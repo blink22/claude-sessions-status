@@ -241,19 +241,21 @@ BADGE_STATE_FILE = HOME / ".claude-sessions-status-badge.json"
 TILE_SIZE = 56.0
 TILE_GAP = 6.0
 TILE_CORNER = 12.0
-# Tile order on the bento: 3 active buckets + 1 dormant tile (muted).
-# Dormant is integrated as a peer tile so the count is always visible
-# at a glance, but it's drawn in tertiaryLabel grays so it doesn't
-# compete with the active counts for attention.
-TILE_KEYS = ("needs", "working", "ready", "dormant")
+# Tile order on the bento: 3 active buckets only. Dormant sessions are
+# surfaced inside the popover (separate section at the bottom) — not on
+# the badge, because they're stale by definition and shouldn't compete
+# for attention with active work.
+TILE_KEYS = ("needs", "working", "ready")
 TILE_ICONS = {
     "needs":   "bell.badge.fill",
     "working": "gearshape.2.fill",
     "ready":   "checkmark.seal.fill",
+    # `dormant` icon kept around for the popover's section header if
+    # we ever surface it there visually; not used on the badge.
     "dormant": "moon.zzz.fill",
 }
 NUM_TILES = len(TILE_KEYS)
-BADGE_WIDTH = TILE_SIZE * NUM_TILES + TILE_GAP * (NUM_TILES - 1)   # 242
+BADGE_WIDTH = TILE_SIZE * NUM_TILES + TILE_GAP * (NUM_TILES - 1)   # 180
 BADGE_HEIGHT = TILE_SIZE                                          # 56
 DEFAULT_BADGE_ORIGIN = (1200.0, 800.0)
 
