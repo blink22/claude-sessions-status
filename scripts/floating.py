@@ -42,6 +42,7 @@ try:
         NSBackingStoreBuffered,
         NSBezierPath,
         NSBox,
+        NSButton,
         NSColor,
         NSEvent,
         NSFont,
@@ -161,6 +162,32 @@ def _write_popover_mode(mode: str) -> None:
         return
     try:
         POPOVER_MODE_FILE.write_text(mode, encoding="utf-8")
+    except OSError:
+        pass
+
+
+# ---------- Dormant visibility (popover-only toggle) ----------
+# Whether the dormant section is rendered inside the popover. Persists
+# across launches. Defaults to True so behavior matches what shipped
+# previously (dormant always visible at the bottom).
+SHOW_DORMANT_FILE = HOME / ".claude-sessions-status-show-dormant"
+
+
+def _read_show_dormant() -> bool:
+    try:
+        v = SHOW_DORMANT_FILE.read_text(encoding="utf-8").strip().lower()
+        if v in ("0", "false", "no", "off"):
+            return False
+        if v in ("1", "true", "yes", "on"):
+            return True
+    except OSError:
+        pass
+    return True
+
+
+def _write_show_dormant(value: bool) -> None:
+    try:
+        SHOW_DORMANT_FILE.write_text("1" if value else "0", encoding="utf-8")
     except OSError:
         pass
 
@@ -1156,6 +1183,8 @@ class PopoverVC(NSViewController):
     kanban_text_views = objc.ivar("kanban_text_views")
     popover_ref = objc.ivar("popover_ref")    # NSPopover, set by BadgeController
     last_rendered_rows = objc.ivar("last_rendered_rows")  # for mark-all-read
+    show_dormant = objc.ivar("show_dormant")   # bool — toggle to hide dormant
+    dormant_btn = objc.ivar("dormant_btn")     # the NSButton checkbox
 
     @objc.python_method
     def set_popover(self, popover):
@@ -1209,6 +1238,29 @@ class PopoverVC(NSViewController):
         seg.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin)
         container.addSubview_(seg)
         self.segmented = seg
+
+        # ---- Top bar (right): "Show dormant" checkbox toggle ----
+        # Lives in the right corner so it doesn't compete with the
+        # primary List/Kanban control. Persists across launches via the
+        # SHOW_DORMANT_FILE state file.
+        self.show_dormant = _read_show_dormant()
+        dormant_btn = NSButton.alloc().init()
+        dormant_btn.setButtonType_(3)        # NSButtonTypeSwitch (checkbox)
+        dormant_btn.setTitle_("Show older")
+        dormant_btn.setState_(1 if self.show_dormant else 0)
+        dormant_btn.setTarget_(self)
+        dormant_btn.setAction_("toggleDormant:")
+        dormant_btn.sizeToFit()
+        dbf = dormant_btn.frame()
+        dormant_btn.setFrame_(NSMakeRect(
+            w - dbf.size.width - 12,
+            h - TOP_BAR_HEIGHT + 6,
+            dbf.size.width, dbf.size.height,
+        ))
+        # Stick to the right edge as the popover resizes.
+        dormant_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+        container.addSubview_(dormant_btn)
+        self.dormant_btn = dormant_btn
 
         # ---- Content host below top bar ----
         host = NSView.alloc().initWithFrame_(
@@ -1322,6 +1374,15 @@ class PopoverVC(NSViewController):
             import traceback
             traceback.print_exc(file=sys.stderr)
 
+    def toggleDormant_(self, sender):
+        """Flip whether dormant sessions are shown in the popover."""
+        try:
+            self.show_dormant = bool(sender.state())   # 0 / 1
+            _write_show_dormant(self.show_dormant)
+            self.refresh()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[toggleDormant_] {e!r}\n")
+
     @objc.python_method
     def refresh(self):
         try:
@@ -1371,12 +1432,11 @@ class PopoverVC(NSViewController):
         cols = ("needs", "working", "ready")
         for tv, key in zip(self.kanban_text_views, cols):
             rows = buckets.get(key) or []
-            # On the right column, append DORMANT rows below FINISHED so
-            # they remain visible without overflowing screen real-estate.
-            extra = (
-                ("dormant", buckets.get("dormant") or [])
-                if key == "ready" else None
-            )
+            # In kanban mode the dormant bucket is tucked beneath the
+            # FINISHED column — but only when the toggle is enabled.
+            extra = None
+            if key == "ready" and self.show_dormant:
+                extra = ("dormant", buckets.get("dormant") or [])
             mas = self._build_single_bucket_attributed(key, rows, extra=extra)
             tv.textStorage().setAttributedString_(mas)
 
@@ -1543,6 +1603,13 @@ class PopoverVC(NSViewController):
                 p = " ".join(raw.split())
                 preview = p[:120] + ("…" if len(p) > 120 else "")
 
+        # Fonts for the gist line specifically — promoted to share
+        # visual focus with the title (13pt vs 14pt title; same primary
+        # labelColor for the gist body, bucket-tint semibold for the
+        # phase tag prefix).
+        gist_emphasis_font = NSFont.systemFontOfSize_(13)
+        phase_tag_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+
         ps = self._row_paragraph_style(right_edge)
 
         def append(text: str, attrs: dict) -> None:
@@ -1599,17 +1666,31 @@ class PopoverVC(NSViewController):
         else:
             append(f"\t{ago}\n", age_attrs)
 
-        # ---- Line 2: phase + gist ----
-        bits = []
-        if phase:
-            bits.append(phase)
-        if gist:
-            bits.append(gist)
-        if bits:
-            append(f"     {'  ·  '.join(bits)}\n", {
-                NSFontAttributeName: gist_font,
-                NSForegroundColorAttributeName: dim,
-            })
+        # ---- Line 2: phase (colored tag) + gist (primary text) ----
+        # The gist is what the user reads to know "what's happening
+        # right now" — so it gets the full primary labelColor, not the
+        # muted secondary. The phase prefix stays in the bucket tint as
+        # a colored "tag" so its category meaning is preserved.
+        if phase or gist:
+            # Indent matching the title's leading inset.
+            append("     ", {NSFontAttributeName: gist_emphasis_font})
+            if phase:
+                append(phase, {
+                    NSFontAttributeName: phase_tag_font,
+                    NSForegroundColorAttributeName: color,
+                })
+                if gist:
+                    # Subtle separator dot, not a heavy bullet.
+                    append("  ·  ", {
+                        NSFontAttributeName: phase_tag_font,
+                        NSForegroundColorAttributeName: dim,
+                    })
+            if gist:
+                append(gist, {
+                    NSFontAttributeName: gist_emphasis_font,
+                    NSForegroundColorAttributeName: NSColor.labelColor(),
+                })
+            append("\n", {NSFontAttributeName: gist_emphasis_font})
 
         # ---- Line 3: quoted preview of Claude's actual content ----
         if preview:
@@ -1654,7 +1735,9 @@ class PopoverVC(NSViewController):
         any_rows = False
 
         section_pairs = [(k, _bucket_tint(k)) for k in ("needs", "working", "ready")]
-        section_pairs.append(("dormant", NSColor.tertiaryLabelColor()))
+        # Dormant only renders when the user has the toggle enabled.
+        if self.show_dormant:
+            section_pairs.append(("dormant", NSColor.tertiaryLabelColor()))
 
         for key, color in section_pairs:
             rows = buckets.get(key) or []
@@ -1739,6 +1822,7 @@ class BadgeController(NSObject):
     badge_view = objc.ivar("badge_view")
     popover = objc.ivar("popover")
     timer = objc.ivar("timer")
+    outside_click_monitor = objc.ivar("outside_click_monitor")  # NSEvent monitor
 
     def initWithPanelMode_(self, panel_mode: str):
         self = objc.super(BadgeController, self).init()
@@ -1809,12 +1893,19 @@ class BadgeController(NSObject):
         self.badge_view = view
 
         # NSPopover anchored to the badge view. Created up-front so we
-        # don't pay setup cost on first click. Behavior=Transient means
-        # macOS auto-dismisses on click-outside / Esc — exactly what we
-        # want for a popover anchored to a small UI target.
+        # don't pay setup cost on first click. Behavior=Transient should
+        # auto-dismiss on outside clicks — but when the host is a
+        # non-activating panel, NSPopover doesn't always detect those
+        # outside clicks. We install a global NSEvent monitor in
+        # togglePanel_ to close the popover on any click anywhere else
+        # on screen as a robust fallback.
         self.popover = NSPopover.alloc().init()
         self.popover.setBehavior_(NSPopoverBehaviorTransient)
         self.popover.setAnimates_(True)
+        # BadgeController is the popover's delegate so we get
+        # popoverDidClose: callbacks and can tear down the event
+        # monitor whenever the popover closes (for any reason).
+        self.popover.setDelegate_(self)
         popover_vc = PopoverVC.alloc().init()
         # Hand the VC a reference to the popover so it can resize itself
         # when the user toggles between list and kanban.
@@ -1824,6 +1915,7 @@ class BadgeController(NSObject):
         initial_mode = _read_popover_mode()
         init_size = POPOVER_KANBAN_SIZE if initial_mode == "kanban" else POPOVER_LIST_SIZE
         self.popover.setContentSize_(NSMakeSize(*init_size))
+        self.outside_click_monitor = None
 
         # Remember the user's preferred mode for popover content (the
         # popover renders a vertical list — kanban as a popover doesn't
@@ -1918,10 +2010,59 @@ class BadgeController(NSObject):
             self.popover.showRelativeToRect_ofView_preferredEdge_(
                 anchor_rect, self.badge_view, NSRectEdgeMinY,
             )
+            # Install the global click monitor so any click outside our
+            # popover (in any other app or on the desktop) dismisses it.
+            self._start_outside_click_monitor()
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[togglePanel] {e!r}\n")
             import traceback
             traceback.print_exc(file=sys.stderr)
+
+    @objc.python_method
+    def _start_outside_click_monitor(self):
+        """Listen globally for mouse clicks in OTHER apps — fire close()
+        when one happens. Global monitors don't see events for our own
+        app, so clicks on the badge / inside the popover are not caught
+        here (good — those are handled by their own event paths)."""
+        if self.outside_click_monitor is not None:
+            return  # already armed
+        try:
+            # 0x02 = NSEventMaskLeftMouseDown, 0x10 = NSEventMaskRightMouseDown.
+            mask = (1 << 1) | (1 << 3)
+            self.outside_click_monitor = (
+                NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    mask, self._handle_outside_click,
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[outside_click_monitor.start] {e!r}\n")
+
+    @objc.python_method
+    def _stop_outside_click_monitor(self):
+        if self.outside_click_monitor is None:
+            return
+        try:
+            NSEvent.removeMonitor_(self.outside_click_monitor)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[outside_click_monitor.stop] {e!r}\n")
+        self.outside_click_monitor = None
+
+    @objc.python_method
+    def _handle_outside_click(self, _event):
+        """Global monitor callback — close the popover on any click in
+        another app or the desktop background."""
+        if self.popover is not None and self.popover.isShown():
+            try:
+                self.popover.close()
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[outside_click_monitor.handler] {e!r}\n")
+
+    # ---- NSPopoverDelegate ----
+    def popoverDidClose_(self, _notification):
+        """Always tear down the click monitor when the popover closes,
+        no matter how it was dismissed (badge click, Esc, click outside,
+        or programmatically)."""
+        self._stop_outside_click_monitor()
 
 
 # ---------- Entry ----------
