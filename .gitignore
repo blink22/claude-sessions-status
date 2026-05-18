@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Defensive — these files live in $HOME, never in the repo, but guard
+# against accidental commits if someone runs commands inside the repo.
+.claude-sessions-status*
