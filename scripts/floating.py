@@ -160,14 +160,19 @@ def _write_popover_mode(mode: str) -> None:
         pass
 
 
-# Badge — modern horizontal capsule (per UX + graphic-design research).
-# Pill shape: width >> height, full corner-radius = pill. Three peer
-# count segments side-by-side, no dots, no dividers — the numeral is
-# the colored element, with a small rounded underline accent below it.
+# Badge — bento-tile layout: three independent rounded-square "tiles"
+# arranged horizontally with small gaps between them. Each tile is its
+# own NSVisualEffectView glass surface, giving each bucket equal visual
+# weight (matches 2026 dev-tooling design language — Linear, Raycast,
+# Arc, Vercel). Inside each tile: a large tinted numeral with a small
+# uppercase label below it.
 BADGE_STATE_FILE = HOME / ".claude-sessions-status-badge.json"
-BADGE_WIDTH = 150.0
-BADGE_HEIGHT = 36.0
-BADGE_CORNER = BADGE_HEIGHT / 2.0     # full pill
+TILE_SIZE = 56.0
+TILE_GAP = 6.0
+TILE_CORNER = 12.0
+NUM_TILES = 3
+BADGE_WIDTH = TILE_SIZE * NUM_TILES + TILE_GAP * (NUM_TILES - 1)   # 180
+BADGE_HEIGHT = TILE_SIZE                                          # 56
 DEFAULT_BADGE_ORIGIN = (1200.0, 800.0)
 
 # NSVisualEffectView constants. Hardcoded to avoid PyObjC export drift.
@@ -790,70 +795,63 @@ class BadgeView(NSView):
         return True
 
     def drawRect_(self, _dirty):
-        bounds = self.bounds()
-        w = bounds.size.width
-        h = bounds.size.height
-
-        # Hairline inside-stroke at 60% separatorColor — the *only*
-        # decoration outside of NSVisualEffectView's own material.
-        # No top-edge highlight oval, no white rim — both fight the
-        # Liquid Glass specular and date the design.
-        rim_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            NSMakeRect(0.5, 0.5, w - 1.0, h - 1.0),
-            BADGE_CORNER - 0.5, BADGE_CORNER - 0.5,
-        )
-        NSColor.separatorColor().colorWithAlphaComponent_(0.6).set()
-        rim_path.setLineWidth_(1.0)
-        rim_path.stroke()
-
-        # Three side-by-side segments. No vertical dividers — spacing
-        # alone separates them.
+        # The three NSVisualEffectView tile backgrounds behind us draw
+        # the glass surfaces. We just paint the numerals + uppercase
+        # labels on top, one set per tile. No rim, no underline — the
+        # tile itself is the boundary.
+        h = self.bounds().size.height
         keys = ("needs", "working", "ready")
-        seg_w = w / len(keys)
+        labels = {"needs": "NEEDS", "working": "WORK", "ready": "DONE"}
 
-        num_font = _rounded_tabular_font(18.0, NSFontWeightSemibold)
-        under_w = 18.0     # rounded accent length (centered under numeral)
-        under_thickness = 2.0
-        under_y_offset = 5.0  # distance below numeral baseline
+        num_font = _rounded_tabular_font(22.0, NSFontWeightSemibold)
+        lbl_font = NSFont.systemFontOfSize_weight_(8.0, NSFontWeightSemibold)
 
         for i, key in enumerate(keys):
             n = int(self.counts.get(key, 0) or 0)
-            seg_cx = seg_w * (i + 0.5)
+            tile_x = i * (TILE_SIZE + TILE_GAP)
+            tile_cx = tile_x + TILE_SIZE / 2.0
 
-            # Color rules: active count → bucket tint; zero → tertiaryLabel.
-            if n > 0:
-                num_color = _bucket_tint(key)
-                under_color = num_color
-                under_alpha = 1.0
-            else:
-                num_color = NSColor.tertiaryLabelColor()
-                under_color = NSColor.tertiaryLabelColor()
-                under_alpha = 0.5
-
-            # Numeral — tinted, tabular figures, slightly tightened.
-            text = str(n)
-            attrs = {
-                NSFontAttributeName: num_font,
-                NSForegroundColorAttributeName: num_color,
-                NSKernAttributeName: -0.2,
-            }
-            s = NSAttributedString.alloc().initWithString_attributes_(text, attrs)
-            sz = s.size()
-            # Center the numeral on the segment center; slight upward
-            # nudge so the underline fits beneath without crowding.
-            num_x = seg_cx - sz.width / 2.0
-            num_y = (h - sz.height) / 2.0 - 4.0
-            s.drawAtPoint_(NSMakePoint(num_x, num_y))
-
-            # Rounded underline accent, centered under the numeral.
-            under_y = num_y + sz.height - under_y_offset
-            under_x = seg_cx - under_w / 2.0
-            under_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                NSMakeRect(under_x, under_y, under_w, under_thickness),
-                under_thickness / 2.0, under_thickness / 2.0,
+            num_color = _bucket_tint(key) if n > 0 else NSColor.tertiaryLabelColor()
+            lbl_color = (
+                _bucket_tint(key).colorWithAlphaComponent_(0.55)
+                if n > 0 else NSColor.tertiaryLabelColor().colorWithAlphaComponent_(0.55)
             )
-            under_color.colorWithAlphaComponent_(under_alpha).setFill()
-            under_path.fill()
+
+            # Numeral — big, tinted, tabular figures, slightly tightened.
+            num_s = NSAttributedString.alloc().initWithString_attributes_(
+                str(n),
+                {
+                    NSFontAttributeName: num_font,
+                    NSForegroundColorAttributeName: num_color,
+                    NSKernAttributeName: -0.4,
+                },
+            )
+            num_sz = num_s.size()
+            # Label — small uppercase with letter-spacing for the
+            # "tag" look. Sits below the numeral.
+            lbl_s = NSAttributedString.alloc().initWithString_attributes_(
+                labels[key],
+                {
+                    NSFontAttributeName: lbl_font,
+                    NSForegroundColorAttributeName: lbl_color,
+                    NSKernAttributeName: 1.2,
+                },
+            )
+            lbl_sz = lbl_s.size()
+
+            # Vertically center the (numeral + 2pt gap + label) block in
+            # the tile. Flipped coords: smaller y == top.
+            gap = 2.0
+            block_h = num_sz.height + gap + lbl_sz.height
+            top = (TILE_SIZE - block_h) / 2.0
+
+            num_x = tile_cx - num_sz.width / 2.0
+            num_y = top
+            num_s.drawAtPoint_(NSMakePoint(num_x, num_y))
+
+            lbl_x = tile_cx - lbl_sz.width / 2.0
+            lbl_y = top + num_sz.height + gap
+            lbl_s.drawAtPoint_(NSMakePoint(lbl_x, lbl_y))
 
     # ---- Mouse handling: click toggles the panel, drag moves the window ----
     def mouseDown_(self, event):
@@ -1462,30 +1460,47 @@ class BadgeController(NSObject):
         win.setMovableByWindowBackground_(False)  # we handle drag ourselves
         win.setHidesOnDeactivate_(False)
 
-        # Frosted-glass background — Popover material (lighter than HUD,
-        # picks up wallpaper tint, reads as system chrome rather than
-        # heavy app surface).
-        vfx = NSVisualEffectView.alloc().initWithFrame_(
+        # Bento tiles: a transparent container holding 3 independent
+        # NSVisualEffectView glass surfaces (one per bucket), with the
+        # BadgeView drawing numerals + labels overlaid on top.
+        container = NSView.alloc().initWithFrame_(
             NSMakeRect(0, 0, BADGE_WIDTH, BADGE_HEIGHT)
         )
-        vfx.setMaterial_(NSVisualEffectMaterialPopover)
-        vfx.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        vfx.setState_(NSVisualEffectStateActive)
-        vfx.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-        vfx.setWantsLayer_(True)
-        layer = vfx.layer()
-        if layer is not None:
-            layer.setCornerRadius_(BADGE_CORNER)
-            layer.setMasksToBounds_(True)
-        win.setContentView_(vfx)
+        container.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
 
-        # Foreground BadgeView is overlaid; it draws numerals + accents.
+        for i in range(NUM_TILES):
+            tx = i * (TILE_SIZE + TILE_GAP)
+            tile = NSVisualEffectView.alloc().initWithFrame_(
+                NSMakeRect(tx, 0, TILE_SIZE, TILE_SIZE)
+            )
+            tile.setMaterial_(NSVisualEffectMaterialPopover)
+            tile.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+            tile.setState_(NSVisualEffectStateActive)
+            tile.setWantsLayer_(True)
+            t_layer = tile.layer()
+            if t_layer is not None:
+                t_layer.setCornerRadius_(TILE_CORNER)
+                t_layer.setMasksToBounds_(True)
+                # Hairline inner border on each tile for definition.
+                t_layer.setBorderWidth_(0.5)
+                # CGColor of separatorColor at ~50% alpha.
+                t_layer.setBorderColor_(
+                    NSColor.separatorColor()
+                    .colorWithAlphaComponent_(0.5).CGColor()
+                )
+            container.addSubview_(tile)
+
+        # Foreground BadgeView (transparent) overlaid on the tiles —
+        # draws numerals + labels, captures click/drag for the whole
+        # badge regardless of which tile the user pressed.
         view = BadgeView.alloc().initWithFrame_(
             NSMakeRect(0, 0, BADGE_WIDTH, BADGE_HEIGHT)
         )
         view.set_controller(self)
         view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-        vfx.addSubview_(view)
+        container.addSubview_(view)
+
+        win.setContentView_(container)
 
         self.badge_window = win
         self.badge_view = view
