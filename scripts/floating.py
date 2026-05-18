@@ -165,6 +165,72 @@ def _write_popover_mode(mode: str) -> None:
         pass
 
 
+# ---------- Unread / seen state ----------
+# Per-session "last seen" timestamp lives in ~/.claude-sessions-status-seen.json.
+# A session is *unread* when its current lastTurnEpoch (real conversation
+# activity) is later than the saved seen epoch. This is opt-in: sessions
+# the user has never marked-as-read are simply not tracked, so a fresh
+# install doesn't dump dozens of unread dots on day one.
+SEEN_FILE = HOME / ".claude-sessions-status-seen.json"
+
+
+def _load_seen() -> dict:
+    if not SEEN_FILE.exists():
+        return {}
+    try:
+        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_seen(seen: dict) -> None:
+    try:
+        SEEN_FILE.write_text(json.dumps(seen), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _is_session_unread(session_id: str, last_turn_epoch, seen: dict) -> bool:
+    """True if this session has had real activity (a new user/assistant
+    turn) since we last marked it read. No prior entry → not unread —
+    we don't manufacture unread state out of nothing."""
+    if not session_id or last_turn_epoch is None:
+        return False
+    entry = seen.get(session_id)
+    if not isinstance(entry, dict):
+        return False
+    seen_epoch = entry.get("lastSeenEpoch")
+    if not isinstance(seen_epoch, (int, float)):
+        return False
+    # 0.5s slack to avoid millisecond drift causing flickering.
+    return float(last_turn_epoch) > float(seen_epoch) + 0.5
+
+
+def _mark_session_read(session_id: str, last_turn_epoch) -> None:
+    if not session_id or last_turn_epoch is None:
+        return
+    seen = _load_seen()
+    seen[session_id] = {
+        "lastSeenEpoch": float(last_turn_epoch),
+        "lastSeenAt": time.time(),
+    }
+    _save_seen(seen)
+
+
+def _mark_sessions_read(session_epoch_pairs: list) -> None:
+    """Batch-mark many sessions read in one file write."""
+    if not session_epoch_pairs:
+        return
+    seen = _load_seen()
+    now = time.time()
+    for sid, epoch in session_epoch_pairs:
+        if not sid or epoch is None:
+            continue
+        seen[sid] = {"lastSeenEpoch": float(epoch), "lastSeenAt": now}
+    _save_seen(seen)
+
+
 # Badge — bento-tile layout: three independent rounded-square "tiles"
 # arranged horizontally with small gaps between them. Each tile is its
 # own NSVisualEffectView glass surface, giving each bucket equal visual
@@ -387,6 +453,7 @@ def _get_buckets() -> dict[str, list[dict]]:
     now = time.time()
     desktop_idx = desktop_titles()
     live_ids = live_session_ids()
+    seen = _load_seen()
 
     buckets: dict[str, list[dict]] = {b: [] for b in BUCKET_ORDER}
     for s in sessions:
@@ -412,6 +479,12 @@ def _get_buckets() -> dict[str, list[dict]]:
             "title": resolve_title(s, meta, desktop_idx),
             "gist": session_gist(s, meta, bucket),
             "hint": next_action(phase_label, meta.get("lastRole"), ago_s),
+            # Inbox-style unread flag — true when last turn happened
+            # after the last time the user marked this session as read.
+            "unread": _is_session_unread(sid, last_epoch, seen),
+            # Carry the resolved epoch so mark-as-read can persist it
+            # without re-deriving from meta.
+            "lastTurnEpoch": last_epoch,
         }
         buckets[bucket].append(row)
     return buckets
@@ -1080,6 +1153,7 @@ class PopoverVC(NSViewController):
     kanban_stack = objc.ivar("kanban_stack")
     kanban_text_views = objc.ivar("kanban_text_views")
     popover_ref = objc.ivar("popover_ref")    # NSPopover, set by BadgeController
+    last_rendered_rows = objc.ivar("last_rendered_rows")  # for mark-all-read
 
     @objc.python_method
     def set_popover(self, popover):
@@ -1263,10 +1337,23 @@ class PopoverVC(NSViewController):
             sys.stderr.write(f"[popover] data fetch failed: {e!r}\n")
             return
 
+        # Cache rows so "Mark all read" knows which sessions are visible.
+        flat: list = []
+        for k in ("needs", "working", "ready", "dormant"):
+            flat.extend(buckets.get(k) or [])
+        self.last_rendered_rows = flat
+
         if self.mode == "kanban":
             self._render_kanban(buckets)
         else:
             self._render_list(buckets)
+
+        # Make sure the text views forward link clicks to us.
+        if self.list_text_view is not None:
+            self.list_text_view.setDelegate_(self)
+        if self.kanban_text_views is not None:
+            for tv in self.kanban_text_views:
+                tv.setDelegate_(self)
 
     @objc.python_method
     def _render_list(self, buckets):
@@ -1376,6 +1463,53 @@ class PopoverVC(NSViewController):
         ps.setTabStops_([tab])
         return ps
 
+    # ---- NSTextView link delegate ----
+    # NSTextView calls this when the user clicks an attributed-string
+    # link. We use it to intercept our custom cssread:// (single session)
+    # and cssreadall:// (all visible sessions) URLs.
+    def textView_clickedOnLink_atIndex_(self, _text_view, link, _char_index):
+        try:
+            url_str = str(link) if link is not None else ""
+            if url_str.startswith("cssread://"):
+                sid = url_str[len("cssread://"):]
+                # Find the corresponding row to learn its current epoch.
+                epoch = None
+                for r in (self.last_rendered_rows or []):
+                    if (r.get("s") or {}).get("sessionId") == sid:
+                        epoch = r.get("lastTurnEpoch")
+                        break
+                _mark_session_read(sid, epoch if epoch is not None else time.time())
+                self.refresh()
+                return True
+            if url_str.startswith("cssreadall:"):
+                pairs = []
+                for r in (self.last_rendered_rows or []):
+                    sid = (r.get("s") or {}).get("sessionId")
+                    epoch = r.get("lastTurnEpoch")
+                    if sid and epoch is not None:
+                        pairs.append((sid, epoch))
+                _mark_sessions_read(pairs)
+                self.refresh()
+                return True
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[textView_clickedOnLink] {e!r}\n")
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+        return False
+
+    @objc.python_method
+    def _accent_color(self):
+        """Unread indicator color — uses the system accent (blue by
+        default, but adapts to whatever the user picked in System
+        Settings ▸ Appearance)."""
+        try:
+            return NSColor.controlAccentColor()
+        except Exception:  # noqa: BLE001
+            # Fall back to a fixed Apple blue for older macOS.
+            return NSColor.colorWithDisplayP3Red_green_blue_alpha_(
+                0.0392, 0.5176, 1.0, 1.0,
+            )
+
     @objc.python_method
     def _append_row(self, out, row, color, title_font, gist_font, meta_font,
                     bar_font, dim, very_dim, *, right_edge: float = 332.0,
@@ -1414,11 +1548,24 @@ class PopoverVC(NSViewController):
                 NSAttributedString.alloc().initWithString_attributes_(text, attrs)
             )
 
-        # ---- Line 1: ▎ Title  [tab]  age (right-aligned) ----
+        unread = bool(row.get("unread"))
+        sid = row.get("s", {}).get("sessionId") or ""
+        accent = self._accent_color()
+
+        # ---- Line 1: [● if unread] ▎ Title  [tab]  age  [✓ if unread] ----
+        # Leading 2-space indent (same as before).
         append("  ", {
             NSFontAttributeName: title_font,
             NSParagraphStyleAttributeName: ps,
         })
+        # Unread indicator — small blue dot, takes the slot where the
+        # ▎ bar would be alone for read rows.
+        if unread:
+            append("● ", {
+                NSFontAttributeName: bar_font,
+                NSForegroundColorAttributeName: accent,
+                NSParagraphStyleAttributeName: ps,
+            })
         append("▎", {
             NSFontAttributeName: bar_font,
             NSForegroundColorAttributeName: color,
@@ -1430,11 +1577,25 @@ class PopoverVC(NSViewController):
             NSParagraphStyleAttributeName: ps,
         })
         # Tab then right-aligned age in tertiary color.
-        append(f"\t{ago}\n", {
+        age_attrs = {
             NSFontAttributeName: meta_font,
             NSForegroundColorAttributeName: very_dim,
             NSParagraphStyleAttributeName: ps,
-        })
+        }
+        if unread and sid:
+            # Append a clickable ✓ link AFTER the age. This is the
+            # mark-as-read affordance. NSTextView's link handling fires
+            # textView:clickedOnLink:atIndex: when the user clicks it.
+            append(f"\t{ago}  ", age_attrs)
+            append("✓", {
+                NSFontAttributeName: title_font,
+                NSForegroundColorAttributeName: accent,
+                NSLinkAttributeName: NSURL.URLWithString_(f"cssread://{sid}"),
+                NSParagraphStyleAttributeName: ps,
+            })
+            append("\n", age_attrs)
+        else:
+            append(f"\t{ago}\n", age_attrs)
 
         # ---- Line 2: phase + gist ----
         bits = []
@@ -1530,6 +1691,37 @@ class PopoverVC(NSViewController):
                         NSFontAttributeName: NSFont.systemFontOfSize_(12),
                         NSForegroundColorAttributeName: dim,
                     },
+                )
+            )
+            return out
+
+        # "Mark all read" footer link — only shown when at least one row
+        # is currently unread, so we don't clutter the popover when
+        # everything's caught up.
+        unread_count = sum(
+            1 for r in (self.last_rendered_rows or []) if r.get("unread")
+        )
+        if unread_count > 0:
+            footer_font = NSFont.systemFontOfSize_(11)
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(
+                    "  ", {NSFontAttributeName: footer_font}
+                )
+            )
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(
+                    f"✓ Mark all {unread_count} as read",
+                    {
+                        NSFontAttributeName: footer_font,
+                        NSForegroundColorAttributeName: self._accent_color(),
+                        NSLinkAttributeName:
+                            NSURL.URLWithString_("cssreadall://"),
+                    },
+                )
+            )
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(
+                    "\n", {NSFontAttributeName: footer_font}
                 )
             )
         return out
