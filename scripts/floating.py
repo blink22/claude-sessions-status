@@ -1065,6 +1065,16 @@ class PopoverVC(NSViewController):
         w, h = size
 
         container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+        # Opaque solid background — overrides NSPopover's default
+        # translucent material so the popover content doesn't show
+        # what's behind it. macOS clips this to the popover's
+        # rounded-corner + arrow shape automatically.
+        container.setWantsLayer_(True)
+        c_layer = container.layer()
+        if c_layer is not None:
+            c_layer.setBackgroundColor_(
+                NSColor.windowBackgroundColor().CGColor()
+            )
 
         # ---- Top bar: segmented control (List | Kanban) ----
         TOP_BAR_HEIGHT = 32.0
