@@ -51,6 +51,8 @@ try:
         NSFontWeightRegular,
         NSFontWeightSemibold,
         NSGradient,
+        NSImage,
+        NSImageSymbolConfiguration,
         NSKernAttributeName,
         NSLinkAttributeName,
         NSMakePoint,
@@ -59,12 +61,15 @@ try:
         NSMenu,
         NSMenuItem,
         NSMutableAttributedString,
+        NSMutableParagraphStyle,
+        NSParagraphStyleAttributeName,
         NSPanel,
         NSPopover,
         NSScrollView,
         NSSegmentedControl,
         NSSegmentStyleAutomatic,
         NSSegmentSwitchTrackingSelectOne,
+        NSTextTab,
         NSStackView,
         NSTextField,
         NSTextView,
@@ -170,8 +175,19 @@ BADGE_STATE_FILE = HOME / ".claude-sessions-status-badge.json"
 TILE_SIZE = 56.0
 TILE_GAP = 6.0
 TILE_CORNER = 12.0
-NUM_TILES = 3
-BADGE_WIDTH = TILE_SIZE * NUM_TILES + TILE_GAP * (NUM_TILES - 1)   # 180
+# Tile order on the bento: 3 active buckets + 1 dormant tile (muted).
+# Dormant is integrated as a peer tile so the count is always visible
+# at a glance, but it's drawn in tertiaryLabel grays so it doesn't
+# compete with the active counts for attention.
+TILE_KEYS = ("needs", "working", "ready", "dormant")
+TILE_ICONS = {
+    "needs":   "bell.badge.fill",
+    "working": "gearshape.2.fill",
+    "ready":   "checkmark.seal.fill",
+    "dormant": "moon.zzz.fill",
+}
+NUM_TILES = len(TILE_KEYS)
+BADGE_WIDTH = TILE_SIZE * NUM_TILES + TILE_GAP * (NUM_TILES - 1)   # 242
 BADGE_HEIGHT = TILE_SIZE                                          # 56
 DEFAULT_BADGE_ORIGIN = (1200.0, 800.0)
 
@@ -226,6 +242,37 @@ def _bucket_tint(key: str):
     table = BUCKET_COLOR_DARK if _is_dark_appearance() else BUCKET_COLOR_LIGHT
     fn = table.get(key)
     return fn() if fn else NSColor.tertiaryLabelColor()
+
+
+def _draw_sf_symbol_centered(name: str, center_x: float, center_y: float,
+                              point_size: float, color):
+    """Draw an SF Symbol centered at (center_x, center_y), tinted with
+    `color`, at the given point size. Falls back silently if the system
+    doesn't have that symbol (older macOS, typo, etc.)."""
+    img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+    if img is None:
+        return
+    try:
+        # Build size + weight config first.
+        size_cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_scale_(
+            point_size, NSFontWeightSemibold, 2,  # scale=Medium
+        )
+        # Then a hierarchical-color config (tint).
+        color_cfg = NSImageSymbolConfiguration.configurationWithHierarchicalColor_(color)
+        combined = size_cfg.configurationByApplyingConfiguration_(color_cfg)
+        img = img.imageWithSymbolConfiguration_(combined)
+    except Exception:  # noqa: BLE001
+        # Older macOS / different PyObjC API path — fall back to drawing
+        # the symbol untinted at its default point size.
+        pass
+    sz = img.size()
+    rect = NSMakeRect(
+        center_x - sz.width / 2.0,
+        center_y - sz.height / 2.0,
+        sz.width, sz.height,
+    )
+    # NSCompositingOperationSourceOver = 2.
+    img.drawInRect_fromRect_operation_fraction_(rect, NSMakeRect(0, 0, 0, 0), 2, 1.0)
 
 
 def _rounded_tabular_font(size: float, weight: float):
@@ -795,27 +842,26 @@ class BadgeView(NSView):
         return True
 
     def drawRect_(self, _dirty):
-        # The three NSVisualEffectView tile backgrounds behind us draw
-        # the glass surfaces. We just paint the numerals + uppercase
-        # labels on top, one set per tile. No rim, no underline — the
-        # tile itself is the boundary.
-        h = self.bounds().size.height
-        keys = ("needs", "working", "ready")
-        labels = {"needs": "NEEDS", "working": "WORK", "ready": "DONE"}
+        # Per-tile content: SF Symbol icon at top, big numeral below.
+        # The NSVisualEffectView behind each tile provides the glass.
+        num_font = _rounded_tabular_font(20.0, NSFontWeightSemibold)
 
-        num_font = _rounded_tabular_font(22.0, NSFontWeightSemibold)
-        lbl_font = NSFont.systemFontOfSize_weight_(8.0, NSFontWeightSemibold)
-
-        for i, key in enumerate(keys):
+        for i, key in enumerate(TILE_KEYS):
             n = int(self.counts.get(key, 0) or 0)
             tile_x = i * (TILE_SIZE + TILE_GAP)
             tile_cx = tile_x + TILE_SIZE / 2.0
 
-            num_color = _bucket_tint(key) if n > 0 else NSColor.tertiaryLabelColor()
-            lbl_color = (
-                _bucket_tint(key).colorWithAlphaComponent_(0.55)
-                if n > 0 else NSColor.tertiaryLabelColor().colorWithAlphaComponent_(0.55)
-            )
+            # Dormant tile is ALWAYS muted (gray) — its presence on the
+            # bento should be calm, not competing with active counts.
+            if key == "dormant":
+                num_color = NSColor.tertiaryLabelColor()
+                icon_color = NSColor.tertiaryLabelColor()
+            elif n > 0:
+                num_color = _bucket_tint(key)
+                icon_color = num_color
+            else:
+                num_color = NSColor.tertiaryLabelColor()
+                icon_color = NSColor.tertiaryLabelColor().colorWithAlphaComponent_(0.6)
 
             # Numeral — big, tinted, tabular figures, slightly tightened.
             num_s = NSAttributedString.alloc().initWithString_attributes_(
@@ -827,31 +873,25 @@ class BadgeView(NSView):
                 },
             )
             num_sz = num_s.size()
-            # Label — small uppercase with letter-spacing for the
-            # "tag" look. Sits below the numeral.
-            lbl_s = NSAttributedString.alloc().initWithString_attributes_(
-                labels[key],
-                {
-                    NSFontAttributeName: lbl_font,
-                    NSForegroundColorAttributeName: lbl_color,
-                    NSKernAttributeName: 1.2,
-                },
-            )
-            lbl_sz = lbl_s.size()
 
-            # Vertically center the (numeral + 2pt gap + label) block in
-            # the tile. Flipped coords: smaller y == top.
+            # Vertically center an [icon, 2pt gap, numeral] block.
+            icon_pt = 14.0  # SF Symbol point size
             gap = 2.0
-            block_h = num_sz.height + gap + lbl_sz.height
+            block_h = icon_pt + gap + num_sz.height
             top = (TILE_SIZE - block_h) / 2.0
 
-            num_x = tile_cx - num_sz.width / 2.0
-            num_y = top
-            num_s.drawAtPoint_(NSMakePoint(num_x, num_y))
+            # SF Symbol — drawn centered horizontally on the tile,
+            # at the top of the block. The drawing helper centers it
+            # on the given (cx, cy) point.
+            icon_cy = top + icon_pt / 2.0
+            _draw_sf_symbol_centered(
+                TILE_ICONS[key], tile_cx, icon_cy, icon_pt, icon_color,
+            )
 
-            lbl_x = tile_cx - lbl_sz.width / 2.0
-            lbl_y = top + num_sz.height + gap
-            lbl_s.drawAtPoint_(NSMakePoint(lbl_x, lbl_y))
+            # Numeral below the icon.
+            num_x = tile_cx - num_sz.width / 2.0
+            num_y = top + icon_pt + gap
+            num_s.drawAtPoint_(NSMakePoint(num_x, num_y))
 
     # ---- Mouse handling: click toggles the panel, drag moves the window ----
     def mouseDown_(self, event):
@@ -1288,26 +1328,66 @@ class PopoverVC(NSViewController):
                 NSForegroundColorAttributeName: dim,
             })
 
+        # Kanban columns are narrower than list mode — set the tab stop
+        # closer in so the age sits at the column's right edge.
+        col_right_edge = (POPOVER_KANBAN_SIZE[0] / 3.0) - 32
+
         for row in rows:
-            self._append_row(out, row, color, title_font, gist_font, meta_font, bar_font, dim, very_dim)
+            self._append_row(
+                out, row, color, title_font, gist_font, meta_font, bar_font,
+                dim, very_dim,
+                right_edge=col_right_edge,
+                show_preview=(key != "dormant"),
+            )
 
         if extra:
             extra_key, extra_rows = extra
             if extra_rows:
                 ex_color = NSColor.tertiaryLabelColor()
-                append(f"\n  {LABELS[extra_key]}  ·  {len(extra_rows)}\n", {
-                    NSFontAttributeName: header_font,
-                    NSForegroundColorAttributeName: ex_color,
-                    NSKernAttributeName: 0.8,
-                })
+                out.appendAttributedString_(
+                    NSAttributedString.alloc().initWithString_attributes_(
+                        f"\n  {LABELS[extra_key]}  ·  {len(extra_rows)}\n",
+                        {
+                            NSFontAttributeName: header_font,
+                            NSForegroundColorAttributeName: ex_color,
+                            NSKernAttributeName: 0.8,
+                        },
+                    )
+                )
                 for row in extra_rows:
-                    self._append_row(out, row, ex_color, title_font, gist_font,
-                                     meta_font, bar_font, dim, very_dim)
+                    self._append_row(
+                        out, row, ex_color, title_font, gist_font,
+                        meta_font, bar_font, dim, very_dim,
+                        right_edge=col_right_edge,
+                        show_preview=False,
+                    )
         return out
 
     @objc.python_method
+    def _row_paragraph_style(self, right_edge: float):
+        """Paragraph style with a right tab stop, used so the age aligns
+        to the right edge of the row."""
+        ps = NSMutableParagraphStyle.alloc().init()
+        tab = NSTextTab.alloc().initWithTextAlignment_location_options_(
+            2,             # NSTextAlignmentRight
+            right_edge,
+            {},
+        )
+        ps.setTabStops_([tab])
+        return ps
+
+    @objc.python_method
     def _append_row(self, out, row, color, title_font, gist_font, meta_font,
-                    bar_font, dim, very_dim):
+                    bar_font, dim, very_dim, *, right_edge: float = 332.0,
+                    show_preview: bool = True):
+        """Render one session row with strong visual hierarchy:
+          1. Big bold title + right-aligned age (via tab stop)
+          2. Phase + gist line (secondary text)
+          3. Quoted preview of Claude's most recent text (the actual
+             content you'd want to read for context-switching)
+          4. Project path (tertiary, smallest)
+        Followed by a blank line to give the next row breathing room.
+        """
         meta = row.get("meta") or {}
         title = (row.get("title") or "(untitled)").strip()
         phase = row.get("phase_label") or ""
@@ -1318,54 +1398,97 @@ class PopoverVC(NSViewController):
             cwd_raw.replace(os.path.expanduser("~"), "~")
             if isinstance(cwd_raw, str) and cwd_raw else ""
         )
+        preview = ""
+        if show_preview and isinstance(meta, dict):
+            raw = meta.get("lastAssistantText") or meta.get("lastAction") or ""
+            if isinstance(raw, str) and raw.strip():
+                # Collapse whitespace, truncate. 120 chars is enough to
+                # tell you "what's going on" without flooding the popover.
+                p = " ".join(raw.split())
+                preview = p[:120] + ("…" if len(p) > 120 else "")
+
+        ps = self._row_paragraph_style(right_edge)
 
         def append(text: str, attrs: dict) -> None:
             out.appendAttributedString_(
                 NSAttributedString.alloc().initWithString_attributes_(text, attrs)
             )
-        append("  ", {NSFontAttributeName: title_font})
-        append("▎", {NSFontAttributeName: bar_font, NSForegroundColorAttributeName: color})
-        append(f" {title}\n", {
+
+        # ---- Line 1: ▎ Title  [tab]  age (right-aligned) ----
+        append("  ", {
+            NSFontAttributeName: title_font,
+            NSParagraphStyleAttributeName: ps,
+        })
+        append("▎", {
+            NSFontAttributeName: bar_font,
+            NSForegroundColorAttributeName: color,
+            NSParagraphStyleAttributeName: ps,
+        })
+        append(f" {title}", {
             NSFontAttributeName: title_font,
             NSForegroundColorAttributeName: NSColor.labelColor(),
+            NSParagraphStyleAttributeName: ps,
         })
+        # Tab then right-aligned age in tertiary color.
+        append(f"\t{ago}\n", {
+            NSFontAttributeName: meta_font,
+            NSForegroundColorAttributeName: very_dim,
+            NSParagraphStyleAttributeName: ps,
+        })
+
+        # ---- Line 2: phase + gist ----
         bits = []
-        if phase: bits.append(phase)
-        if gist: bits.append(gist)
+        if phase:
+            bits.append(phase)
+        if gist:
+            bits.append(gist)
         if bits:
             append(f"     {'  ·  '.join(bits)}\n", {
                 NSFontAttributeName: gist_font,
                 NSForegroundColorAttributeName: dim,
             })
-        meta_bits = [ago]
-        if cwd: meta_bits.append(cwd)
-        append(f"     {'  ·  '.join(meta_bits)}\n", {
-            NSFontAttributeName: meta_font,
-            NSForegroundColorAttributeName: very_dim,
-        })
+
+        # ---- Line 3: quoted preview of Claude's actual content ----
+        if preview:
+            # Curly quotes + italic-ish styling so it reads as a snippet.
+            quote_font = NSFont.systemFontOfSize_(12)
+            append(f"     “{preview}”\n", {
+                NSFontAttributeName: quote_font,
+                NSForegroundColorAttributeName: dim,
+            })
+
+        # ---- Line 4: project path ----
+        if cwd:
+            append(f"     {cwd}\n", {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: very_dim,
+            })
+
+        # Blank spacer line so rows don't run together.
         append("\n", {NSFontAttributeName: gist_font})
 
     @objc.python_method
     def _build_attributed(self, buckets: dict) -> NSAttributedString:
-        """Render bucket headers + session rows into a single attributed
-        string. The colored leading bar is the `▎` glyph in the bucket
-        tint, prepended to each title line."""
+        """Render bucket headers + session rows into one attributed string
+        for the list view. Hierarchy is: bigger bold title with the age
+        right-aligned via a tab stop, secondary phase/gist line, a
+        quoted preview of Claude's actual recent text (the context you'd
+        want for switching back into the session), and a tertiary path."""
         header_font = NSFont.systemFontOfSize_weight_(10, NSFontWeightSemibold)
-        title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        title_font = NSFont.systemFontOfSize_weight_(14, NSFontWeightSemibold)
         gist_font = NSFont.systemFontOfSize_(12)
         meta_font = _rounded_tabular_font(11.0, NSFontWeightRegular)
-        bar_font = NSFont.systemFontOfSize_(15)  # slightly taller for the ▎ glyph
+        bar_font = NSFont.systemFontOfSize_(16)  # slightly taller for the ▎ glyph
 
         dim = NSColor.secondaryLabelColor()
         very_dim = NSColor.tertiaryLabelColor()
 
+        # Right tab stop x position — slightly less than the popover
+        # content width so the age sits with a small right margin.
+        list_right_edge = POPOVER_LIST_SIZE[0] - 28
+
         out = NSMutableAttributedString.alloc().init()
         any_rows = False
-
-        def append(text: str, attrs: dict) -> None:
-            out.appendAttributedString_(
-                NSAttributedString.alloc().initWithString_attributes_(text, attrs)
-            )
 
         section_pairs = [(k, _bucket_tint(k)) for k in ("needs", "working", "ready")]
         section_pairs.append(("dormant", NSColor.tertiaryLabelColor()))
@@ -1377,62 +1500,38 @@ class PopoverVC(NSViewController):
             any_rows = True
 
             # Bucket header — uppercase, tinted, generous tracking.
-            label_text = f"  {LABELS[key]}  ·  {len(rows)}\n"
-            append(label_text, {
-                NSFontAttributeName: header_font,
-                NSForegroundColorAttributeName: color,
-                NSKernAttributeName: 0.8,
-            })
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(
+                    f"  {LABELS[key]}  ·  {len(rows)}\n",
+                    {
+                        NSFontAttributeName: header_font,
+                        NSForegroundColorAttributeName: color,
+                        NSKernAttributeName: 0.8,
+                    },
+                )
+            )
 
             for row in rows:
-                meta = row.get("meta") or {}
-                title = (row.get("title") or "(untitled)").strip()
-                phase = row.get("phase_label") or ""
-                gist = row.get("gist") or ""
-                ago = format_ago(row.get("ago_s") or 0)
-                cwd_raw = meta.get("cwd") if isinstance(meta, dict) else None
-                cwd = (
-                    cwd_raw.replace(os.path.expanduser("~"), "~")
-                    if isinstance(cwd_raw, str) and cwd_raw else ""
+                self._append_row(
+                    out, row, color,
+                    title_font, gist_font, meta_font, bar_font,
+                    dim, very_dim,
+                    right_edge=list_right_edge,
+                    # Dormant rows don't need the literal preview —
+                    # they're stale by definition, save vertical space.
+                    show_preview=(key != "dormant"),
                 )
 
-                # Colored leading bar (▎) + title.
-                append("  ", {NSFontAttributeName: title_font})
-                append("▎", {
-                    NSFontAttributeName: bar_font,
-                    NSForegroundColorAttributeName: color,
-                })
-                append(f" {title}\n", {
-                    NSFontAttributeName: title_font,
-                    NSForegroundColorAttributeName: NSColor.labelColor(),
-                })
-
-                # Gist line — phase + AI/raw gist.
-                bits = []
-                if phase: bits.append(phase)
-                if gist: bits.append(gist)
-                if bits:
-                    append(f"     {'  ·  '.join(bits)}\n", {
-                        NSFontAttributeName: gist_font,
-                        NSForegroundColorAttributeName: dim,
-                    })
-
-                # Meta line — age + cwd.
-                meta_bits = [ago]
-                if cwd: meta_bits.append(cwd)
-                append(f"     {'  ·  '.join(meta_bits)}\n", {
-                    NSFontAttributeName: meta_font,
-                    NSForegroundColorAttributeName: very_dim,
-                })
-
-                # Spacer line between rows.
-                append("\n", {NSFontAttributeName: gist_font})
-
         if not any_rows:
-            append("  No active sessions in the last 24h.\n", {
-                NSFontAttributeName: NSFont.systemFontOfSize_(12),
-                NSForegroundColorAttributeName: dim,
-            })
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(
+                    "  No active sessions in the last 24h.\n",
+                    {
+                        NSFontAttributeName: NSFont.systemFontOfSize_(12),
+                        NSForegroundColorAttributeName: dim,
+                    },
+                )
+            )
         return out
 
 
