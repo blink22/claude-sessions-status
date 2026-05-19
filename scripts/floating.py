@@ -1650,6 +1650,16 @@ class KanbanCardView(NSView):
             pass
 
 
+class KanbanColumnDocView(NSView):
+    """Flipped NSView used as the document view of each kanban
+    NSScrollView. We lay subviews out top-to-bottom manually rather
+    than via NSStackView — the latter trips up on frame-sized
+    KanbanCardView children (no autolayout intrinsic size)."""
+
+    def isFlipped(self):
+        return True
+
+
 class PopoverVC(NSViewController):
     """Popover content view controller with a List ↔ Kanban segmented
     control at the top. Choice persists to ~/.claude-sessions-status-popover-mode.
@@ -1790,32 +1800,52 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _build_kanban_views(self):
-        """3 NSScrollView columns side by side via NSStackView. Each
-        column's document view is a vertical NSStackView containing
-        one column header label + N KanbanCardView subviews (the
-        Trello-style cards). Cards are torn down and rebuilt every
-        refresh — small N, cheap."""
-        stack = NSStackView.alloc().initWithFrame_(self.content_host.bounds())
+        """3 NSScrollView columns side by side via a horizontal NSStackView
+        with FILL_EQUALLY distribution. Each scroll view's document view
+        is a *flipped* KanbanColumnDocView with manually-laid-out subviews
+        (header NSTextField at top, KanbanCardView cards stacked below).
+        We avoid NSStackView for the inner column because frame-sized
+        cards have no autolayout intrinsic size — NSStackView would
+        collapse them to zero."""
+        host_bounds = self.content_host.bounds()
+        # If the content_host doesn't have a sensible frame yet (e.g.
+        # the popover hasn't been sized to KANBAN size yet), fall back
+        # to the kanban target size so the outer stack has a non-zero
+        # starting frame.
+        if host_bounds.size.width < 10:
+            host_bounds = NSMakeRect(
+                0, 0, POPOVER_KANBAN_SIZE[0],
+                POPOVER_KANBAN_SIZE[1] - 32,
+            )
+        stack = NSStackView.alloc().initWithFrame_(host_bounds)
         stack.setOrientation_(NS_USER_INTERFACE_LAYOUT_ORIENTATION_HORIZONTAL)
         stack.setSpacing_(8.0)
         stack.setDistribution_(NS_STACK_VIEW_DISTRIBUTION_FILL_EQUALLY)
         stack.setEdgeInsets_((4.0, 6.0, 4.0, 6.0))
         stack.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
 
+        # Start each scroll view with a non-zero frame; FILL_EQUALLY
+        # will then redistribute as the outer stack lays them out.
+        col_w0 = max(1.0, (host_bounds.size.width - 32) / 3.0)
+        col_h0 = max(1.0, host_bounds.size.height - 8)
+
         columns: list[dict] = []
         for key in ("needs", "working", "ready"):
-            col_scroll = NSScrollView.alloc().init()
+            col_scroll = NSScrollView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, col_w0, col_h0)
+            )
             col_scroll.setHasVerticalScroller_(True)
+            col_scroll.setHasHorizontalScroller_(False)
             col_scroll.setBorderType_(0)
             col_scroll.setDrawsBackground_(False)
-            col_scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            col_scroll.setAutoresizingMask_(
+                NSViewWidthSizable | NSViewHeightSizable
+            )
 
-            col_stack = NSStackView.alloc().init()
-            col_stack.setOrientation_(NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL)
-            col_stack.setSpacing_(8.0)
-            col_stack.setAlignment_(9)  # NSLayoutAttributeLeading
-            col_stack.setEdgeInsets_((4.0, 0.0, 4.0, 0.0))
-            col_stack.setAutoresizingMask_(NSViewWidthSizable)
+            doc = KanbanColumnDocView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, col_w0, col_h0)
+            )
+            doc.setAutoresizingMask_(NSViewWidthSizable)
 
             # Column header — set per-refresh because the count changes.
             header = NSTextField.labelWithString_("")
@@ -1823,15 +1853,16 @@ class PopoverVC(NSViewController):
                 NSFont.systemFontOfSize_weight_(10.0, NSFontWeightSemibold)
             )
             header.setTextColor_(_bucket_tint(key))
-            col_stack.addArrangedSubview_(header)
+            header.setAutoresizingMask_(NSViewWidthSizable)
+            doc.addSubview_(header)
 
-            col_scroll.setDocumentView_(col_stack)
+            col_scroll.setDocumentView_(doc)
             stack.addArrangedSubview_(col_scroll)
 
             columns.append({
                 "key": key,
                 "scroll": col_scroll,
-                "stack": col_stack,
+                "doc": doc,
                 "header": header,
             })
 
@@ -1929,67 +1960,103 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _render_kanban(self, buckets):
-        """Rebuild the per-column card stacks. Tears down existing
-        KanbanCardView subviews (keeping the header), then adds one
-        card per session in the corresponding bucket. Dormant rows
-        appear underneath the FINISHED column when show_dormant is on."""
+        """Rebuild the per-column card lists. Tears down existing
+        subviews of each column's flipped doc view, re-adds the header
+        + one KanbanCardView per session (and dormant rows under
+        FINISHED when show_dormant is on), then resizes the doc view
+        so the NSScrollView knows its scrollable height."""
         if self.kanban_columns is None:
             return
-        # Compute the card width so we can pre-measure card height during
-        # init. NSStackView splits the popover width evenly across 3 cols
-        # minus its edge insets and inter-column spacing.
-        popover_w = POPOVER_KANBAN_SIZE[0]
-        per_col_w = (popover_w - 12 - 2 * 8) / 3.0       # outer pad + 2 gaps
-        card_w = per_col_w - 8                            # inner col stack pad
+
+        HEADER_H = 20.0
+        HEADER_GAP = 6.0
+        CARD_GAP = 8.0
+        DORMANT_HEADER_TOP_GAP = 14.0
+        DORMANT_HEADER_H = 18.0
+        DOC_LEFT_PAD = 4.0
+        DOC_RIGHT_PAD = 4.0
 
         for col in self.kanban_columns:
             key = col["key"]
-            stack = col["stack"]
+            doc = col["doc"]
             header = col["header"]
+            scroll = col["scroll"]
             rows = buckets.get(key) or []
-            # Tuck dormant under FINISHED when the toggle is on.
             extra_rows: list = []
             if key == "ready" and self.show_dormant:
                 extra_rows = buckets.get("dormant") or []
 
-            # Clear all arranged subviews EXCEPT the header (index 0).
-            for sub in list(stack.arrangedSubviews())[1:]:
-                stack.removeArrangedSubview_(sub)
-                sub.removeFromSuperview()
+            # Tear down everything except the persistent header.
+            for sub in list(doc.subviews()):
+                if sub is not header:
+                    sub.removeFromSuperview()
 
-            # Update column header text + color.
-            header_count = len(rows)
-            header_text = f"  {LABELS[key]}  ·  {header_count}"
-            header.setStringValue_(header_text)
+            # The scroll view's content width minus our doc padding.
+            col_bounds_w = scroll.contentSize().width
+            if col_bounds_w < 10:
+                # Scroll view hasn't laid out yet; fall back to a
+                # sensible default so cards still measure correctly.
+                col_bounds_w = (POPOVER_KANBAN_SIZE[0] - 32) / 3.0
+            card_w = max(50.0, col_bounds_w - DOC_LEFT_PAD - DOC_RIGHT_PAD)
+
+            # Update + place the header at the top of the doc view.
+            header.setStringValue_(f"  {LABELS[key]}  ·  {len(rows)}")
             header.setTextColor_(_bucket_tint(key))
+            header.setFrame_(NSMakeRect(
+                DOC_LEFT_PAD, 0,
+                col_bounds_w - DOC_LEFT_PAD - DOC_RIGHT_PAD, HEADER_H,
+            ))
 
-            # Active rows as cards.
+            y = HEADER_H + HEADER_GAP
             color = _bucket_tint(key)
             for row in rows:
                 card = KanbanCardView.alloc().initWithRow_color_width_vc_(
                     row, color, card_w, self,
                 )
-                if card is not None:
-                    stack.addArrangedSubview_(card)
+                if card is None:
+                    continue
+                ch = card.frame().size.height
+                card.setFrame_(NSMakeRect(DOC_LEFT_PAD, y, card_w, ch))
+                doc.addSubview_(card)
+                y += ch + CARD_GAP
 
-            # Dormant block under FINISHED (when toggle is on).
+            # Dormant block (under FINISHED column when toggle is on).
             if extra_rows:
-                # A small dim header before the dormant cards.
+                y += DORMANT_HEADER_TOP_GAP - CARD_GAP  # extra breathing room
                 dormant_header = NSTextField.labelWithString_(
-                    f"\n  {LABELS['dormant']}  ·  {len(extra_rows)}"
+                    f"  {LABELS['dormant']}  ·  {len(extra_rows)}"
                 )
                 dormant_header.setFont_(
                     NSFont.systemFontOfSize_weight_(10.0, NSFontWeightSemibold)
                 )
                 dormant_header.setTextColor_(NSColor.tertiaryLabelColor())
-                stack.addArrangedSubview_(dormant_header)
+                dormant_header.setFrame_(NSMakeRect(
+                    DOC_LEFT_PAD, y,
+                    col_bounds_w - DOC_LEFT_PAD - DOC_RIGHT_PAD,
+                    DORMANT_HEADER_H,
+                ))
+                doc.addSubview_(dormant_header)
+                y += DORMANT_HEADER_H + HEADER_GAP
+
                 dormant_color = NSColor.tertiaryLabelColor()
                 for row in extra_rows:
                     card = KanbanCardView.alloc().initWithRow_color_width_vc_(
                         row, dormant_color, card_w, self,
                     )
-                    if card is not None:
-                        stack.addArrangedSubview_(card)
+                    if card is None:
+                        continue
+                    ch = card.frame().size.height
+                    card.setFrame_(NSMakeRect(
+                        DOC_LEFT_PAD, y, card_w, ch,
+                    ))
+                    doc.addSubview_(card)
+                    y += ch + CARD_GAP
+
+            # Resize the doc view to the total laid-out height so the
+            # scroll view knows it needs to scroll (or doesn't).
+            content_h = scroll.contentSize().height
+            doc_h = max(content_h, y + 8.0)
+            doc.setFrame_(NSMakeRect(0, 0, col_bounds_w, doc_h))
 
     @objc.python_method
     def _build_single_bucket_attributed(
