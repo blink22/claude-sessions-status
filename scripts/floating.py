@@ -44,6 +44,7 @@ try:
         NSBox,
         NSButton,
         NSColor,
+        NSCursor,
         NSEvent,
         NSFont,
         NSFontAttributeName,
@@ -1405,13 +1406,254 @@ class _SessionRowView(NSView):
         meta_s.drawInRect_(NSMakeRect(text_x, 44.0, avail_w, 14.0))
 
 
+class KanbanCardView(NSView):
+    """A single Trello-style session card for kanban mode.
+
+    Visuals: layer-backed NSView with rounded corners (8pt) and a thin
+    separator border, an opinionated card background, a 3pt colored
+    leading bar (bucket tint), and the session's title / phase+gist /
+    snippet / age rendered as one attributed string drawn in drawRect_.
+
+    Interactions:
+      - Click anywhere on the card → resume the session (delegates to
+        the popover VC's resume handler).
+      - For unread sessions, an inline ✓ NSButton subview in the
+        top-right marks the session read; click is absorbed by the
+        button so the card-level click doesn't also fire.
+      - Pointing-hand cursor on hover."""
+
+    row_data = objc.ivar("row_data")
+    bucket_color = objc.ivar("bucket_color")
+    vc_ref = objc.ivar("vc_ref")
+    attr_str = objc.ivar("attr_str")
+    mark_button = objc.ivar("mark_button")
+
+    # Visual constants — kept here rather than module-scope so future
+    # tweaks stay close to the drawing code.
+    _PAD_TOP = 12.0
+    _PAD_BOTTOM = 12.0
+    _PAD_LEFT_BAR = 8.0           # leading bar starts here
+    _PAD_LEFT_TEXT = 22.0         # text content starts here (after bar + gap)
+    _PAD_RIGHT = 14.0
+    _PAD_BUTTON_RIGHT = 32.0      # text right-padding when there's a ✓ button
+    _BAR_WIDTH = 3.0
+    _BAR_VINSET = 8.0             # bar inset from top/bottom of card
+    _BUTTON_SIZE = 22.0
+    _CORNER_RADIUS = 8.0
+    _BUTTON_TOP_RIGHT_INSET = 6.0
+
+    def initWithRow_color_width_vc_(self, row, color, width: float, vc):
+        attr = KanbanCardView._build_content_attr_str(row, color)
+        unread = bool(row.get("unread"))
+        right_pad = (
+            KanbanCardView._PAD_BUTTON_RIGHT if unread
+            else KanbanCardView._PAD_RIGHT
+        )
+        text_w = (
+            width - KanbanCardView._PAD_LEFT_TEXT - right_pad
+        )
+        # Measure text height with word-wrap at the available width.
+        bounding = attr.boundingRectWithSize_options_(
+            NSMakeSize(text_w, 10_000.0),
+            (1 << 0) | (1 << 1),  # NSStringDrawingUsesLineFragmentOrigin | UsesFontLeading
+        )
+        text_h = bounding.size.height
+        h = KanbanCardView._PAD_TOP + text_h + KanbanCardView._PAD_BOTTOM
+        # Round up so we never clip a partial pixel of the last line.
+        import math
+        h = float(math.ceil(h))
+
+        self = objc.super(KanbanCardView, self).initWithFrame_(
+            NSMakeRect(0, 0, width, h),
+        )
+        if self is None:
+            return None
+        self.row_data = row
+        self.bucket_color = color
+        self.vc_ref = vc
+        self.attr_str = attr
+        self.mark_button = None
+
+        # Card chrome: rounded background + thin border.
+        self.setWantsLayer_(True)
+        layer = self.layer()
+        if layer is not None:
+            layer.setCornerRadius_(KanbanCardView._CORNER_RADIUS)
+            layer.setBackgroundColor_(
+                NSColor.controlBackgroundColor().CGColor()
+            )
+            layer.setBorderWidth_(0.5)
+            layer.setBorderColor_(
+                NSColor.separatorColor().colorWithAlphaComponent_(0.7).CGColor()
+            )
+
+        if unread:
+            self._install_mark_read_button()
+
+        return self
+
+    @staticmethod
+    def _build_content_attr_str(row, color):
+        """Build the card's attributed-string content."""
+        meta = row.get("meta") or {}
+        title = (row.get("title") or "(untitled)").strip()
+        phase = row.get("phase_label") or ""
+        gist = row.get("gist") or ""
+        ago = format_ago(row.get("ago_s") or 0)
+
+        # Snippet from real recent content.
+        raw = meta.get("lastAssistantText") or meta.get("lastAction") or ""
+        snippet = ""
+        if isinstance(raw, str) and raw.strip():
+            snippet = " ".join(raw.split())
+            if len(snippet) > 140:
+                snippet = snippet[:140] + "…"
+
+        title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        phase_font = NSFont.systemFontOfSize_weight_(12, NSFontWeightSemibold)
+        body_font = NSFont.systemFontOfSize_(12)
+        snippet_font = NSFont.systemFontOfSize_(11)
+        meta_font = _rounded_tabular_font(11, NSFontWeightRegular)
+        tiny_spacer = NSFont.systemFontOfSize_(5)
+        label = NSColor.labelColor()
+        secondary = NSColor.secondaryLabelColor()
+        tertiary = NSColor.tertiaryLabelColor()
+
+        out = NSMutableAttributedString.alloc().init()
+
+        def add(text, attrs):
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+            )
+
+        # Title — bold, primary
+        add(title, {
+            NSFontAttributeName: title_font,
+            NSForegroundColorAttributeName: label,
+        })
+        # Phase + gist
+        if phase or gist:
+            add("\n\n", {NSFontAttributeName: tiny_spacer})
+            if phase:
+                add(phase, {
+                    NSFontAttributeName: phase_font,
+                    NSForegroundColorAttributeName: color or label,
+                })
+                if gist:
+                    add("  ·  ", {
+                        NSFontAttributeName: body_font,
+                        NSForegroundColorAttributeName: secondary,
+                    })
+            if gist:
+                add(gist, {
+                    NSFontAttributeName: body_font,
+                    NSForegroundColorAttributeName: label,
+                })
+        # Snippet
+        if snippet:
+            add("\n\n", {NSFontAttributeName: tiny_spacer})
+            add(f"“{snippet}”", {
+                NSFontAttributeName: snippet_font,
+                NSForegroundColorAttributeName: secondary,
+            })
+        # Footer (age)
+        add("\n\n", {NSFontAttributeName: tiny_spacer})
+        add(ago, {
+            NSFontAttributeName: meta_font,
+            NSForegroundColorAttributeName: tertiary,
+        })
+        return out
+
+    @objc.python_method
+    def _install_mark_read_button(self):
+        btn = NSButton.alloc().init()
+        btn.setTitle_("✓")
+        btn.setBordered_(False)
+        btn.setFont_(NSFont.systemFontOfSize_weight_(14, NSFontWeightSemibold))
+        btn.setContentTintColor_(
+            NSColor.controlAccentColor()
+            if hasattr(NSColor, "controlAccentColor") else NSColor.labelColor()
+        )
+        btn.setTarget_(self)
+        btn.setAction_("markReadClicked:")
+        bounds = self.bounds()
+        sz = KanbanCardView._BUTTON_SIZE
+        inset = KanbanCardView._BUTTON_TOP_RIGHT_INSET
+        btn.setFrame_(NSMakeRect(
+            bounds.size.width - sz - inset,
+            inset,                          # flipped: top-right
+            sz, sz,
+        ))
+        btn.setAutoresizingMask_(NSViewMinXMargin)
+        self.addSubview_(btn)
+        self.mark_button = btn
+
+    def isFlipped(self):
+        return True
+
+    def drawRect_(self, _dirty):
+        bounds = self.bounds()
+        # Colored leading bar (bucket tint).
+        if self.bucket_color is not None:
+            bar_x = KanbanCardView._PAD_LEFT_BAR
+            bar_y = KanbanCardView._BAR_VINSET
+            bar_w = KanbanCardView._BAR_WIDTH
+            bar_h = max(0.0, bounds.size.height - 2 * KanbanCardView._BAR_VINSET)
+            self.bucket_color.setFill()
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(bar_x, bar_y, bar_w, bar_h),
+                bar_w / 2.0, bar_w / 2.0,
+            ).fill()
+        # Text content
+        unread = bool(self.row_data.get("unread")) if self.row_data else False
+        right_pad = (
+            KanbanCardView._PAD_BUTTON_RIGHT if unread
+            else KanbanCardView._PAD_RIGHT
+        )
+        text_x = KanbanCardView._PAD_LEFT_TEXT
+        text_y = KanbanCardView._PAD_TOP
+        text_w = bounds.size.width - text_x - right_pad
+        text_h = bounds.size.height - text_y - KanbanCardView._PAD_BOTTOM
+        if self.attr_str is not None and text_w > 0 and text_h > 0:
+            self.attr_str.drawWithRect_options_(
+                NSMakeRect(text_x, text_y, text_w, text_h),
+                (1 << 0) | (1 << 1),  # UsesLineFragmentOrigin | UsesFontLeading
+            )
+
+    def mouseDown_(self, _event):
+        # Card-wide click = resume the session in its current host.
+        if self.vc_ref is not None and self.row_data is not None:
+            try:
+                self.vc_ref.handleCardResume_(self)
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[KanbanCardView.mouseDown_] {e!r}\n")
+
+    def markReadClicked_(self, _sender):
+        if self.vc_ref is not None and self.row_data is not None:
+            try:
+                self.vc_ref.handleCardMarkRead_(self)
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[KanbanCardView.markReadClicked_] {e!r}\n")
+
+    def resetCursorRects(self):
+        # Pointing hand over the card content (NSButton installs its
+        # own cursor over its bounds — no conflict).
+        try:
+            self.addCursorRect_cursor_(
+                self.bounds(), NSCursor.pointingHandCursor(),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class PopoverVC(NSViewController):
     """Popover content view controller with a List ↔ Kanban segmented
     control at the top. Choice persists to ~/.claude-sessions-status-popover-mode.
 
-    Both layouts use the same rendering primitives (NSScrollView +
-    NSTextView + NSAttributedString) so we keep one proven text-stack
-    instead of mixing custom auto-layout views."""
+    List mode renders inside one NSTextView (attributed string).
+    Kanban mode renders 3 NSScrollView columns, each containing an
+    NSStackView of KanbanCardView subviews — proper Trello-style
+    cards with rounded backgrounds + per-card click handling."""
 
     mode = objc.ivar("mode")                  # "list" or "kanban"
     segmented = objc.ivar("segmented")
@@ -1419,7 +1661,10 @@ class PopoverVC(NSViewController):
     list_scroll = objc.ivar("list_scroll")
     list_text_view = objc.ivar("list_text_view")
     kanban_stack = objc.ivar("kanban_stack")
-    kanban_text_views = objc.ivar("kanban_text_views")
+    # List of one dict per column: {"scroll", "stack", "header", "key"}
+    # where "stack" holds the KanbanCardView subviews and "header" is
+    # the NSTextField at the top of the column. Rebuilt on every refresh.
+    kanban_columns = objc.ivar("kanban_columns")
     popover_ref = objc.ivar("popover_ref")    # NSPopover, set by BadgeController
     last_rendered_rows = objc.ivar("last_rendered_rows")  # for mark-all-read
     show_dormant = objc.ivar("show_dormant")   # bool — toggle to hide dormant
@@ -1541,39 +1786,53 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _build_kanban_views(self):
-        """3 NSScrollView+NSTextView columns side by side via NSStackView."""
+        """3 NSScrollView columns side by side via NSStackView. Each
+        column's document view is a vertical NSStackView containing
+        one column header label + N KanbanCardView subviews (the
+        Trello-style cards). Cards are torn down and rebuilt every
+        refresh — small N, cheap."""
         stack = NSStackView.alloc().initWithFrame_(self.content_host.bounds())
         stack.setOrientation_(NS_USER_INTERFACE_LAYOUT_ORIENTATION_HORIZONTAL)
-        stack.setSpacing_(4.0)
+        stack.setSpacing_(8.0)
         stack.setDistribution_(NS_STACK_VIEW_DISTRIBUTION_FILL_EQUALLY)
-        stack.setEdgeInsets_((4.0, 4.0, 4.0, 4.0))
+        stack.setEdgeInsets_((4.0, 6.0, 4.0, 6.0))
         stack.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
 
-        tvs: list = []
-        for _ in range(3):
+        columns: list[dict] = []
+        for key in ("needs", "working", "ready"):
             col_scroll = NSScrollView.alloc().init()
             col_scroll.setHasVerticalScroller_(True)
             col_scroll.setBorderType_(0)
             col_scroll.setDrawsBackground_(False)
             col_scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
 
-            col_tv = NSTextView.alloc().init()
-            col_tv.setEditable_(False)
-            col_tv.setSelectable_(True)
-            col_tv.setRichText_(True)
-            col_tv.setHorizontallyResizable_(False)
-            col_tv.setVerticallyResizable_(True)
-            col_tv.setAutoresizingMask_(NSViewWidthSizable)
-            col_tv.textContainer().setWidthTracksTextView_(True)
-            col_tv.setDrawsBackground_(False)
-            col_tv.setTextContainerInset_(NSMakeSize(0, 4))
+            col_stack = NSStackView.alloc().init()
+            col_stack.setOrientation_(NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL)
+            col_stack.setSpacing_(8.0)
+            col_stack.setAlignment_(9)  # NSLayoutAttributeLeading
+            col_stack.setEdgeInsets_((4.0, 0.0, 4.0, 0.0))
+            col_stack.setAutoresizingMask_(NSViewWidthSizable)
 
-            col_scroll.setDocumentView_(col_tv)
+            # Column header — set per-refresh because the count changes.
+            header = NSTextField.labelWithString_("")
+            header.setFont_(
+                NSFont.systemFontOfSize_weight_(10.0, NSFontWeightSemibold)
+            )
+            header.setTextColor_(_bucket_tint(key))
+            col_stack.addArrangedSubview_(header)
+
+            col_scroll.setDocumentView_(col_stack)
             stack.addArrangedSubview_(col_scroll)
-            tvs.append(col_tv)
+
+            columns.append({
+                "key": key,
+                "scroll": col_scroll,
+                "stack": col_stack,
+                "header": header,
+            })
 
         self.kanban_stack = stack
-        self.kanban_text_views = tvs
+        self.kanban_columns = columns
 
     @objc.python_method
     def _install_layout(self):
@@ -1650,12 +1909,12 @@ class PopoverVC(NSViewController):
         else:
             self._render_list(buckets)
 
-        # Make sure the text views forward link clicks to us.
+        # Make sure the list-mode text view forwards link clicks to us.
+        # (Kanban-mode cards now use their own mouseDown_ / NSButton
+        # actions instead of NSTextView link tracking — no delegate
+        # plumbing needed for that mode.)
         if self.list_text_view is not None:
             self.list_text_view.setDelegate_(self)
-        if self.kanban_text_views is not None:
-            for tv in self.kanban_text_views:
-                tv.setDelegate_(self)
 
     @objc.python_method
     def _render_list(self, buckets):
@@ -1666,18 +1925,67 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _render_kanban(self, buckets):
-        if self.kanban_text_views is None:
+        """Rebuild the per-column card stacks. Tears down existing
+        KanbanCardView subviews (keeping the header), then adds one
+        card per session in the corresponding bucket. Dormant rows
+        appear underneath the FINISHED column when show_dormant is on."""
+        if self.kanban_columns is None:
             return
-        cols = ("needs", "working", "ready")
-        for tv, key in zip(self.kanban_text_views, cols):
+        # Compute the card width so we can pre-measure card height during
+        # init. NSStackView splits the popover width evenly across 3 cols
+        # minus its edge insets and inter-column spacing.
+        popover_w = POPOVER_KANBAN_SIZE[0]
+        per_col_w = (popover_w - 12 - 2 * 8) / 3.0       # outer pad + 2 gaps
+        card_w = per_col_w - 8                            # inner col stack pad
+
+        for col in self.kanban_columns:
+            key = col["key"]
+            stack = col["stack"]
+            header = col["header"]
             rows = buckets.get(key) or []
-            # In kanban mode the dormant bucket is tucked beneath the
-            # FINISHED column — but only when the toggle is enabled.
-            extra = None
+            # Tuck dormant under FINISHED when the toggle is on.
+            extra_rows: list = []
             if key == "ready" and self.show_dormant:
-                extra = ("dormant", buckets.get("dormant") or [])
-            mas = self._build_single_bucket_attributed(key, rows, extra=extra)
-            tv.textStorage().setAttributedString_(mas)
+                extra_rows = buckets.get("dormant") or []
+
+            # Clear all arranged subviews EXCEPT the header (index 0).
+            for sub in list(stack.arrangedSubviews())[1:]:
+                stack.removeArrangedSubview_(sub)
+                sub.removeFromSuperview()
+
+            # Update column header text + color.
+            header_count = len(rows)
+            header_text = f"  {LABELS[key]}  ·  {header_count}"
+            header.setStringValue_(header_text)
+            header.setTextColor_(_bucket_tint(key))
+
+            # Active rows as cards.
+            color = _bucket_tint(key)
+            for row in rows:
+                card = KanbanCardView.alloc().initWithRow_color_width_vc_(
+                    row, color, card_w, self,
+                )
+                if card is not None:
+                    stack.addArrangedSubview_(card)
+
+            # Dormant block under FINISHED (when toggle is on).
+            if extra_rows:
+                # A small dim header before the dormant cards.
+                dormant_header = NSTextField.labelWithString_(
+                    f"\n  {LABELS['dormant']}  ·  {len(extra_rows)}"
+                )
+                dormant_header.setFont_(
+                    NSFont.systemFontOfSize_weight_(10.0, NSFontWeightSemibold)
+                )
+                dormant_header.setTextColor_(NSColor.tertiaryLabelColor())
+                stack.addArrangedSubview_(dormant_header)
+                dormant_color = NSColor.tertiaryLabelColor()
+                for row in extra_rows:
+                    card = KanbanCardView.alloc().initWithRow_color_width_vc_(
+                        row, dormant_color, card_w, self,
+                    )
+                    if card is not None:
+                        stack.addArrangedSubview_(card)
 
     @objc.python_method
     def _build_single_bucket_attributed(
@@ -1840,6 +2148,37 @@ class PopoverVC(NSViewController):
             import traceback
             traceback.print_exc(file=sys.stderr)
         return False
+
+    # ---- Kanban card actions (called from KanbanCardView) ----
+    def handleCardResume_(self, card):
+        """A card was clicked → resume the session in its existing host."""
+        row = card.row_data
+        if not row:
+            return
+        sid = (row.get("s") or {}).get("sessionId") or ""
+        cwd = ((row.get("meta") or {}).get("cwd")
+               if isinstance((row.get("meta") or {}).get("cwd"), str)
+               else None) or os.path.expanduser("~")
+        # Auto-mark-as-read on resume click — engaging with the session.
+        epoch = row.get("lastTurnEpoch")
+        _mark_session_read(sid, epoch if epoch is not None else time.time())
+        self._open_session_in_terminal(sid, cwd)
+        # Close the popover — the user is moving to the session host.
+        if self.popover_ref is not None:
+            try:
+                self.popover_ref.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def handleCardMarkRead_(self, card):
+        """The card's ✓ button was clicked → mark this session as read."""
+        row = card.row_data
+        if not row:
+            return
+        sid = (row.get("s") or {}).get("sessionId") or ""
+        epoch = row.get("lastTurnEpoch")
+        _mark_session_read(sid, epoch if epoch is not None else time.time())
+        self.refresh()
 
     @objc.python_method
     def _open_session_in_terminal(self, sid: str, cwd: str) -> None:
