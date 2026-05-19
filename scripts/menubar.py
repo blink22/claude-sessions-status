@@ -45,6 +45,11 @@ from dashboard import (  # noqa: E402
     is_dormant,
     desktop_titles,
     session_gist,
+    classify as _classify_canonical,
+    BUCKET_NEEDS as _CANON_NEEDS,
+    BUCKET_WORKING as _CANON_WORKING,
+    BUCKET_READY as _CANON_READY,
+    BUCKET_DORMANT as _CANON_DORMANT,
 )
 
 # ---------- sanitization ----------
@@ -70,10 +75,12 @@ def _abbrev_home(path: str) -> str:
 
 
 # ---------- buckets + colors ----------
-BUCKET_NEEDS = "needs"
-BUCKET_WORKING = "working"
-BUCKET_READY = "ready"
-BUCKET_DORMANT = "dormant"
+# Re-export the canonical bucket identifiers from dashboard.py so this
+# file's existing references keep working without changes elsewhere.
+BUCKET_NEEDS = _CANON_NEEDS
+BUCKET_WORKING = _CANON_WORKING
+BUCKET_READY = _CANON_READY
+BUCKET_DORMANT = _CANON_DORMANT
 
 # Active buckets — shown prominently. DORMANT is rendered separately at
 # the bottom with reduced visual weight.
@@ -87,16 +94,9 @@ DORMANT_HEADER = "DORMANT"
 DORMANT_COLOR = "#6e7681"   # dim gray, matches subtle text elsewhere
 
 
+# Delegate to dashboard.classify so menubar and floating can't drift apart.
 def classify(state: str, phase_label: str) -> str:
-    if state == "Maybe stuck":
-        return BUCKET_NEEDS
-    if phase_label in ("Asking you", "Proposing a plan"):
-        return BUCKET_NEEDS
-    if state == "Working…":
-        return BUCKET_WORKING
-    if state == "Waiting on you":
-        return BUCKET_READY
-    return BUCKET_READY
+    return _classify_canonical(state, phase_label)
 
 
 def urgency_key(row: dict) -> tuple:

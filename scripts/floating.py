@@ -111,6 +111,7 @@ except ImportError as e:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dashboard  # noqa: E402
 from dashboard import (  # noqa: E402
+    classify,
     desktop_titles,
     find_sessions,
     format_ago,
@@ -193,15 +194,30 @@ def _write_show_dormant(value: bool) -> None:
 # install doesn't dump dozens of unread dots on day one.
 SEEN_FILE = HOME / ".claude-sessions-status-seen.json"
 
+# mtime-keyed cache: avoids re-reading + re-parsing the seen JSON on
+# every 5s tick when nothing has changed. Invalidated on mtime change
+# (either we wrote it, or another process did).
+_seen_cache: tuple[float, dict] | None = None
+
 
 def _load_seen() -> dict:
+    global _seen_cache
     if not SEEN_FILE.exists():
+        _seen_cache = None
         return {}
     try:
+        mtime = SEEN_FILE.stat().st_mtime
+    except OSError:
+        return _seen_cache[1] if _seen_cache else {}
+    if _seen_cache is not None and _seen_cache[0] == mtime:
+        return _seen_cache[1]
+    try:
         data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        data = data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
-        return {}
+        data = {}
+    _seen_cache = (mtime, data)
+    return data
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -222,8 +238,37 @@ def _atomic_write_text(path: Path, content: str) -> None:
             pass
 
 
+_SEEN_GC_TTL_S = 30 * 86400.0  # 30 days
+
+
+def _gc_seen(seen: dict) -> dict:
+    """Drop entries whose `lastSeenAt` is older than the GC TTL. Keeps
+    the seen file from growing unboundedly over months of use without
+    expensively cross-referencing every entry against on-disk session
+    files. Returns a NEW dict (does not mutate the input)."""
+    cutoff = time.time() - _SEEN_GC_TTL_S
+    out: dict = {}
+    for sid, entry in seen.items():
+        if not isinstance(entry, dict):
+            continue
+        ts = entry.get("lastSeenAt")
+        if isinstance(ts, (int, float)) and ts >= cutoff:
+            out[sid] = entry
+    return out
+
+
 def _save_seen(seen: dict) -> None:
+    global _seen_cache
+    # GC expired entries before each save — once per mark-read action,
+    # which is rare enough that the cost is invisible.
+    seen = _gc_seen(seen)
     _atomic_write_text(SEEN_FILE, json.dumps(seen, indent=2, sort_keys=True))
+    # Update the in-process cache so the next _load_seen avoids a disk
+    # read. Use the file's new mtime as the cache key.
+    try:
+        _seen_cache = (SEEN_FILE.stat().st_mtime, dict(seen))
+    except OSError:
+        _seen_cache = None
 
 
 def _is_session_unread(session_id: str, last_turn_epoch, seen: dict) -> bool:
@@ -350,24 +395,38 @@ def _bucket_tint(key: str):
 def _draw_sf_symbol_centered(name: str, center_x: float, center_y: float,
                               point_size: float, color):
     """Draw an SF Symbol centered at (center_x, center_y), tinted with
-    `color`, at the given point size. Falls back silently if the system
-    doesn't have that symbol (older macOS, typo, etc.)."""
+    `color`, at the given point size. Falls back to a smaller set of
+    AppKit features on older macOS (11), and silently no-ops if the
+    system doesn't have the symbol at all."""
     img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
     if img is None:
         return
+    # Step 1 (universal — macOS 11+): size + weight + scale config.
+    size_cfg = None
     try:
-        # Build size + weight config first.
         size_cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_scale_(
             point_size, NSFontWeightSemibold, 2,  # scale=Medium
         )
-        # Then a hierarchical-color config (tint).
-        color_cfg = NSImageSymbolConfiguration.configurationWithHierarchicalColor_(color)
-        combined = size_cfg.configurationByApplyingConfiguration_(color_cfg)
-        img = img.imageWithSymbolConfiguration_(combined)
     except Exception:  # noqa: BLE001
-        # Older macOS / different PyObjC API path — fall back to drawing
-        # the symbol untinted at its default point size.
-        pass
+        size_cfg = None
+    # Step 2 (macOS 12+): hierarchical-color tint. If unavailable,
+    # apply the size config alone — the icon ends up the system
+    # foreground color but at the correct size, which is preferable to
+    # an oversized default-rendered symbol.
+    final_cfg = None
+    try:
+        color_cfg = NSImageSymbolConfiguration.configurationWithHierarchicalColor_(color)
+        if size_cfg is not None and color_cfg is not None:
+            final_cfg = size_cfg.configurationByApplyingConfiguration_(color_cfg)
+        else:
+            final_cfg = color_cfg or size_cfg
+    except Exception:  # noqa: BLE001
+        final_cfg = size_cfg
+    if final_cfg is not None:
+        try:
+            img = img.imageWithSymbolConfiguration_(final_cfg)
+        except Exception:  # noqa: BLE001
+            pass
     sz = img.size()
     rect = NSMakeRect(
         center_x - sz.width / 2.0,
@@ -471,17 +530,11 @@ def _write_mode(mode: str) -> None:
     _atomic_write_text(MODE_FILE, mode)
 
 
-# ---------- Session aggregation (mirrors menubar.py) ----------
-def _classify(state: str, phase_label: str) -> str:
-    if state == "Maybe stuck":
-        return "needs"
-    if phase_label in ("Asking you", "Proposing a plan"):
-        return "needs"
-    if state == "Working…":
-        return "working"
-    if state == "Waiting on you":
-        return "ready"
-    return "ready"
+# ---------- Session aggregation ----------
+# `classify` is imported from dashboard.py so menubar.py and floating.py
+# share a single source of truth. The wrapper preserves the old `_classify`
+# name in case anything else in this module imports it by that name.
+_classify = classify
 
 
 def _get_buckets() -> dict[str, list[dict]]:
@@ -941,11 +994,35 @@ class BadgeView(NSView):
         self.counts = {"needs": 0, "working": 0, "ready": 0, "dormant": 0}
         self.drag_anchor = None
         self.did_drag = False
+        # Accessibility: surface this widget to VoiceOver as a labeled
+        # button. The dynamic count breakdown is exposed via the
+        # accessibilityValue (refreshed in set_counts).
+        try:
+            self.setAccessibilityElement_(True)
+            self.setAccessibilityRole_("AXButton")
+            self.setAccessibilityLabel_("Claude Sessions Status")
+            self.setAccessibilityValue_(self._accessibility_value_text())
+        except Exception:  # noqa: BLE001
+            pass
         return self
+
+    @objc.python_method
+    def _accessibility_value_text(self) -> str:
+        """Human-readable per-bucket count string for VoiceOver."""
+        c = self.counts or {}
+        return (
+            f"{int(c.get('needs', 0) or 0)} need you, "
+            f"{int(c.get('working', 0) or 0)} working, "
+            f"{int(c.get('ready', 0) or 0)} finished"
+        )
 
     @objc.python_method
     def set_counts(self, counts: dict) -> None:
         self.counts = counts
+        try:
+            self.setAccessibilityValue_(self._accessibility_value_text())
+        except Exception:  # noqa: BLE001
+            pass
         self.setNeedsDisplay_(True)
 
     @objc.python_method
@@ -1528,7 +1605,9 @@ class PopoverVC(NSViewController):
     @objc.python_method
     def _row_paragraph_style(self, right_edge: float):
         """Paragraph style with a right tab stop, used so the age aligns
-        to the right edge of the row."""
+        to the right edge of the row. The line break mode is set to
+        truncating-tail so long titles get an ellipsis instead of
+        pushing the tab stop off-screen / onto a wrapped line."""
         ps = NSMutableParagraphStyle.alloc().init()
         tab = NSTextTab.alloc().initWithTextAlignment_location_options_(
             2,             # NSTextAlignmentRight
@@ -1536,6 +1615,16 @@ class PopoverVC(NSViewController):
             {},
         )
         ps.setTabStops_([tab])
+        # If the title alone exceeds the tab-stop position, NSTextView
+        # would normally wrap and put the age on a new line. Setting
+        # truncate-tail (=4) makes the title get clipped with "…"
+        # instead, keeping the row a tidy single line.
+        ps.setLineBreakMode_(4)
+        # And: any tab past our explicit stop falls back to a default
+        # interval. Force that interval to the same right_edge so a
+        # second tab (if anything ever introduces one) doesn't snap
+        # to a stray 28pt grid.
+        ps.setDefaultTabInterval_(right_edge)
         return ps
 
     # ---- NSTextView link delegate ----

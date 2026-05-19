@@ -155,9 +155,13 @@ def _text_from_content(content) -> str:
     return ""
 
 
-# Caches keyed on session file path. cwd/firstPrompt don't change once set,
-# so we avoid re-scanning the full transcript on every refresh.
-_meta_cache: dict[str, dict] = {}
+# Caches keyed on session file path. Stores (mtime, meta) tuples so
+# we can skip the full transcript scan whenever the file hasn't grown
+# since last read. Combined with `cwd` / `firstPrompt` being immutable
+# once seen, this turns a 20-session refresh from ~20 disk reads into
+# ~0 in the steady state (only re-scanning sessions that actually had
+# a new turn).
+_meta_cache: dict[str, tuple[float, dict]] = {}
 
 
 def transcript_meta(transcript_path: str) -> dict:
@@ -170,7 +174,6 @@ def transcript_meta(transcript_path: str) -> dict:
     we expose `lastAssistantHasText` for downstream logic to tell them
     apart."""
     p = Path(transcript_path)
-    cached = _meta_cache.get(transcript_path)
     blank = {
         "cwd": None, "firstPrompt": None,
         "lastRole": None, "lastAction": "",
@@ -179,7 +182,21 @@ def transcript_meta(transcript_path: str) -> dict:
         "lastAssistantTools": [],
     }
     if not p.exists():
-        return cached or blank
+        # Return the cached value if we have one — better than blank.
+        prev = _meta_cache.get(transcript_path)
+        return (prev[1] if prev else blank)
+
+    # mtime-based cache hit: skip the JSONL scan entirely if the file
+    # hasn't changed since the last computation.
+    try:
+        current_mtime = p.stat().st_mtime
+    except OSError:
+        prev = _meta_cache.get(transcript_path)
+        return (prev[1] if prev else blank)
+    prev = _meta_cache.get(transcript_path)
+    if prev is not None and prev[0] == current_mtime:
+        return prev[1]
+    cached = prev[1] if prev else None
 
     try:
         with p.open("r", encoding="utf-8", errors="ignore") as f:
@@ -319,7 +336,7 @@ def transcript_meta(transcript_path: str) -> dict:
         "lastTurnEpoch": last_turn_epoch,
         "latestUserPrompt": latest_user_prompt,
     }
-    _meta_cache[transcript_path] = meta
+    _meta_cache[transcript_path] = (current_mtime, meta)
     return meta
 
 
@@ -626,6 +643,31 @@ def is_dormant(
     if bucket == "ready" and ago_seconds > STALE_FINISHED_SECS:
         return True
     return False
+
+
+# Canonical bucket identifiers. Re-used by `classify` and by every view
+# (menubar, floating, terminal). Single source of truth so menubar and
+# floating can't drift apart.
+BUCKET_NEEDS = "needs"
+BUCKET_WORKING = "working"
+BUCKET_READY = "ready"
+BUCKET_DORMANT = "dormant"
+BUCKET_ORDER = (BUCKET_NEEDS, BUCKET_WORKING, BUCKET_READY, BUCKET_DORMANT)
+
+
+def classify(state: str, phase_label: str) -> str:
+    """Map (state, phase_label) → one of {needs, working, ready}.
+    Dormant is NOT decided here — `is_dormant` overrides this once
+    activity-age + process-liveness are known."""
+    if state == "Maybe stuck":
+        return BUCKET_NEEDS
+    if phase_label in ("Asking you", "Proposing a plan"):
+        return BUCKET_NEEDS
+    if state == "Working…":
+        return BUCKET_WORKING
+    if state == "Waiting on you":
+        return BUCKET_READY
+    return BUCKET_READY
 
 
 def state_for(meta: dict, ago_seconds: float) -> tuple[str, str]:
