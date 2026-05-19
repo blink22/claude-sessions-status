@@ -1804,23 +1804,6 @@ class PopoverVC(NSViewController):
                 _mark_sessions_read(pairs)
                 self.refresh()
                 return True
-            if url_str.startswith("cssmessage://"):
-                sid = url_str[len("cssmessage://"):]
-                # Look up the matching row for cwd + title.
-                row = next(
-                    (r for r in (self.last_rendered_rows or [])
-                     if (r.get("s") or {}).get("sessionId") == sid),
-                    None,
-                )
-                if row is None:
-                    return True
-                meta = row.get("meta") or {}
-                cwd = (meta.get("cwd")
-                       if isinstance(meta.get("cwd"), str) else None) \
-                      or os.path.expanduser("~")
-                title = row.get("title") or "(untitled)"
-                self._send_message_to_session(sid, cwd, title)
-                return True
             if url_str.startswith("cssresume://"):
                 sid = url_str[len("cssresume://"):]
                 # Look up cwd for the click target so we can cd before
@@ -1910,118 +1893,6 @@ class PopoverVC(NSViewController):
             )
         except (OSError, subprocess.SubprocessError) as e:
             sys.stderr.write(f"[_activate_app {app_name}] {e!r}\n")
-
-    @objc.python_method
-    def _send_message_to_session(self, sid: str, cwd: str, title: str) -> None:
-        """Inline send: prompts for a message via AppleScript `display
-        dialog`, then runs `claude --print --resume <sid> "<message>"`
-        in the background with cwd set to the session's project dir.
-
-        Refuses (with a notification) when the session is currently
-        live in Claude Desktop — sending in the background while the
-        user is also editing in Desktop would cause JSONL write
-        conflicts and a desync. The user should focus the Desktop
-        session and type there instead."""
-        if not sid:
-            return
-
-        # --- Guard: refuse if session is live in Claude Desktop ---
-        host = _find_live_session_host(sid)
-        if host is not None and host.get("kind") == "claude-desktop":
-            self._notify(
-                "Session is open in Claude Desktop",
-                "Focus it there to send a message — sending in the "
-                "background could conflict with active edits.",
-            )
-            return
-
-        # --- Prompt for message text via native dialog ---
-        # The title goes through .replace('"', "'") so an embedded
-        # quote in a session name doesn't break the AppleScript.
-        safe_title = (title or "session").replace('"', "'").replace("\\", " ")
-        if len(safe_title) > 50:
-            safe_title = safe_title[:50] + "…"
-        dialog_script = (
-            'tell application "System Events"\n'
-            '  activate\n'
-            '  try\n'
-            f'    set theResult to display dialog "Send to «{safe_title}»:" '
-            'default answer "" with title "Send to Claude session" '
-            'buttons {"Cancel", "Send"} default button "Send" '
-            'with icon note\n'
-            '    return text returned of theResult\n'
-            '  on error number -128\n'
-            '    return ""\n'
-            '  end try\n'
-            'end tell\n'
-        )
-        try:
-            r = subprocess.run(
-                ["osascript", "-e", dialog_script],
-                capture_output=True, text=True, timeout=180,
-            )
-        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
-            sys.stderr.write(f"[send_message dialog] {e!r}\n")
-            return
-        message = (r.stdout or "").strip()
-        if not message:
-            return  # User cancelled or empty input.
-
-        # --- Dispatch claude --print --resume in the background ---
-        # We DO NOT wait for it; claude's response (5-60s typical) lands
-        # in the transcript JSONL, which our 5s refresh picks up.
-        try:
-            subprocess.Popen(
-                ["claude", "--print", "--resume", sid, message],
-                cwd=cwd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                # Detach so the child outlives this popover process if
-                # the user quits the badge before claude finishes.
-                start_new_session=True,
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            self._notify("Couldn't send", f"{type(e).__name__}: {e}")
-            return
-
-        # --- User-facing confirmation + scheduled refresh ---
-        self._notify(
-            "Message sent",
-            f"Claude is processing it now. Watch «{safe_title}» for the reply.",
-        )
-        # Refresh popover content shortly so the new turn surfaces
-        # without requiring the user to wait the full 5s timer tick.
-        try:
-            from Foundation import NSTimer
-            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                3.0, self, "_postSendRefresh:", None, False,
-            )
-        except Exception as e:  # noqa: BLE001
-            sys.stderr.write(f"[send_message refresh timer] {e!r}\n")
-
-    def _postSendRefresh_(self, _timer):
-        """One-shot refresh kicked off after a message send so the new
-        turn shows up without waiting for the full timer tick."""
-        try:
-            self.refresh()
-        except Exception:  # noqa: BLE001
-            pass
-
-    @objc.python_method
-    def _notify(self, title: str, body: str) -> None:
-        """Show a native macOS notification (banner in Notification Center)."""
-        safe_title = (title or "").replace('"', "'").replace("\\", " ")[:80]
-        safe_body = (body or "").replace('"', "'").replace("\\", " ")[:240]
-        script = (
-            f'display notification "{safe_body}" with title "{safe_title}"'
-        )
-        try:
-            subprocess.Popen(
-                ["osascript", "-e", script],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except (OSError, subprocess.SubprocessError):
-            pass
 
     @objc.python_method
     def _spawn_new_terminal_session(self, sid: str, cwd: str) -> None:
@@ -2137,33 +2008,26 @@ class PopoverVC(NSViewController):
                 f"cssresume://{sid}",
             )
         append(f" {title}", title_attrs)
-        # Tab + right-aligned trailing block. Order: age, then a ✉
-        # (send-message) link that's always shown, then a ✓ (mark-read)
-        # link when the session is unread. All three are tab-aligned to
-        # the right edge of the row.
+        # Tab then right-aligned age in tertiary color.
         age_attrs = {
             NSFontAttributeName: meta_font,
             NSForegroundColorAttributeName: very_dim,
             NSParagraphStyleAttributeName: ps,
         }
-        append(f"\t{ago}", age_attrs)
-        if sid:
-            append("  ", age_attrs)
-            append("✉", {
-                NSFontAttributeName: title_font,
-                NSForegroundColorAttributeName: dim,
-                NSLinkAttributeName: NSURL.URLWithString_(f"cssmessage://{sid}"),
-                NSParagraphStyleAttributeName: ps,
-            })
         if unread and sid:
-            append("  ", age_attrs)
+            # Append a clickable ✓ link AFTER the age. This is the
+            # mark-as-read affordance. NSTextView's link handling fires
+            # textView:clickedOnLink:atIndex: when the user clicks it.
+            append(f"\t{ago}  ", age_attrs)
             append("✓", {
                 NSFontAttributeName: title_font,
                 NSForegroundColorAttributeName: accent,
                 NSLinkAttributeName: NSURL.URLWithString_(f"cssread://{sid}"),
                 NSParagraphStyleAttributeName: ps,
             })
-        append("\n", age_attrs)
+            append("\n", age_attrs)
+        else:
+            append(f"\t{ago}\n", age_attrs)
 
         # ---- Line 2: phase (colored tag) + gist (primary text) ----
         # The gist is what the user reads to know "what's happening
