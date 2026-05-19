@@ -1548,17 +1548,19 @@ class KanbanCardView(NSView):
             s = " ".join(s.split())
             return s if len(s) <= n else s[: n - 1] + "…"
 
-        # Detail-mode fields.
+        # Detail-mode fields. In detail mode, the assistant snippet is
+        # promoted into line 2 (as gist_extra) so it adds words to the
+        # primary summary — the grey block below stays short.
         user_prompt = ""
         up_raw = meta.get("latestUserPrompt") if isinstance(meta, dict) else None
         if isinstance(up_raw, str) and up_raw.strip():
-            user_prompt = _clip(up_raw, 220)
+            user_prompt = _clip(up_raw, 100)
 
         raw = meta.get("lastAssistantText") or meta.get("lastAction") or ""
-        snippet = _clip(raw, 320) if isinstance(raw, str) and raw.strip() else ""
+        gist_extra = _clip(raw, 240) if isinstance(raw, str) and raw.strip() else ""
 
         tools = meta.get("recentTools") or meta.get("lastAssistantTools") or []
-        # Dedupe in order, cap to 6 tools so the line stays compact.
+        # Dedupe in order, cap to 4 tools (was 6) so the grey line stays compact.
         tools_seen: set = set()
         tools_list: list = []
         for t in tools:
@@ -1568,7 +1570,7 @@ class KanbanCardView(NSView):
                 continue
             tools_seen.add(t)
             tools_list.append(t)
-            if len(tools_list) >= 6:
+            if len(tools_list) >= 4:
                 break
 
         cwd_raw = meta.get("cwd") if isinstance(meta, dict) else None
@@ -1627,8 +1629,21 @@ class KanbanCardView(NSView):
                     NSFontAttributeName: body_font,
                     NSForegroundColorAttributeName: label,
                 })
+            # Detail mode: extend line 2 with the assistant follow-on
+            # so the summary itself reads as a richer paragraph.
+            if density == "detail" and gist_extra:
+                if gist:
+                    add("  —  ", {
+                        NSFontAttributeName: body_font,
+                        NSForegroundColorAttributeName: secondary,
+                    })
+                add(gist_extra, {
+                    NSFontAttributeName: body_font,
+                    NSForegroundColorAttributeName: label,
+                })
 
-        # Detail only: user prompt → assistant snippet → tools → cwd
+        # Detail only: user prompt → tools → cwd
+        # (Assistant snippet now lives in line 2 above.)
         if density == "detail":
             if user_prompt:
                 add("\n\n", {NSFontAttributeName: tiny_spacer})
@@ -1639,18 +1654,6 @@ class KanbanCardView(NSView):
                     NSForegroundColorAttributeName: tertiary,
                 })
                 add(user_prompt, {
-                    NSFontAttributeName: snippet_font,
-                    NSForegroundColorAttributeName: secondary,
-                })
-            if snippet:
-                add("\n\n", {NSFontAttributeName: tiny_spacer})
-                add("Claude: ", {
-                    NSFontAttributeName: NSFont.systemFontOfSize_weight_(
-                        11, NSFontWeightSemibold,
-                    ),
-                    NSForegroundColorAttributeName: tertiary,
-                })
-                add(snippet, {
                     NSFontAttributeName: snippet_font,
                     NSForegroundColorAttributeName: secondary,
                 })
@@ -2643,18 +2646,25 @@ class PopoverVC(NSViewController):
             return s if len(s) <= n else s[: n - 1] + "…"
 
         preview = ""
+        gist_extra = ""        # appended to line 2 in detail mode
         user_prompt = ""
         tools_list: list = []
         if show_preview and isinstance(meta, dict):
             raw = meta.get("lastAssistantText") or meta.get("lastAction") or ""
             if isinstance(raw, str) and raw.strip():
-                # In detail mode we want a richer preview; focus mode
-                # doesn't render the preview at all, so this length only
-                # matters for detail.
-                preview = _clip(raw, 320 if density == "detail" else 120)
+                # In detail mode we lift the assistant preview *into*
+                # line 2 (giving the summary more words) instead of
+                # showing it as a separate 'Claude: …' grey line.
+                # Focus mode doesn't render a preview at all.
+                if density == "detail":
+                    gist_extra = _clip(raw, 240)
+                else:
+                    preview = _clip(raw, 120)
             up = meta.get("latestUserPrompt") or ""
             if isinstance(up, str) and up.strip() and density == "detail":
-                user_prompt = _clip(up, 220)
+                # Tighter than before — the grey block carries less
+                # weight now that line 2 is doing more of the work.
+                user_prompt = _clip(up, 100)
             if density == "detail":
                 tools_seen: set = set()
                 for t in (meta.get("recentTools")
@@ -2663,7 +2673,7 @@ class PopoverVC(NSViewController):
                         continue
                     tools_seen.add(t)
                     tools_list.append(t)
-                    if len(tools_list) >= 6:
+                    if len(tools_list) >= 4:
                         break
 
         # Fonts for the gist line specifically — promoted to share
@@ -2791,9 +2801,24 @@ class PopoverVC(NSViewController):
                     NSFontAttributeName: gist_emphasis_font,
                     NSForegroundColorAttributeName: NSColor.labelColor(),
                 })
+            # Extend line 2 in detail mode with a longer assistant
+            # follow-on so the summary itself carries more words. The
+            # separate 'Claude: …' grey line is intentionally dropped.
+            if gist_extra:
+                if gist:
+                    append("  —  ", {
+                        NSFontAttributeName: gist_emphasis_font,
+                        NSForegroundColorAttributeName: dim,
+                    })
+                append(gist_extra, {
+                    NSFontAttributeName: gist_emphasis_font,
+                    NSForegroundColorAttributeName: NSColor.labelColor(),
+                })
             append("\n", {NSFontAttributeName: gist_emphasis_font})
 
-        # ---- Detail mode: user prompt → assistant preview → tools → cwd ----
+        # ---- Detail mode: user prompt → tools → cwd ----
+        # (The assistant snippet now lives in line 2; this block stays
+        # short on purpose.)
         if density == "detail":
             quote_font = NSFont.systemFontOfSize_(12)
             label_font = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
@@ -2804,16 +2829,6 @@ class PopoverVC(NSViewController):
                     NSForegroundColorAttributeName: very_dim,
                 })
                 append(f"{user_prompt}\n", {
-                    NSFontAttributeName: quote_font,
-                    NSForegroundColorAttributeName: dim,
-                })
-            if preview:
-                append("     ", {NSFontAttributeName: quote_font})
-                append("Claude: ", {
-                    NSFontAttributeName: label_font,
-                    NSForegroundColorAttributeName: very_dim,
-                })
-                append(f"{preview}\n", {
                     NSFontAttributeName: quote_font,
                     NSForegroundColorAttributeName: dim,
                 })
