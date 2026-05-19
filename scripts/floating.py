@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -1655,11 +1656,70 @@ class PopoverVC(NSViewController):
                 _mark_sessions_read(pairs)
                 self.refresh()
                 return True
+            if url_str.startswith("cssresume://"):
+                sid = url_str[len("cssresume://"):]
+                # Look up cwd for the click target so we can cd before
+                # running claude --resume. Missing cwd falls back to $HOME.
+                cwd = os.path.expanduser("~")
+                for r in (self.last_rendered_rows or []):
+                    if (r.get("s") or {}).get("sessionId") == sid:
+                        meta = r.get("meta") or {}
+                        c = meta.get("cwd")
+                        if isinstance(c, str) and c.strip():
+                            cwd = c
+                        break
+                self._open_session_in_terminal(sid, cwd)
+                # Auto-mark-as-read when the user resumes — they're
+                # clearly engaging with the session.
+                if sid:
+                    epoch = None
+                    for r in (self.last_rendered_rows or []):
+                        if (r.get("s") or {}).get("sessionId") == sid:
+                            epoch = r.get("lastTurnEpoch")
+                            break
+                    _mark_session_read(sid, epoch if epoch is not None else time.time())
+                # Close the popover — the user is moving to the terminal.
+                if self.popover_ref is not None:
+                    try:
+                        self.popover_ref.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return True
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[textView_clickedOnLink] {e!r}\n")
             import traceback
             traceback.print_exc(file=sys.stderr)
         return False
+
+    @objc.python_method
+    def _open_session_in_terminal(self, sid: str, cwd: str) -> None:
+        """Spawn Terminal.app at `cwd` running `claude --resume <sid>`.
+
+        Uses two `osascript -e` invocations to avoid in-band quote
+        escaping. `shlex.quote` wraps the cwd in single quotes if it
+        contains spaces / special characters, which compose safely
+        inside the AppleScript's double-quoted `do script` argument.
+
+        Falls back gracefully if AppleScript or Terminal.app aren't
+        available — the user sees nothing happen but no crash."""
+        if not sid:
+            return
+        import shlex
+        shell_cmd = (
+            f"cd {shlex.quote(cwd)} && claude --resume {shlex.quote(sid)}"
+        )
+        try:
+            subprocess.Popen(
+                [
+                    "osascript",
+                    "-e", 'tell application "Terminal" to activate',
+                    "-e", f'tell application "Terminal" to do script "{shell_cmd}"',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            sys.stderr.write(f"[_open_session_in_terminal] {e!r}\n")
 
     @objc.python_method
     def _accent_color(self):
@@ -1742,11 +1802,21 @@ class PopoverVC(NSViewController):
             NSForegroundColorAttributeName: color,
             NSParagraphStyleAttributeName: ps,
         })
-        append(f" {title}", {
+        # Title — clickable link that resumes the session in Terminal.
+        # `cssresume://<sessionId>` is intercepted by our NSTextView
+        # delegate (textView_clickedOnLink_atIndex_) which spawns
+        # `claude --resume <sid>` in a Terminal window at the session's
+        # cwd. Hovering shows the standard underline + I-beam cursor.
+        title_attrs = {
             NSFontAttributeName: title_font,
             NSForegroundColorAttributeName: NSColor.labelColor(),
             NSParagraphStyleAttributeName: ps,
-        })
+        }
+        if sid:
+            title_attrs[NSLinkAttributeName] = NSURL.URLWithString_(
+                f"cssresume://{sid}",
+            )
+        append(f" {title}", title_attrs)
         # Tab then right-aligned age in tertiary color.
         age_attrs = {
             NSFontAttributeName: meta_font,
