@@ -94,6 +94,10 @@ try:
     import objc
 
     NSFloatingWindowLevel = 5  # AppKit constant — not always exported by PyObjC.
+    # NSWindow.collectionBehavior flags (not always exported either).
+    NS_WINDOW_COLLECTION_CAN_JOIN_ALL_SPACES = 1 << 0
+    NS_WINDOW_COLLECTION_STATIONARY = 1 << 4
+    NS_WINDOW_COLLECTION_FULL_SCREEN_AUX = 1 << 8
     # NSStackView constants used below — hardcoded to avoid PyObjC import drift.
     NS_USER_INTERFACE_LAYOUT_ORIENTATION_HORIZONTAL = 0
     NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL = 1
@@ -2581,6 +2585,14 @@ class BadgeController(NSObject):
         win.setReleasedWhenClosed_(False)
         win.setMovableByWindowBackground_(False)  # we handle drag ourselves
         win.setHidesOnDeactivate_(False)
+        # Visible on every Space + alongside fullscreen apps. Stationary
+        # keeps the badge from sliding around during Mission Control / Spaces
+        # transitions.
+        win.setCollectionBehavior_(
+            NS_WINDOW_COLLECTION_CAN_JOIN_ALL_SPACES
+            | NS_WINDOW_COLLECTION_STATIONARY
+            | NS_WINDOW_COLLECTION_FULL_SCREEN_AUX
+        )
 
         # Bento tiles: a transparent container holding 3 independent
         # NSVisualEffectView glass surfaces (one per bucket), with the
