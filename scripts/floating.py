@@ -1578,13 +1578,10 @@ class KanbanCardView(NSView):
         )
 
         title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
-        # Line 2 (phase + gist) is the primary summary — bumped to 13pt
-        # so it competes with the title. Grey detail rows below use the
-        # smaller snippet_font / meta_font to read as supporting info.
-        phase_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
-        body_font = NSFont.systemFontOfSize_(13)
-        snippet_font = NSFont.systemFontOfSize_(10)
-        meta_font = _rounded_tabular_font(10, NSFontWeightRegular)
+        phase_font = NSFont.systemFontOfSize_weight_(12, NSFontWeightSemibold)
+        body_font = NSFont.systemFontOfSize_(12)
+        snippet_font = NSFont.systemFontOfSize_(11)
+        meta_font = _rounded_tabular_font(11, NSFontWeightRegular)
         tiny_spacer = NSFont.systemFontOfSize_(5)
         label = NSColor.labelColor()
         secondary = NSColor.secondaryLabelColor()
@@ -1637,7 +1634,7 @@ class KanbanCardView(NSView):
                 add("\n\n", {NSFontAttributeName: tiny_spacer})
                 add("You: ", {
                     NSFontAttributeName: NSFont.systemFontOfSize_weight_(
-                        10, NSFontWeightSemibold,
+                        11, NSFontWeightSemibold,
                     ),
                     NSForegroundColorAttributeName: tertiary,
                 })
@@ -1649,7 +1646,7 @@ class KanbanCardView(NSView):
                 add("\n\n", {NSFontAttributeName: tiny_spacer})
                 add("Claude: ", {
                     NSFontAttributeName: NSFont.systemFontOfSize_weight_(
-                        10, NSFontWeightSemibold,
+                        11, NSFontWeightSemibold,
                     ),
                     NSForegroundColorAttributeName: tertiary,
                 })
@@ -2673,12 +2670,8 @@ class PopoverVC(NSViewController):
         # visual focus with the title (13pt vs 14pt title; same primary
         # labelColor for the gist body, bucket-tint semibold for the
         # phase tag prefix).
-        # Phase + gist (line 2) is the primary summary — promoted to
-        # 14pt so it competes with the title for visual focus. The
-        # grey detail lines below (You/Claude/Tools/cwd) are sized
-        # smaller in the detail block.
-        gist_emphasis_font = NSFont.systemFontOfSize_(14)
-        phase_tag_font = NSFont.systemFontOfSize_weight_(14, NSFontWeightSemibold)
+        gist_emphasis_font = NSFont.systemFontOfSize_(13)
+        phase_tag_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
 
         ps = self._row_paragraph_style(right_edge)
 
@@ -2802,10 +2795,8 @@ class PopoverVC(NSViewController):
 
         # ---- Detail mode: user prompt → assistant preview → tools → cwd ----
         if density == "detail":
-            # Smaller than the line-2 gist (14pt) so the grey detail
-            # block reads as supporting context, not primary content.
-            quote_font = NSFont.systemFontOfSize_(11)
-            label_font = NSFont.systemFontOfSize_weight_(10, NSFontWeightSemibold)
+            quote_font = NSFont.systemFontOfSize_(12)
+            label_font = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
             if user_prompt:
                 append("     ", {NSFontAttributeName: quote_font})
                 append("You: ", {
@@ -2826,22 +2817,19 @@ class PopoverVC(NSViewController):
                     NSFontAttributeName: quote_font,
                     NSForegroundColorAttributeName: dim,
                 })
-            # Tools/cwd share the smaller meta-detail size so the whole
-            # grey block stays visually below the line-2 gist.
-            small_meta_font = _rounded_tabular_font(10.0, NSFontWeightRegular)
             if tools_list:
-                append("     ", {NSFontAttributeName: small_meta_font})
+                append("     ", {NSFontAttributeName: meta_font})
                 append("Tools: ", {
                     NSFontAttributeName: label_font,
                     NSForegroundColorAttributeName: very_dim,
                 })
                 append(f"{' · '.join(tools_list)}\n", {
-                    NSFontAttributeName: small_meta_font,
+                    NSFontAttributeName: meta_font,
                     NSForegroundColorAttributeName: dim,
                 })
             if cwd:
                 append(f"     {cwd}\n", {
-                    NSFontAttributeName: small_meta_font,
+                    NSFontAttributeName: meta_font,
                     NSForegroundColorAttributeName: very_dim,
                 })
 
