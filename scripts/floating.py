@@ -192,6 +192,32 @@ def _write_show_dormant(value: bool) -> None:
     _atomic_write_text(SHOW_DORMANT_FILE, "1" if value else "0")
 
 
+# ---------- Density (Glance / Focus / Detail) ----------
+# How much per-session info each row/card renders. Orthogonal to
+# List vs. Kanban. Persists across launches.
+#   glance  — one line: title + age (max sessions visible)
+#   focus   — title + phase + gist (default; balanced)
+#   detail  — adds last-assistant snippet + cwd path
+DENSITY_FILE = HOME / ".claude-sessions-status-density"
+DENSITIES = ("glance", "focus", "detail")
+
+
+def _read_density() -> str:
+    try:
+        v = DENSITY_FILE.read_text(encoding="utf-8").strip().lower()
+        if v in DENSITIES:
+            return v
+    except OSError:
+        pass
+    return "focus"
+
+
+def _write_density(value: str) -> None:
+    if value not in DENSITIES:
+        return
+    _atomic_write_text(DENSITY_FILE, value)
+
+
 # ---------- Unread / seen state ----------
 # Per-session "last seen" timestamp lives in ~/.claude-sessions-status-seen.json.
 # A session is *unread* when its current lastTurnEpoch (real conversation
@@ -1446,8 +1472,10 @@ class KanbanCardView(NSView):
     _CORNER_RADIUS = 8.0
     _BUTTON_TOP_RIGHT_INSET = 6.0
 
-    def initWithRow_color_width_vc_(self, row, color, width: float, vc):
-        attr = KanbanCardView._build_content_attr_str(row, color)
+    def initWithRow_color_width_vc_density_(
+        self, row, color, width: float, vc, density: str,
+    ):
+        attr = KanbanCardView._build_content_attr_str(row, color, density)
         unread = bool(row.get("unread"))
         right_pad = (
             KanbanCardView._PAD_BUTTON_RIGHT if unread
@@ -1497,21 +1525,33 @@ class KanbanCardView(NSView):
         return self
 
     @staticmethod
-    def _build_content_attr_str(row, color):
-        """Build the card's attributed-string content."""
+    def _build_content_attr_str(row, color, density: str = "focus"):
+        """Build the card's attributed-string content. Density gates
+        what's included:
+          - glance: title + age (one tight line per session)
+          - focus:  title + phase + gist + age (default — balanced)
+          - detail: title + phase + gist + snippet + cwd + age
+        """
         meta = row.get("meta") or {}
         title = (row.get("title") or "(untitled)").strip()
         phase = row.get("phase_label") or ""
         gist = row.get("gist") or ""
         ago = format_ago(row.get("ago_s") or 0)
 
-        # Snippet from real recent content.
+        # Snippet (only used in detail mode).
         raw = meta.get("lastAssistantText") or meta.get("lastAction") or ""
         snippet = ""
         if isinstance(raw, str) and raw.strip():
             snippet = " ".join(raw.split())
-            if len(snippet) > 140:
-                snippet = snippet[:140] + "…"
+            if len(snippet) > 160:
+                snippet = snippet[:160] + "…"
+
+        # Path (only used in detail mode).
+        cwd_raw = meta.get("cwd") if isinstance(meta, dict) else None
+        cwd = (
+            cwd_raw.replace(os.path.expanduser("~"), "~")
+            if isinstance(cwd_raw, str) and cwd_raw else ""
+        )
 
         title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
         phase_font = NSFont.systemFontOfSize_weight_(12, NSFontWeightSemibold)
@@ -1530,12 +1570,22 @@ class KanbanCardView(NSView):
                 NSAttributedString.alloc().initWithString_attributes_(text, attrs)
             )
 
-        # Title — bold, primary
+        # Title — bold, primary (always shown).
         add(title, {
             NSFontAttributeName: title_font,
             NSForegroundColorAttributeName: label,
         })
-        # Phase + gist
+
+        # Glance mode: title + tiny age on the same row block, that's it.
+        if density == "glance":
+            add("    ", {NSFontAttributeName: meta_font})
+            add(ago, {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: tertiary,
+            })
+            return out
+
+        # Focus / Detail: phase + gist
         if phase or gist:
             add("\n\n", {NSFontAttributeName: tiny_spacer})
             if phase:
@@ -1553,14 +1603,23 @@ class KanbanCardView(NSView):
                     NSFontAttributeName: body_font,
                     NSForegroundColorAttributeName: label,
                 })
-        # Snippet
-        if snippet:
-            add("\n\n", {NSFontAttributeName: tiny_spacer})
-            add(f"“{snippet}”", {
-                NSFontAttributeName: snippet_font,
-                NSForegroundColorAttributeName: secondary,
-            })
-        # Footer (age)
+
+        # Detail only: snippet + cwd
+        if density == "detail":
+            if snippet:
+                add("\n\n", {NSFontAttributeName: tiny_spacer})
+                add(f"“{snippet}”", {
+                    NSFontAttributeName: snippet_font,
+                    NSForegroundColorAttributeName: secondary,
+                })
+            if cwd:
+                add("\n\n", {NSFontAttributeName: tiny_spacer})
+                add(cwd, {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: tertiary,
+                })
+
+        # Footer (age) — Focus + Detail
         add("\n\n", {NSFontAttributeName: tiny_spacer})
         add(ago, {
             NSFontAttributeName: meta_font,
@@ -1700,6 +1759,8 @@ class PopoverVC(NSViewController):
     last_rendered_rows = objc.ivar("last_rendered_rows")  # for mark-all-read
     show_dormant = objc.ivar("show_dormant")   # bool — toggle to hide dormant
     dormant_btn = objc.ivar("dormant_btn")     # the NSButton checkbox
+    density = objc.ivar("density")             # "glance" | "focus" | "detail"
+    density_seg = objc.ivar("density_seg")     # NSSegmentedControl
 
     @objc.python_method
     def set_popover(self, popover):
@@ -1719,8 +1780,9 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _load_view_safely(self):
-        # Restore last-used mode.
+        # Restore last-used mode + density.
         self.mode = _read_popover_mode()
+        self.density = _read_density()
         size = POPOVER_KANBAN_SIZE if self.mode == "kanban" else POPOVER_LIST_SIZE
         w, h = size
 
@@ -1753,6 +1815,29 @@ class PopoverVC(NSViewController):
         seg.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin)
         container.addSubview_(seg)
         self.segmented = seg
+
+        # ---- Top bar (left): density (Glance | Focus | Detail) ----
+        # Three density levels — orthogonal to list/kanban. Sticks to
+        # the left edge so it doesn't crowd the centered list/kanban
+        # control or the right-edge "Show older" toggle.
+        density_seg = NSSegmentedControl.alloc().init()
+        density_seg.setSegmentCount_(3)
+        density_seg.setLabel_forSegment_("Glance", 0)
+        density_seg.setLabel_forSegment_("Focus", 1)
+        density_seg.setLabel_forSegment_("Detail", 2)
+        density_seg.setSegmentStyle_(NSSegmentStyleAutomatic)
+        density_seg.setTrackingMode_(NSSegmentSwitchTrackingSelectOne)
+        density_seg.setSelectedSegment_(DENSITIES.index(self.density))
+        density_seg.setTarget_(self)
+        density_seg.setAction_("densityChanged:")
+        density_w = 180.0
+        density_seg.setFrame_(NSMakeRect(
+            12, h - TOP_BAR_HEIGHT + 4, density_w, 22,
+        ))
+        # Sticks to the left edge as the popover resizes.
+        density_seg.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
+        container.addSubview_(density_seg)
+        self.density_seg = density_seg
 
         # ---- Top bar (right): "Show dormant" checkbox toggle ----
         # Lives in the right corner so it doesn't compete with the
@@ -1933,6 +2018,21 @@ class PopoverVC(NSViewController):
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[toggleDormant_] {e!r}\n")
 
+    def densityChanged_(self, sender):
+        """Glance / Focus / Detail — orthogonal to list/kanban."""
+        try:
+            idx = sender.selectedSegment()
+            if not (0 <= idx < len(DENSITIES)):
+                return
+            new_density = DENSITIES[idx]
+            if new_density == self.density:
+                return
+            self.density = new_density
+            _write_density(new_density)
+            self.refresh()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[densityChanged_] {e!r}\n")
+
     @objc.python_method
     def refresh(self):
         try:
@@ -2027,8 +2127,8 @@ class PopoverVC(NSViewController):
             y = HEADER_H + HEADER_GAP
             color = _bucket_tint(key)
             for row in rows:
-                card = KanbanCardView.alloc().initWithRow_color_width_vc_(
-                    row, color, card_w, self,
+                card = KanbanCardView.alloc().initWithRow_color_width_vc_density_(
+                    row, color, card_w, self, self.density or "focus",
                 )
                 if card is None:
                     continue
@@ -2057,8 +2157,9 @@ class PopoverVC(NSViewController):
 
                 dormant_color = NSColor.tertiaryLabelColor()
                 for row in extra_rows:
-                    card = KanbanCardView.alloc().initWithRow_color_width_vc_(
+                    card = KanbanCardView.alloc().initWithRow_color_width_vc_density_(
                         row, dormant_color, card_w, self,
+                        self.density or "focus",
                     )
                     if card is None:
                         continue
@@ -2357,7 +2458,8 @@ class PopoverVC(NSViewController):
     @objc.python_method
     def _append_row(self, out, row, color, title_font, gist_font, meta_font,
                     bar_font, dim, very_dim, *, right_edge: float = 332.0,
-                    show_preview: bool = True, kanban_mode: bool = False):
+                    show_preview: bool = True, kanban_mode: bool = False,
+                    density: str = "focus"):
         """Render one session row with strong visual hierarchy:
           1. Big bold title + right-aligned age (via tab stop)
           2. Phase + gist line (secondary text)
@@ -2365,6 +2467,11 @@ class PopoverVC(NSViewController):
              content you'd want to read for context-switching)
           4. Project path (tertiary, smallest)
         Followed by a blank line to give the next row breathing room.
+
+        Density gates what's shown:
+          - glance: just line 1 (title + age + ✓)
+          - focus:  lines 1 + 2 (title, phase/gist)
+          - detail: all four lines (adds quoted preview + cwd)
         """
         meta = row.get("meta") or {}
         title = (row.get("title") or "(untitled)").strip()
@@ -2490,11 +2597,8 @@ class PopoverVC(NSViewController):
             append(f"\t{ago}\n", age_attrs)
 
         # ---- Line 2: phase (colored tag) + gist (primary text) ----
-        # The gist is what the user reads to know "what's happening
-        # right now" — so it gets the full primary labelColor, not the
-        # muted secondary. The phase prefix stays in the bucket tint as
-        # a colored "tag" so its category meaning is preserved.
-        if phase or gist:
+        # Hidden in glance mode (one-line-per-row).
+        if density != "glance" and (phase or gist):
             # Indent matching the title's leading inset.
             append("     ", {NSFontAttributeName: gist_emphasis_font})
             if phase:
@@ -2515,24 +2619,26 @@ class PopoverVC(NSViewController):
                 })
             append("\n", {NSFontAttributeName: gist_emphasis_font})
 
-        # ---- Line 3: quoted preview of Claude's actual content ----
-        if preview:
-            # Curly quotes + italic-ish styling so it reads as a snippet.
-            quote_font = NSFont.systemFontOfSize_(12)
-            append(f"     “{preview}”\n", {
-                NSFontAttributeName: quote_font,
-                NSForegroundColorAttributeName: dim,
-            })
+        # ---- Line 3 + 4: preview snippet + cwd — only in detail mode. ----
+        if density == "detail":
+            if preview:
+                quote_font = NSFont.systemFontOfSize_(12)
+                append(f"     “{preview}”\n", {
+                    NSFontAttributeName: quote_font,
+                    NSForegroundColorAttributeName: dim,
+                })
+            if cwd:
+                append(f"     {cwd}\n", {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: very_dim,
+                })
 
-        # ---- Line 4: project path ----
-        if cwd:
-            append(f"     {cwd}\n", {
-                NSFontAttributeName: meta_font,
-                NSForegroundColorAttributeName: very_dim,
-            })
-
-        # Blank spacer line so rows don't run together.
-        append("\n", {NSFontAttributeName: gist_font})
+        # Blank spacer line so rows don't run together. In glance mode
+        # we use a smaller gap since rows are one line each.
+        spacer_font = (
+            NSFont.systemFontOfSize_(4) if density == "glance" else gist_font
+        )
+        append("\n", {NSFontAttributeName: spacer_font})
 
     @objc.python_method
     def _build_attributed(self, buckets: dict) -> NSAttributedString:
@@ -2589,6 +2695,7 @@ class PopoverVC(NSViewController):
                     # Dormant rows don't need the literal preview —
                     # they're stale by definition, save vertical space.
                     show_preview=(key != "dormant"),
+                    density=self.density or "focus",
                 )
 
         if not any_rows:
