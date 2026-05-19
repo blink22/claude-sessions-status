@@ -1530,7 +1530,8 @@ class KanbanCardView(NSView):
         what's included:
           - glance: title + age (one tight line per session)
           - focus:  title + phase + gist + age (default — balanced)
-          - detail: title + phase + gist + snippet + cwd + age
+          - detail: + latest user prompt, longer assistant snippet,
+                    recent tools, cwd
         """
         meta = row.get("meta") or {}
         title = (row.get("title") or "(untitled)").strip()
@@ -1538,15 +1539,33 @@ class KanbanCardView(NSView):
         gist = row.get("gist") or ""
         ago = format_ago(row.get("ago_s") or 0)
 
-        # Snippet (only used in detail mode).
-        raw = meta.get("lastAssistantText") or meta.get("lastAction") or ""
-        snippet = ""
-        if isinstance(raw, str) and raw.strip():
-            snippet = " ".join(raw.split())
-            if len(snippet) > 160:
-                snippet = snippet[:160] + "…"
+        def _clip(s: str, n: int) -> str:
+            s = " ".join(s.split())
+            return s if len(s) <= n else s[: n - 1] + "…"
 
-        # Path (only used in detail mode).
+        # Detail-mode fields.
+        user_prompt = ""
+        up_raw = meta.get("latestUserPrompt") if isinstance(meta, dict) else None
+        if isinstance(up_raw, str) and up_raw.strip():
+            user_prompt = _clip(up_raw, 220)
+
+        raw = meta.get("lastAssistantText") or meta.get("lastAction") or ""
+        snippet = _clip(raw, 320) if isinstance(raw, str) and raw.strip() else ""
+
+        tools = meta.get("recentTools") or meta.get("lastAssistantTools") or []
+        # Dedupe in order, cap to 6 tools so the line stays compact.
+        tools_seen: set = set()
+        tools_list: list = []
+        for t in tools:
+            if not isinstance(t, str):
+                continue
+            if t in tools_seen:
+                continue
+            tools_seen.add(t)
+            tools_list.append(t)
+            if len(tools_list) >= 6:
+                break
+
         cwd_raw = meta.get("cwd") if isinstance(meta, dict) else None
         cwd = (
             cwd_raw.replace(os.path.expanduser("~"), "~")
@@ -1604,12 +1623,40 @@ class KanbanCardView(NSView):
                     NSForegroundColorAttributeName: label,
                 })
 
-        # Detail only: snippet + cwd
+        # Detail only: user prompt → assistant snippet → tools → cwd
         if density == "detail":
+            if user_prompt:
+                add("\n\n", {NSFontAttributeName: tiny_spacer})
+                add("You: ", {
+                    NSFontAttributeName: NSFont.systemFontOfSize_weight_(
+                        11, NSFontWeightSemibold,
+                    ),
+                    NSForegroundColorAttributeName: tertiary,
+                })
+                add(user_prompt, {
+                    NSFontAttributeName: snippet_font,
+                    NSForegroundColorAttributeName: secondary,
+                })
             if snippet:
                 add("\n\n", {NSFontAttributeName: tiny_spacer})
-                add(f"“{snippet}”", {
+                add("Claude: ", {
+                    NSFontAttributeName: NSFont.systemFontOfSize_weight_(
+                        11, NSFontWeightSemibold,
+                    ),
+                    NSForegroundColorAttributeName: tertiary,
+                })
+                add(snippet, {
                     NSFontAttributeName: snippet_font,
+                    NSForegroundColorAttributeName: secondary,
+                })
+            if tools_list:
+                add("\n\n", {NSFontAttributeName: tiny_spacer})
+                add("Tools: ", {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: tertiary,
+                })
+                add(" · ".join(tools_list), {
+                    NSFontAttributeName: meta_font,
                     NSForegroundColorAttributeName: secondary,
                 })
             if cwd:
@@ -2562,14 +2609,33 @@ class PopoverVC(NSViewController):
             cwd_raw.replace(os.path.expanduser("~"), "~")
             if isinstance(cwd_raw, str) and cwd_raw else ""
         )
+        def _clip(s: str, n: int) -> str:
+            s = " ".join(s.split())
+            return s if len(s) <= n else s[: n - 1] + "…"
+
         preview = ""
+        user_prompt = ""
+        tools_list: list = []
         if show_preview and isinstance(meta, dict):
             raw = meta.get("lastAssistantText") or meta.get("lastAction") or ""
             if isinstance(raw, str) and raw.strip():
-                # Collapse whitespace, truncate. 120 chars is enough to
-                # tell you "what's going on" without flooding the popover.
-                p = " ".join(raw.split())
-                preview = p[:120] + ("…" if len(p) > 120 else "")
+                # In detail mode we want a richer preview; focus mode
+                # doesn't render the preview at all, so this length only
+                # matters for detail.
+                preview = _clip(raw, 320 if density == "detail" else 120)
+            up = meta.get("latestUserPrompt") or ""
+            if isinstance(up, str) and up.strip() and density == "detail":
+                user_prompt = _clip(up, 220)
+            if density == "detail":
+                tools_seen: set = set()
+                for t in (meta.get("recentTools")
+                          or meta.get("lastAssistantTools") or []):
+                    if not isinstance(t, str) or t in tools_seen:
+                        continue
+                    tools_seen.add(t)
+                    tools_list.append(t)
+                    if len(tools_list) >= 6:
+                        break
 
         # Fonts for the gist line specifically — promoted to share
         # visual focus with the title (13pt vs 14pt title; same primary
@@ -2698,12 +2764,38 @@ class PopoverVC(NSViewController):
                 })
             append("\n", {NSFontAttributeName: gist_emphasis_font})
 
-        # ---- Line 3 + 4: preview snippet + cwd — only in detail mode. ----
+        # ---- Detail mode: user prompt → assistant preview → tools → cwd ----
         if density == "detail":
-            if preview:
-                quote_font = NSFont.systemFontOfSize_(12)
-                append(f"     “{preview}”\n", {
+            quote_font = NSFont.systemFontOfSize_(12)
+            label_font = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
+            if user_prompt:
+                append("     ", {NSFontAttributeName: quote_font})
+                append("You: ", {
+                    NSFontAttributeName: label_font,
+                    NSForegroundColorAttributeName: very_dim,
+                })
+                append(f"{user_prompt}\n", {
                     NSFontAttributeName: quote_font,
+                    NSForegroundColorAttributeName: dim,
+                })
+            if preview:
+                append("     ", {NSFontAttributeName: quote_font})
+                append("Claude: ", {
+                    NSFontAttributeName: label_font,
+                    NSForegroundColorAttributeName: very_dim,
+                })
+                append(f"{preview}\n", {
+                    NSFontAttributeName: quote_font,
+                    NSForegroundColorAttributeName: dim,
+                })
+            if tools_list:
+                append("     ", {NSFontAttributeName: meta_font})
+                append("Tools: ", {
+                    NSFontAttributeName: label_font,
+                    NSForegroundColorAttributeName: very_dim,
+                })
+                append(f"{' · '.join(tools_list)}\n", {
+                    NSFontAttributeName: meta_font,
                     NSForegroundColorAttributeName: dim,
                 })
             if cwd:
