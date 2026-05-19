@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import sys
 import time
 from pathlib import Path
@@ -160,10 +159,7 @@ def _read_popover_mode() -> str:
 def _write_popover_mode(mode: str) -> None:
     if mode not in ("list", "kanban"):
         return
-    try:
-        POPOVER_MODE_FILE.write_text(mode, encoding="utf-8")
-    except OSError:
-        pass
+    _atomic_write_text(POPOVER_MODE_FILE, mode)
 
 
 # ---------- Dormant visibility (popover-only toggle) ----------
@@ -186,10 +182,7 @@ def _read_show_dormant() -> bool:
 
 
 def _write_show_dormant(value: bool) -> None:
-    try:
-        SHOW_DORMANT_FILE.write_text("1" if value else "0", encoding="utf-8")
-    except OSError:
-        pass
+    _atomic_write_text(SHOW_DORMANT_FILE, "1" if value else "0")
 
 
 # ---------- Unread / seen state ----------
@@ -211,11 +204,26 @@ def _load_seen() -> dict:
         return {}
 
 
-def _save_seen(seen: dict) -> None:
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write `content` to `path` atomically via tempfile+os.replace.
+    Protects against partial-write corruption if the process is killed
+    mid-write, and against the read-modify-write races that occur when
+    a second floating process briefly coexists (uninstall, doctor,
+    leftover from a crash). The replace is atomic on POSIX — readers
+    either see the old file or the new file, never a half-written one."""
     try:
-        SEEN_FILE.write_text(json.dumps(seen), encoding="utf-8")
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
     except OSError:
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _save_seen(seen: dict) -> None:
+    _atomic_write_text(SEEN_FILE, json.dumps(seen, indent=2, sort_keys=True))
 
 
 def _is_session_unread(session_id: str, last_turn_epoch, seen: dict) -> bool:
@@ -366,8 +374,14 @@ def _draw_sf_symbol_centered(name: str, center_x: float, center_y: float,
         center_y - sz.height / 2.0,
         sz.width, sz.height,
     )
-    # NSCompositingOperationSourceOver = 2.
-    img.drawInRect_fromRect_operation_fraction_(rect, NSMakeRect(0, 0, 0, 0), 2, 1.0)
+    # Use the long form with respectFlipped=True so the bitmap renders
+    # right-side-up in a flipped view (BadgeView.isFlipped() == True).
+    # Without this, NSImage.drawInRect_… would render the SF Symbol
+    # mirrored vertically because the image's bitmap is in unflipped
+    # (origin-at-bottom) coordinates. NSCompositingOperationSourceOver = 2.
+    img.drawInRect_fromRect_operation_fraction_respectFlipped_hints_(
+        rect, NSMakeRect(0, 0, 0, 0), 2, 1.0, True, None,
+    )
 
 
 def _rounded_tabular_font(size: float, weight: float):
@@ -438,12 +452,9 @@ def _load_frame(default_frame: tuple[float, float, float, float]) -> tuple[float
 
 
 def _save_frame(x: float, y: float, w: float, h: float) -> None:
-    try:
-        WINDOW_STATE_FILE.write_text(
-            json.dumps({"x": x, "y": y, "w": w, "h": h}), encoding="utf-8"
-        )
-    except OSError:
-        pass
+    _atomic_write_text(
+        WINDOW_STATE_FILE, json.dumps({"x": x, "y": y, "w": w, "h": h}),
+    )
 
 
 def _read_mode() -> str:
@@ -457,10 +468,7 @@ def _read_mode() -> str:
 
 
 def _write_mode(mode: str) -> None:
-    try:
-        MODE_FILE.write_text(mode, encoding="utf-8")
-    except OSError:
-        pass
+    _atomic_write_text(MODE_FILE, mode)
 
 
 # ---------- Session aggregation (mirrors menubar.py) ----------
@@ -819,8 +827,7 @@ class PanelController(NSObject):
                     content = build_column_content(key, buckets[key])
                     if key == "ready" and buckets["dormant"]:
                         # Tuck dormant rows under the FINISHED column.
-                        from AppKit import NSMutableAttributedString as _M
-                        full = _M.alloc().initWithAttributedString_(content)
+                        full = NSMutableAttributedString.alloc().initWithAttributedString_(content)
                         full.appendAttributedString_(_attr("\n", NSFont.systemFontOfSize_(12)))
                         full.appendAttributedString_(
                             build_column_content("dormant", buckets["dormant"])
@@ -884,6 +891,15 @@ class PanelController(NSObject):
 
     def windowWillClose_(self, _notification):
         self._save_current_frame()
+        # NSTimer holds a strong reference to its target — invalidate it
+        # so the controller can be released cleanly if the app ever
+        # intercepts terminate_ in the future.
+        if self.timer is not None:
+            try:
+                self.timer.invalidate()
+            except Exception:  # noqa: BLE001
+                pass
+            self.timer = None
         try:
             PID_FILE.unlink(missing_ok=True)
         except OSError:
@@ -903,10 +919,7 @@ def _load_badge_origin() -> tuple[float, float]:
 
 
 def _save_badge_origin(x: float, y: float) -> None:
-    try:
-        BADGE_STATE_FILE.write_text(json.dumps({"x": x, "y": y}), encoding="utf-8")
-    except OSError:
-        pass
+    _atomic_write_text(BADGE_STATE_FILE, json.dumps({"x": x, "y": y}))
 
 
 class BadgeView(NSView):
@@ -1967,6 +1980,15 @@ class BadgeController(NSObject):
                 pass
             f = self.badge_window.frame()
             _save_badge_origin(float(f.origin.x), float(f.origin.y))
+            # Tear down the recurring timer + outside-click monitor so
+            # the controller can be released cleanly during terminate_.
+            if self.timer is not None:
+                try:
+                    self.timer.invalidate()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.timer = None
+            self._stop_outside_click_monitor()
             try:
                 PID_FILE.unlink(missing_ok=True)
             except OSError:
@@ -1975,11 +1997,18 @@ class BadgeController(NSObject):
             return
         # Update badge counts.
         self.badge_view.set_counts(self._counts())
-        # If popover is open, re-render its content too.
+        # If popover is open, re-render its content too. Guard against
+        # the case where the popover is mid-dismissal — `isShown()`
+        # returns True briefly after `close()` while the animation runs,
+        # but the contentViewController's text view may already be torn
+        # down. The hasattr + try/except below absorbs that.
         if self.popover is not None and self.popover.isShown():
             vc = self.popover.contentViewController()
             if vc is not None and hasattr(vc, "refresh"):
-                vc.refresh()
+                try:
+                    vc.refresh()
+                except Exception as e:  # noqa: BLE001
+                    sys.stderr.write(f"[badge.refresh -> vc.refresh] {e!r}\n")
 
     def togglePanel_(self, _sender):
         """Show/hide the NSPopover anchored to the badge."""
@@ -2023,11 +2052,15 @@ class BadgeController(NSObject):
         """Listen globally for mouse clicks in OTHER apps — fire close()
         when one happens. Global monitors don't see events for our own
         app, so clicks on the badge / inside the popover are not caught
-        here (good — those are handled by their own event paths)."""
-        if self.outside_click_monitor is not None:
-            return  # already armed
+        here (good — those are handled by their own event paths).
+
+        Always tears down any previous monitor before installing a new
+        one. Two installs without a teardown leak a global event tap
+        and have historically been the source of intermittent flicker
+        on rapid open→close→open sequences."""
+        self._stop_outside_click_monitor()
         try:
-            # 0x02 = NSEventMaskLeftMouseDown, 0x10 = NSEventMaskRightMouseDown.
+            # 1<<1 = NSEventMaskLeftMouseDown, 1<<3 = NSEventMaskRightMouseDown.
             mask = (1 << 1) | (1 << 3)
             self.outside_click_monitor = (
                 NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
@@ -2050,12 +2083,28 @@ class BadgeController(NSObject):
     @objc.python_method
     def _handle_outside_click(self, _event):
         """Global monitor callback — close the popover on any click in
-        another app or the desktop background."""
+        another app or the desktop background.
+
+        Defers `close()` to the next runloop turn via performSelector
+        with delay=0, because closing the popover synchronously from
+        inside a global event handler has historically (10.14–11.x)
+        produced crashes when NSPopoverBehaviorTransient's own dismissal
+        logic fires on the same event."""
+        if self.popover is not None and self.popover.isShown():
+            try:
+                self.performSelector_withObject_afterDelay_(
+                    "deferredClosePopover:", None, 0.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[outside_click_monitor.handler] {e!r}\n")
+
+    def deferredClosePopover_(self, _sender):
+        """Called on the next runloop tick from the click monitor."""
         if self.popover is not None and self.popover.isShown():
             try:
                 self.popover.close()
             except Exception as e:  # noqa: BLE001
-                sys.stderr.write(f"[outside_click_monitor.handler] {e!r}\n")
+                sys.stderr.write(f"[deferredClosePopover] {e!r}\n")
 
     # ---- NSPopoverDelegate ----
     def popoverDidClose_(self, _notification):
