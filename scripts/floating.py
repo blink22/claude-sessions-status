@@ -531,6 +531,154 @@ def _write_mode(mode: str) -> None:
     _atomic_write_text(MODE_FILE, mode)
 
 
+# ---------- Live-session host detection ----------
+# Each running `claude` CLI process registers itself by writing
+# `~/.claude/sessions/<pid>.json` with its sessionId + cwd + entrypoint.
+# We use that to find where (if anywhere) a session is currently
+# running, so resume clicks can focus the existing host instead of
+# duplicating it.
+_CLAUDE_PROCESS_SESSIONS_DIR = Path(os.path.expanduser("~/.claude/sessions"))
+
+
+# Terminal emulators we know how to bring forward by app name. Keys are
+# substrings to match in `ps -o comm=` output for each emulator's
+# process; values are the canonical macOS app name passed to `open -a`.
+_KNOWN_TERMINAL_PROCS = {
+    "Terminal":   "Terminal",
+    "iTerm":      "iTerm",
+    "iTerm2":     "iTerm",
+    "Ghostty":    "Ghostty",
+    "Alacritty":  "Alacritty",
+    "WezTerm":    "WezTerm",
+    "kitty":      "kitty",
+    "Hyper":      "Hyper",
+    "tabby":      "Tabby",
+}
+
+
+def _find_terminal_ancestor(pid: int) -> str | None:
+    """Walk the parent-process chain from `pid` upward looking for a
+    known terminal emulator. Returns the macOS app name to pass to
+    `open -a`, or None if no terminal was found in the chain."""
+    seen: set[int] = set()
+    cur = pid
+    while cur > 1 and cur not in seen:
+        seen.add(cur)
+        try:
+            r = subprocess.run(
+                ["ps", "-p", str(cur), "-o", "comm=,ppid="],
+                capture_output=True, text=True, timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        line = r.stdout.strip()
+        if not line:
+            return None
+        parts = line.rsplit(None, 1)
+        if len(parts) != 2:
+            return None
+        comm, ppid_str = parts
+        for needle, app in _KNOWN_TERMINAL_PROCS.items():
+            if needle in comm:
+                return app
+        try:
+            cur = int(ppid_str)
+        except ValueError:
+            return None
+    return None
+
+
+def _tty_for_pid(pid: int) -> str:
+    """Return the TTY of `pid` as `ps -o tty=` reports it (e.g. 'ttys001'
+    or '' if no controlling tty)."""
+    try:
+        r = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "tty="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip()
+
+
+def _find_live_session_host(session_id: str) -> dict | None:
+    """Walk ~/.claude/sessions/*.json looking for a live process whose
+    `sessionId` matches. Returns:
+      {kind: "claude-desktop", pid: int}
+        — the session is running inside the Claude Desktop app
+      {kind: "terminal", pid: int, tty: str, terminal_app: str}
+        — the session is running in a terminal emulator
+      None
+        — no live host for this session"""
+    if not session_id or not _CLAUDE_PROCESS_SESSIONS_DIR.exists():
+        return None
+    try:
+        files = list(_CLAUDE_PROCESS_SESSIONS_DIR.glob("*.json"))
+    except OSError:
+        return None
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("sessionId") != session_id:
+            continue
+        pid = data.get("pid")
+        if not isinstance(pid, int):
+            continue
+        # Liveness probe — skip stale registrations.
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue
+        entrypoint = data.get("entrypoint", "")
+        if entrypoint == "claude-desktop":
+            return {"kind": "claude-desktop", "pid": pid}
+        # Treat anything else (cli, interactive, missing) as terminal.
+        return {
+            "kind": "terminal",
+            "pid": pid,
+            "tty": _tty_for_pid(pid),
+            "terminal_app": _find_terminal_ancestor(pid),
+        }
+    return None
+
+
+def _focus_terminal_tab_for_tty(tty: str) -> bool:
+    """Use AppleScript to find the Terminal.app tab whose `tty` matches
+    and bring it to the front. `tty` here is `ps -o tty=` output like
+    'ttys001' — we prepend '/dev/' to match what Terminal reports.
+    Returns True iff a matching tab was focused."""
+    if not tty:
+        return False
+    tty_path = f"/dev/{tty}"
+    script = f'''
+tell application "Terminal"
+    activate
+    repeat with w in windows
+        try
+            repeat with t in tabs of w
+                if (tty of t as string) is "{tty_path}" then
+                    set selected of t to true
+                    set frontmost of w to true
+                    return "found"
+                end if
+            end repeat
+        end try
+    end repeat
+    return "not-found"
+end tell
+'''
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=4,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "found" in (r.stdout or "")
+
+
 # ---------- Session aggregation ----------
 # `classify` is imported from dashboard.py so menubar.py and floating.py
 # share a single source of truth. The wrapper preserves the old `_classify`
@@ -1693,17 +1841,61 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _open_session_in_terminal(self, sid: str, cwd: str) -> None:
-        """Spawn Terminal.app at `cwd` running `claude --resume <sid>`.
+        """Navigate to a session — preferring an existing host over
+        spawning a new one. Three branches:
 
-        Uses two `osascript -e` invocations to avoid in-band quote
-        escaping. `shlex.quote` wraps the cwd in single quotes if it
-        contains spaces / special characters, which compose safely
-        inside the AppleScript's double-quoted `do script` argument.
+        1. Session is alive in Claude.app (entrypoint=claude-desktop)
+           → bring Claude.app to the front so the user can select that
+           session in its in-app sidebar.
 
-        Falls back gracefully if AppleScript or Terminal.app aren't
-        available — the user sees nothing happen but no crash."""
+        2. Session is alive in a Terminal.app tab → match the claude
+           process's TTY to a tab's tty via AppleScript and focus that
+           exact tab. No duplicate window.
+
+        3. Session isn't alive anywhere → spawn a new Terminal at the
+           project cwd and run `claude --resume <sid>`.
+
+        Stays no-op safe if any step fails (the user sees nothing
+        happen but no crash)."""
         if not sid:
             return
+        host = _find_live_session_host(sid)
+        if host is not None:
+            if host.get("kind") == "claude-desktop":
+                self._activate_claude_desktop()
+                return
+            if host.get("kind") == "terminal":
+                term_app = host.get("terminal_app") or "Terminal"
+                if term_app == "Terminal" and host.get("tty"):
+                    if _focus_terminal_tab_for_tty(host["tty"]):
+                        return
+                # Unknown terminal — best effort, bring the app forward.
+                if term_app:
+                    self._activate_app(term_app)
+                    return
+        # No live host or focus failed — spawn a new Terminal session.
+        self._spawn_new_terminal_session(sid, cwd)
+
+    @objc.python_method
+    def _activate_claude_desktop(self) -> None:
+        """`open -a Claude` brings the Claude Desktop app to the front.
+        From there the user can pick the specific session in the
+        Desktop's own sidebar. We can't navigate further than that
+        without an undocumented URL scheme."""
+        self._activate_app("Claude")
+
+    @objc.python_method
+    def _activate_app(self, app_name: str) -> None:
+        try:
+            subprocess.Popen(
+                ["open", "-a", app_name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            sys.stderr.write(f"[_activate_app {app_name}] {e!r}\n")
+
+    @objc.python_method
+    def _spawn_new_terminal_session(self, sid: str, cwd: str) -> None:
         import shlex
         shell_cmd = (
             f"cd {shlex.quote(cwd)} && claude --resume {shlex.quote(sid)}"
@@ -1715,11 +1907,10 @@ class PopoverVC(NSViewController):
                     "-e", 'tell application "Terminal" to activate',
                     "-e", f'tell application "Terminal" to do script "{shell_cmd}"',
                 ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except (OSError, subprocess.SubprocessError) as e:
-            sys.stderr.write(f"[_open_session_in_terminal] {e!r}\n")
+            sys.stderr.write(f"[_spawn_new_terminal_session] {e!r}\n")
 
     @objc.python_method
     def _accent_color(self):
