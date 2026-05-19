@@ -1570,7 +1570,7 @@ class KanbanCardView(NSView):
 
     @objc.python_method
     def _install_mark_read_button(self):
-        btn = NSButton.alloc().init()
+        btn = _FirstMouseButton.alloc().init()
         btn.setTitle_("✓")
         btn.setBordered_(False)
         btn.setFont_(NSFont.systemFontOfSize_weight_(14, NSFontWeightSemibold))
@@ -1624,6 +1624,14 @@ class KanbanCardView(NSView):
                 (1 << 0) | (1 << 1),  # UsesLineFragmentOrigin | UsesFontLeading
             )
 
+    def acceptsFirstMouse_(self, _event):
+        # NSPopover doesn't activate its window on the click that opens
+        # it. Without this, the first click inside an inactive popover
+        # only makes its window key and the card-level handler doesn't
+        # fire — the user has to click twice. Returning True here makes
+        # that first click count as a real click on the card.
+        return True
+
     def mouseDown_(self, _event):
         # Card-wide click = resume the session in its current host.
         if self.vc_ref is not None and self.row_data is not None:
@@ -1648,6 +1656,15 @@ class KanbanCardView(NSView):
             )
         except Exception:  # noqa: BLE001
             pass
+
+
+class _FirstMouseButton(NSButton):
+    """NSButton that fires on the first click even when its window
+    isn't key — needed for buttons inside NSPopovers, whose window
+    isn't key on the click that opened them."""
+
+    def acceptsFirstMouse_(self, _event):
+        return True
 
 
 class KanbanColumnDocView(NSView):
