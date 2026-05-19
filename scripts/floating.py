@@ -151,6 +151,10 @@ REFRESH_SECS = max(1.0, float(os.environ.get("CLAUDE_SESSIONS_REFRESH", "5")))
 POPOVER_MODE_FILE = HOME / ".claude-sessions-status-popover-mode"
 POPOVER_LIST_SIZE = (360.0, 480.0)
 POPOVER_KANBAN_SIZE = (720.0, 480.0)
+# When the user toggles "Show older" in kanban mode, the dormant
+# sessions render as a 4th column on the right. The popover widens
+# to give that column room without squeezing the other three.
+POPOVER_KANBAN_WITH_DORMANT_SIZE = (940.0, 480.0)
 
 
 def _read_popover_mode() -> str:
@@ -1831,10 +1835,16 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _load_view_safely(self):
-        # Restore last-used mode + density.
+        # Restore last-used mode + density + show_dormant.
         self.mode = _read_popover_mode()
         self.density = _read_density()
-        size = POPOVER_KANBAN_SIZE if self.mode == "kanban" else POPOVER_LIST_SIZE
+        self.show_dormant = _read_show_dormant()
+        # The dormant column adds a 4th lane in kanban → wider popover.
+        size = (
+            POPOVER_KANBAN_WITH_DORMANT_SIZE
+            if (self.mode == "kanban" and self.show_dormant)
+            else (POPOVER_KANBAN_SIZE if self.mode == "kanban" else POPOVER_LIST_SIZE)
+        )
         w, h = size
 
         container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
@@ -1892,9 +1902,9 @@ class PopoverVC(NSViewController):
 
         # ---- Top bar (right): "Show dormant" checkbox toggle ----
         # Lives in the right corner so it doesn't compete with the
-        # primary List/Kanban control. Persists across launches via the
-        # SHOW_DORMANT_FILE state file.
-        self.show_dormant = _read_show_dormant()
+        # primary List/Kanban control. self.show_dormant is set in the
+        # _load_view_safely preamble so the initial popover size can
+        # depend on it; here we just build the UI for the toggle.
         dormant_btn = NSButton.alloc().init()
         dormant_btn.setButtonType_(3)        # NSButtonTypeSwitch (checkbox)
         dormant_btn.setTitle_("Show older")
@@ -1983,7 +1993,7 @@ class PopoverVC(NSViewController):
         col_h0 = max(1.0, host_bounds.size.height - 8)
 
         columns: list[dict] = []
-        for key in ("needs", "working", "ready"):
+        for key in ("needs", "working", "ready", "dormant"):
             col_scroll = NSScrollView.alloc().initWithFrame_(
                 NSMakeRect(0, 0, col_w0, col_h0)
             )
@@ -2010,7 +2020,11 @@ class PopoverVC(NSViewController):
             doc.addSubview_(header)
 
             col_scroll.setDocumentView_(doc)
-            stack.addArrangedSubview_(col_scroll)
+            # Only add active-bucket columns to the stack upfront; the
+            # dormant column is added/removed by _render_kanban based on
+            # the Show-older toggle.
+            if key != "dormant":
+                stack.addArrangedSubview_(col_scroll)
 
             columns.append({
                 "key": key,
@@ -2071,6 +2085,25 @@ class PopoverVC(NSViewController):
             self.list_scroll.setFrame_(self.content_host.bounds())
             self.content_host.addSubview_(self.list_scroll)
 
+    @objc.python_method
+    def _target_popover_size(self) -> tuple:
+        """Pick the right popover (w, h) for the current mode + toggle."""
+        if self.mode != "kanban":
+            return POPOVER_LIST_SIZE
+        if self.show_dormant:
+            return POPOVER_KANBAN_WITH_DORMANT_SIZE
+        return POPOVER_KANBAN_SIZE
+
+    @objc.python_method
+    def _apply_popover_size(self) -> None:
+        if self.popover_ref is None:
+            return
+        try:
+            w, h = self._target_popover_size()
+            self.popover_ref.setContentSize_(NSMakeSize(w, h))
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[_apply_popover_size] {e!r}\n")
+
     def segmentChanged_(self, sender):
         try:
             idx = sender.selectedSegment()
@@ -2079,15 +2112,7 @@ class PopoverVC(NSViewController):
                 return
             self.mode = new_mode
             _write_popover_mode(new_mode)
-            # Resize the popover content frame to fit the new mode.
-            new_size = (
-                POPOVER_KANBAN_SIZE if new_mode == "kanban" else POPOVER_LIST_SIZE
-            )
-            if self.popover_ref is not None:
-                try:
-                    self.popover_ref.setContentSize_(NSMakeSize(*new_size))
-                except Exception as e:  # noqa: BLE001
-                    sys.stderr.write(f"[segmentChanged] resize failed: {e!r}\n")
+            self._apply_popover_size()
             self._install_layout()
             self.refresh()
         except Exception as e:  # noqa: BLE001
@@ -2096,10 +2121,12 @@ class PopoverVC(NSViewController):
             traceback.print_exc(file=sys.stderr)
 
     def toggleDormant_(self, sender):
-        """Flip whether dormant sessions are shown in the popover."""
+        """Flip whether dormant sessions are shown in the popover. In
+        kanban mode this also widens the popover to fit a 4th column."""
         try:
             self.show_dormant = bool(sender.state())   # 0 / 1
             _write_show_dormant(self.show_dormant)
+            self._apply_popover_size()
             self.refresh()
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[toggleDormant_] {e!r}\n")
@@ -2180,31 +2207,46 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _render_kanban(self, buckets):
-        """Rebuild the per-column card lists. Tears down existing
-        subviews of each column's flipped doc view, re-adds the header
-        + one KanbanCardView per session (and dormant rows under
-        FINISHED when show_dormant is on), then resizes the doc view
-        so the NSScrollView knows its scrollable height."""
+        """Rebuild the per-column card lists. Active buckets always
+        render in the first three columns; the dormant column is added
+        to the kanban stack as a 4th column on the right when the
+        Show-older toggle is on, and removed otherwise."""
         if self.kanban_columns is None:
             return
 
         HEADER_H = 20.0
         HEADER_GAP = 6.0
         CARD_GAP = 8.0
-        DORMANT_HEADER_TOP_GAP = 14.0
-        DORMANT_HEADER_H = 18.0
         DOC_LEFT_PAD = 4.0
         DOC_RIGHT_PAD = 4.0
 
+        # Sync the dormant column's membership in the outer stack with
+        # the show_dormant toggle. NSStackView.FILL_EQUALLY redistributes
+        # automatically once we add/remove the arranged subview.
+        dormant_col = next(
+            (c for c in self.kanban_columns if c["key"] == "dormant"), None,
+        )
+        if dormant_col is not None:
+            current = list(self.kanban_stack.arrangedSubviews())
+            in_stack = dormant_col["scroll"] in current
+            if self.show_dormant and not in_stack:
+                self.kanban_stack.addArrangedSubview_(dormant_col["scroll"])
+            elif (not self.show_dormant) and in_stack:
+                self.kanban_stack.removeArrangedSubview_(dormant_col["scroll"])
+                dormant_col["scroll"].removeFromSuperview()
+
+        col_count = 4 if self.show_dormant else 3
+
         for col in self.kanban_columns:
             key = col["key"]
+            # Skip drawing into the dormant column when it's hidden —
+            # not strictly necessary but cheaper.
+            if key == "dormant" and not self.show_dormant:
+                continue
             doc = col["doc"]
             header = col["header"]
             scroll = col["scroll"]
             rows = buckets.get(key) or []
-            extra_rows: list = []
-            if key == "ready" and self.show_dormant:
-                extra_rows = buckets.get("dormant") or []
 
             # Tear down everything except the persistent header.
             for sub in list(doc.subviews()):
@@ -2216,7 +2258,11 @@ class PopoverVC(NSViewController):
             if col_bounds_w < 10:
                 # Scroll view hasn't laid out yet; fall back to a
                 # sensible default so cards still measure correctly.
-                col_bounds_w = (POPOVER_KANBAN_SIZE[0] - 32) / 3.0
+                target_w = (
+                    POPOVER_KANBAN_WITH_DORMANT_SIZE[0]
+                    if self.show_dormant else POPOVER_KANBAN_SIZE[0]
+                )
+                col_bounds_w = (target_w - 32) / col_count
             card_w = max(50.0, col_bounds_w - DOC_LEFT_PAD - DOC_RIGHT_PAD)
 
             # Update + place the header at the top of the doc view.
@@ -2239,39 +2285,6 @@ class PopoverVC(NSViewController):
                 card.setFrame_(NSMakeRect(DOC_LEFT_PAD, y, card_w, ch))
                 doc.addSubview_(card)
                 y += ch + CARD_GAP
-
-            # Dormant block (under FINISHED column when toggle is on).
-            if extra_rows:
-                y += DORMANT_HEADER_TOP_GAP - CARD_GAP  # extra breathing room
-                dormant_header = NSTextField.labelWithString_(
-                    f"  {LABELS['dormant']}  ·  {len(extra_rows)}"
-                )
-                dormant_header.setFont_(
-                    NSFont.systemFontOfSize_weight_(10.0, NSFontWeightSemibold)
-                )
-                dormant_header.setTextColor_(NSColor.tertiaryLabelColor())
-                dormant_header.setFrame_(NSMakeRect(
-                    DOC_LEFT_PAD, y,
-                    col_bounds_w - DOC_LEFT_PAD - DOC_RIGHT_PAD,
-                    DORMANT_HEADER_H,
-                ))
-                doc.addSubview_(dormant_header)
-                y += DORMANT_HEADER_H + HEADER_GAP
-
-                dormant_color = NSColor.tertiaryLabelColor()
-                for row in extra_rows:
-                    card = KanbanCardView.alloc().initWithRow_color_width_vc_density_(
-                        row, dormant_color, card_w, self,
-                        self.density or "focus",
-                    )
-                    if card is None:
-                        continue
-                    ch = card.frame().size.height
-                    card.setFrame_(NSMakeRect(
-                        DOC_LEFT_PAD, y, card_w, ch,
-                    ))
-                    doc.addSubview_(card)
-                    y += ch + CARD_GAP
 
             # Resize the doc view to the total laid-out height so the
             # scroll view knows it needs to scroll (or doesn't).
@@ -3020,9 +3033,17 @@ class BadgeController(NSObject):
         # when the user toggles between list and kanban.
         popover_vc.set_popover(self.popover)
         self.popover.setContentViewController_(popover_vc)
-        # Initial content size matches the saved popover mode.
+        # Initial content size matches the saved popover mode (and
+        # widens to fit a 4th dormant column when show_dormant is on).
         initial_mode = _read_popover_mode()
-        init_size = POPOVER_KANBAN_SIZE if initial_mode == "kanban" else POPOVER_LIST_SIZE
+        initial_show_dormant = _read_show_dormant()
+        if initial_mode == "kanban":
+            init_size = (
+                POPOVER_KANBAN_WITH_DORMANT_SIZE
+                if initial_show_dormant else POPOVER_KANBAN_SIZE
+            )
+        else:
+            init_size = POPOVER_LIST_SIZE
         self.popover.setContentSize_(NSMakeSize(*init_size))
         self.outside_click_monitor = None
 
