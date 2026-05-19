@@ -67,6 +67,7 @@ try:
         NSParagraphStyleAttributeName,
         NSPanel,
         NSPopover,
+        NSPopUpButton,
         NSScrollView,
         NSSegmentedControl,
         NSSegmentStyleAutomatic,
@@ -1860,6 +1861,9 @@ class PopoverVC(NSViewController):
             )
 
         # ---- Top bar: segmented control (List | Kanban) ----
+        # Width is tight enough that it fits in the 360pt list-mode
+        # popover without colliding with the density popup (left) or
+        # the dormant toggle (right).
         TOP_BAR_HEIGHT = 32.0
         seg = NSSegmentedControl.alloc().init()
         seg.setSegmentCount_(2)
@@ -1871,34 +1875,28 @@ class PopoverVC(NSViewController):
         seg.setTarget_(self)
         seg.setAction_("segmentChanged:")
         # Center the segmented control horizontally in the top bar.
-        seg_w = 160.0
+        seg_w = 130.0
         seg.setFrame_(NSMakeRect((w - seg_w) / 2, h - TOP_BAR_HEIGHT + 4, seg_w, 22))
         seg.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin)
         container.addSubview_(seg)
         self.segmented = seg
 
-        # ---- Top bar (left): density (Glance | Focus | Detail) ----
-        # Three density levels — orthogonal to list/kanban. Sticks to
-        # the left edge so it doesn't crowd the centered list/kanban
-        # control or the right-edge "Show older" toggle.
-        density_seg = NSSegmentedControl.alloc().init()
-        density_seg.setSegmentCount_(3)
-        density_seg.setLabel_forSegment_("Glance", 0)
-        density_seg.setLabel_forSegment_("Focus", 1)
-        density_seg.setLabel_forSegment_("Detail", 2)
-        density_seg.setSegmentStyle_(NSSegmentStyleAutomatic)
-        density_seg.setTrackingMode_(NSSegmentSwitchTrackingSelectOne)
-        density_seg.setSelectedSegment_(DENSITIES.index(self.density))
-        density_seg.setTarget_(self)
-        density_seg.setAction_("densityChanged:")
-        density_w = 180.0
-        density_seg.setFrame_(NSMakeRect(
-            12, h - TOP_BAR_HEIGHT + 4, density_w, 22,
-        ))
-        # Sticks to the left edge as the popover resizes.
-        density_seg.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
-        container.addSubview_(density_seg)
-        self.density_seg = density_seg
+        # ---- Top bar (left): density popup (Glance / Focus / Detail) ----
+        # A compact NSPopUpButton instead of a segmented control. The
+        # segmented version was 180pt wide and overlapped the centered
+        # List/Kanban control in 360pt list mode. The popup is ~90pt
+        # and shows the current selection inline ("Focus ▾").
+        density_pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(12, h - TOP_BAR_HEIGHT + 4, 96, 22),
+            False,
+        )
+        density_pop.addItemsWithTitles_(["Glance", "Focus", "Detail"])
+        density_pop.selectItemAtIndex_(DENSITIES.index(self.density))
+        density_pop.setTarget_(self)
+        density_pop.setAction_("densityChanged:")
+        density_pop.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
+        container.addSubview_(density_pop)
+        self.density_seg = density_pop
 
         # ---- Top bar (right): "Show dormant" checkbox toggle ----
         # Lives in the right corner so it doesn't compete with the
@@ -2165,7 +2163,14 @@ class PopoverVC(NSViewController):
     def densityChanged_(self, sender):
         """Glance / Focus / Detail — orthogonal to list/kanban."""
         try:
-            idx = sender.selectedSegment()
+            # NSPopUpButton exposes indexOfSelectedItem; the older
+            # NSSegmentedControl exposed selectedSegment. Use whichever
+            # the sender supports so this stays robust if we swap the
+            # control type back later.
+            if hasattr(sender, "indexOfSelectedItem"):
+                idx = sender.indexOfSelectedItem()
+            else:
+                idx = sender.selectedSegment()
             if not (0 <= idx < len(DENSITIES)):
                 return
             new_density = DENSITIES[idx]
