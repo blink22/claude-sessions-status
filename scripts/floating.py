@@ -1761,6 +1761,10 @@ class PopoverVC(NSViewController):
     dormant_btn = objc.ivar("dormant_btn")     # the NSButton checkbox
     density = objc.ivar("density")             # "glance" | "focus" | "detail"
     density_seg = objc.ivar("density_seg")     # NSSegmentedControl
+    # Kanban footer with the "Mark all N read" button. Lives below
+    # the columns and only shows up when there's at least one unread.
+    kanban_footer = objc.ivar("kanban_footer")
+    mark_all_btn = objc.ivar("mark_all_btn")
 
     @objc.python_method
     def set_popover(self, popover):
@@ -1971,6 +1975,30 @@ class PopoverVC(NSViewController):
         self.kanban_stack = stack
         self.kanban_columns = columns
 
+        # ---- Footer: "Mark all N read" button (kanban-only). ----
+        # Mirrors the inline footer link that already exists in list mode
+        # (which renders inside the NSTextView via attributed-string link).
+        # The footer container is sized in _install_layout; the button
+        # is centered within it and hidden when there are no unreads.
+        footer = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 32))
+        # Stays pinned to the bottom: width tracks content_host; the
+        # gap above it (i.e. the kanban_stack) stretches with height.
+        footer.setAutoresizingMask_(NSViewWidthSizable)
+        mark_btn = _FirstMouseButton.alloc().init()
+        mark_btn.setBordered_(False)
+        mark_btn.setFont_(NSFont.systemFontOfSize_(12))
+        mark_btn.setTarget_(self)
+        mark_btn.setAction_("markAllReadClicked:")
+        mark_btn.setTitle_("")
+        mark_btn.setHidden_(True)
+        mark_btn.setContentTintColor_(
+            NSColor.controlAccentColor()
+            if hasattr(NSColor, "controlAccentColor") else NSColor.labelColor()
+        )
+        footer.addSubview_(mark_btn)
+        self.kanban_footer = footer
+        self.mark_all_btn = mark_btn
+
     @objc.python_method
     def _install_layout(self):
         """Swap whichever content view is in the host based on self.mode."""
@@ -1979,8 +2007,19 @@ class PopoverVC(NSViewController):
         for sub in list(self.content_host.subviews()):
             sub.removeFromSuperview()
         if self.mode == "kanban":
-            self.kanban_stack.setFrame_(self.content_host.bounds())
+            host_b = self.content_host.bounds()
+            FOOTER_H = 32.0
+            # Stack fills everything above the footer.
+            self.kanban_stack.setFrame_(NSMakeRect(
+                0, FOOTER_H,
+                host_b.size.width, host_b.size.height - FOOTER_H,
+            ))
             self.content_host.addSubview_(self.kanban_stack)
+            # Footer at the bottom edge.
+            self.kanban_footer.setFrame_(NSMakeRect(
+                0, 0, host_b.size.width, FOOTER_H,
+            ))
+            self.content_host.addSubview_(self.kanban_footer)
         else:
             self.list_scroll.setFrame_(self.content_host.bounds())
             self.content_host.addSubview_(self.list_scroll)
@@ -2032,6 +2071,23 @@ class PopoverVC(NSViewController):
             self.refresh()
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[densityChanged_] {e!r}\n")
+
+    def markAllReadClicked_(self, _sender):
+        """Kanban footer 'Mark all N read' button. Same effect as the
+        cssreadall:// link in list mode: mark every currently-rendered
+        session as read at its current lastTurnEpoch."""
+        try:
+            pairs = []
+            for r in (self.last_rendered_rows or []):
+                sid = (r.get("s") or {}).get("sessionId")
+                epoch = r.get("lastTurnEpoch")
+                if sid and epoch is not None:
+                    pairs.append((sid, epoch))
+            if pairs:
+                _mark_sessions_read(pairs)
+                self.refresh()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[markAllReadClicked_] {e!r}\n")
 
     @objc.python_method
     def refresh(self):
@@ -2175,6 +2231,29 @@ class PopoverVC(NSViewController):
             content_h = scroll.contentSize().height
             doc_h = max(content_h, y + 8.0)
             doc.setFrame_(NSMakeRect(0, 0, col_bounds_w, doc_h))
+
+        # Update the footer "Mark all N read" button based on the
+        # current unread count across all rendered rows.
+        if self.mark_all_btn is not None and self.kanban_footer is not None:
+            unread_count = sum(
+                1 for r in (self.last_rendered_rows or []) if r.get("unread")
+            )
+            if unread_count > 0:
+                self.mark_all_btn.setTitle_(
+                    f"✓ Mark all {unread_count} as read"
+                )
+                self.mark_all_btn.sizeToFit()
+                # Center the button horizontally in the footer.
+                f = self.kanban_footer.frame()
+                b = self.mark_all_btn.frame()
+                self.mark_all_btn.setFrame_(NSMakeRect(
+                    (f.size.width - b.size.width) / 2.0,
+                    (f.size.height - b.size.height) / 2.0,
+                    b.size.width, b.size.height,
+                ))
+                self.mark_all_btn.setHidden_(False)
+            else:
+                self.mark_all_btn.setHidden_(True)
 
     @objc.python_method
     def _build_single_bucket_attributed(
