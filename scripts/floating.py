@@ -1726,6 +1726,7 @@ class PopoverVC(NSViewController):
                 dim, very_dim,
                 right_edge=col_right_edge,
                 show_preview=(key != "dormant"),
+                kanban_mode=True,
             )
 
         if extra:
@@ -1748,6 +1749,7 @@ class PopoverVC(NSViewController):
                         meta_font, bar_font, dim, very_dim,
                         right_edge=col_right_edge,
                         show_preview=False,
+                        kanban_mode=True,
                     )
         return out
 
@@ -1928,7 +1930,7 @@ class PopoverVC(NSViewController):
     @objc.python_method
     def _append_row(self, out, row, color, title_font, gist_font, meta_font,
                     bar_font, dim, very_dim, *, right_edge: float = 332.0,
-                    show_preview: bool = True):
+                    show_preview: bool = True, kanban_mode: bool = False):
         """Render one session row with strong visual hierarchy:
           1. Big bold title + right-aligned age (via tab stop)
           2. Phase + gist line (secondary text)
@@ -2008,23 +2010,54 @@ class PopoverVC(NSViewController):
                 f"cssresume://{sid}",
             )
         append(f" {title}", title_attrs)
-        # Tab then right-aligned age in tertiary color.
+
+        # Trailing block: age + (optional) ✓ mark-read link.
+        #
+        # List mode: render inline on the same line as the title, tab-
+        # right-aligned, because list rows are wide (360+px).
+        #
+        # Kanban mode: kanban columns are narrow (~240px); the title
+        # almost always exceeds the available width and truncatingTail
+        # would eat the ✓ at the end. So in kanban we end the title
+        # line and put `age  ✓` on its own indented line below, which
+        # is always visible regardless of title length.
         age_attrs = {
             NSFontAttributeName: meta_font,
             NSForegroundColorAttributeName: very_dim,
             NSParagraphStyleAttributeName: ps,
         }
-        if unread and sid:
-            # Append a clickable ✓ link AFTER the age. This is the
-            # mark-as-read affordance. NSTextView's link handling fires
-            # textView:clickedOnLink:atIndex: when the user clicks it.
+        check_attrs = {
+            NSFontAttributeName: title_font,
+            NSForegroundColorAttributeName: accent,
+            NSLinkAttributeName: NSURL.URLWithString_(f"cssread://{sid}") if sid else None,
+            NSParagraphStyleAttributeName: ps,
+        }
+        # Drop the NSLinkAttribute entry if it'd be None (no sid).
+        check_attrs = {k: v for k, v in check_attrs.items() if v is not None}
+
+        if kanban_mode:
+            # End the title line, no inline tab/age.
+            append("\n", title_attrs)
+            # Indented meta line: age + optional ✓ on its own row,
+            # using a plain paragraph style (no tab-right alignment)
+            # so it doesn't risk overflowing the column.
+            plain_attrs = {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: very_dim,
+            }
+            append("     ", plain_attrs)
+            append(ago, plain_attrs)
+            if unread and sid:
+                append("  ", plain_attrs)
+                append("✓", {
+                    NSFontAttributeName: title_font,
+                    NSForegroundColorAttributeName: accent,
+                    NSLinkAttributeName: NSURL.URLWithString_(f"cssread://{sid}"),
+                })
+            append("\n", plain_attrs)
+        elif unread and sid:
             append(f"\t{ago}  ", age_attrs)
-            append("✓", {
-                NSFontAttributeName: title_font,
-                NSForegroundColorAttributeName: accent,
-                NSLinkAttributeName: NSURL.URLWithString_(f"cssread://{sid}"),
-                NSParagraphStyleAttributeName: ps,
-            })
+            append("✓", check_attrs)
             append("\n", age_attrs)
         else:
             append(f"\t{ago}\n", age_attrs)
