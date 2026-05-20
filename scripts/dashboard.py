@@ -66,7 +66,83 @@ YELLOW = "\033[33m"
 CYAN = "\033[36m"
 MAGENTA = "\033[35m"
 RED = "\033[31m"
+BLUE = "\033[34m"
 CLEAR = "\033[2J\033[H"
+
+# Where the dashboard remembers its last-chosen view (list vs kanban).
+# Sibling to ~/.claude-sessions-status-popover-mode and -panel-mode used
+# by floating.py — terminal keeps its own preference so kanban can be on
+# in the popover while the terminal stays in list mode (or vice-versa).
+HOME = Path(os.path.expanduser("~"))
+DASHBOARD_MODE_FILE = HOME / ".claude-sessions-status-dashboard-mode"
+
+
+# Common emojis we emit. Most render as 2 terminal cells; everything else
+# is 1. Lets us pad/truncate columns without pulling in `wcwidth`.
+_WIDE_CHARS: frozenset[str] = frozenset(
+    "🎨🛠🔍🌀📋❓💬✅📁📌🔔⚙️📥💤🪲🎯⚠️🤔🪛📝🧠🪛🧪"
+)
+# Pre-compiled ANSI stripper for visible-width calculations.
+import re as _re  # local alias; we only need it in helpers
+_ANSI_RE = _re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _term_width(s: str) -> int:
+    """Approximate the number of terminal cells `s` occupies. Strips ANSI
+    escapes and counts wide emojis as 2. Good enough for our card layout
+    — the alternative (`wcwidth`) is a hard dependency."""
+    plain = _ANSI_RE.sub("", s)
+    w = 0
+    for ch in plain:
+        w += 2 if ch in _WIDE_CHARS else 1
+    return w
+
+
+def _clip_w(s: str, max_width: int) -> str:
+    """Truncate `s` to `max_width` terminal cells, appending '…' if cut.
+    Assumes `s` is plain text (no ANSI). Callers that pass pre-styled
+    strings should style AFTER clipping."""
+    s = s.replace("\n", " ").replace("\r", " ")
+    if _term_width(s) <= max_width:
+        return s
+    out: list[str] = []
+    w = 0
+    for ch in s:
+        cw = 2 if ch in _WIDE_CHARS else 1
+        if w + cw > max_width - 1:
+            out.append("…")
+            return "".join(out)
+        out.append(ch)
+        w += cw
+    return "".join(out)
+
+
+def _pad_w(s: str, width: int) -> str:
+    """Right-pad `s` with spaces so it occupies `width` terminal cells.
+    Tolerates ANSI escapes — pad count is based on visible width."""
+    n = _term_width(s)
+    if n >= width:
+        return s
+    return s + " " * (width - n)
+
+
+def _read_dashboard_mode() -> str:
+    try:
+        v = DASHBOARD_MODE_FILE.read_text(encoding="utf-8").strip()
+        if v in ("list", "kanban"):
+            return v
+    except OSError:
+        pass
+    return "list"
+
+
+def _write_dashboard_mode(mode: str) -> None:
+    if mode not in ("list", "kanban"):
+        return
+    try:
+        DASHBOARD_MODE_FILE.write_text(mode, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _load_index(proj_dir: Path) -> tuple[dict[str, dict], str]:
@@ -654,6 +730,16 @@ BUCKET_READY = "ready"
 BUCKET_DORMANT = "dormant"
 BUCKET_ORDER = (BUCKET_NEEDS, BUCKET_WORKING, BUCKET_READY, BUCKET_DORMANT)
 
+# Header glyph + label + color for each bucket. Kanban column headers
+# read from here; the menubar/floating use parallel constants in their
+# own files — keeping these here so the terminal isn't a snowflake.
+BUCKET_DISPLAY: dict[str, tuple[str, str, str]] = {
+    BUCKET_NEEDS:   ("🔔", "NEEDS YOU", RED),
+    BUCKET_WORKING: ("⚙️", "WORKING",  YELLOW),
+    BUCKET_READY:   ("📥", "FINISHED", GREEN),
+    BUCKET_DORMANT: ("💤", "DORMANT",  DIM),
+}
+
 
 def classify(state: str, phase_label: str) -> str:
     """Map (state, phase_label) → one of {needs, working, ready}.
@@ -846,7 +932,198 @@ def truncate(s: str, width: int) -> str:
     return s[: max(1, width - 1)] + "…"
 
 
-def render(sessions: list[dict]) -> None:
+def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> dict:
+    """Resolve everything we need to render one session, in one pass.
+    Both list and kanban renderers call this so the two views can never
+    disagree about a session's bucket, state, or gist."""
+    full_path = s.get("fullPath", "")
+    meta = transcript_meta(full_path)
+    last_epoch = meta.get("lastTurnEpoch")
+    if last_epoch is None:
+        last_epoch = s.get("fileMtime", 0) / 1000
+    ago_secs = now_ts - last_epoch
+
+    phase_emoji, phase_label = infer_phase(meta)
+    state, color = state_for(meta, ago_secs)
+    hint = next_action(phase_label, meta.get("lastRole"), ago_secs)
+    if state == "Working…" and meta.get("lastRole") == "assistant":
+        hint = "Wait — Claude is mid-tool"
+
+    bucket = classify(state, phase_label)
+    sid = s.get("sessionId") or ""
+    if is_dormant(sid, ago_secs, live, bucket):
+        bucket = BUCKET_DORMANT
+
+    return {
+        "session": s,
+        "meta": meta,
+        "ago_secs": ago_secs,
+        "ago": format_ago(ago_secs),
+        "phase_emoji": phase_emoji,
+        "phase_label": phase_label,
+        "state": state,
+        "color": color,
+        "hint": hint,
+        "bucket": bucket,
+        "title": resolve_title(s, meta, desktop_idx),
+        "project": meta.get("cwd") or s.get("_originalPath") or "",
+        "action": meta.get("lastAction") or "",
+        "sid_short": sid[:8],
+        "gist": session_gist(s, meta, bucket=bucket) or "",
+    }
+
+
+# ---------- list view (original layout) ----------
+def render_list(rows: list[dict], width: int) -> str:
+    parts: list[str] = []
+    if not rows:
+        parts.append(
+            f"{DIM}No sessions modified in the last {RECENT_HOURS:.0f} hours.{RESET}\n"
+        )
+        return "".join(parts)
+    for r in rows:
+        # Reserve room for "▸ <emoji> <title>  [id]"
+        prefix_len = 4 + (2 if r["phase_emoji"] else 0) + 12
+        title = truncate(r["title"], max(20, width - prefix_len))
+        project = truncate(r["project"], width - 8)
+        action = truncate(r["action"], width - 8)
+        gist = truncate(r["gist"], width - 8)
+        emoji_part = f"{r['phase_emoji']} " if r["phase_emoji"] else ""
+        parts.append(
+            f"{BOLD}▸ {emoji_part}{title}{RESET}  {DIM}[{r['sid_short']}]{RESET}\n"
+        )
+        if project:
+            parts.append(
+                f"  {CYAN}📁{RESET} {DIM}{project} · {r['ago']}{RESET}\n"
+            )
+        tail = f"  {DIM}— {r['hint']}{RESET}" if r["hint"] else ""
+        phase_tag = f" {DIM}· {r['phase_label']}{RESET}" if r["phase_label"] else ""
+        parts.append(
+            f"  {r['color']}⏵ {r['state']}{RESET}{phase_tag}{tail}\n"
+        )
+        if gist:
+            parts.append(f"  📌 {BOLD}{gist}{RESET}\n")
+        if action:
+            parts.append(f"  {MAGENTA}↳{RESET} {DIM}{action}{RESET}\n")
+        parts.append("\n")
+    return "".join(parts)
+
+
+# ---------- kanban view ----------
+KANBAN_MIN_WIDTH = 60        # below this, fall back to list view with a banner
+KANBAN_MIN_COL_WIDTH = 28    # narrower than this per column → too cramped
+
+def _kanban_card_lines(r: dict, col_inner_w: int) -> list[str]:
+    """Build the styled lines for one card. 4–5 lines; trailing blank
+    line is added by the caller, not here, so column-zipping knows where
+    cards begin and end."""
+    lines: list[str] = []
+
+    # Line 1 — title (with phase emoji prefix).
+    emoji_part = f"{r['phase_emoji']} " if r["phase_emoji"] else ""
+    t1_plain = f"▸ {emoji_part}{r['title']}"
+    t1 = _clip_w(t1_plain, col_inner_w)
+    lines.append(f"{BOLD}{t1}{RESET}")
+
+    # Line 2 — gist (optional).
+    if r["gist"]:
+        g_plain = f"📌 {r['gist']}"
+        lines.append(_clip_w(g_plain, col_inner_w))
+
+    # Line 3 — state · phase.
+    if r["phase_label"]:
+        s3_plain = f"⏵ {r['state']} · {r['phase_label']}"
+    else:
+        s3_plain = f"⏵ {r['state']}"
+    s3 = _clip_w(s3_plain, col_inner_w)
+    lines.append(f"{r['color']}{s3}{RESET}")
+
+    # Line 4 — folder · age (dim).
+    folder_short = r["project"].replace(str(HOME), "~") if r["project"] else ""
+    if folder_short:
+        f4_plain = f"📁 {folder_short} · {r['ago']}"
+    else:
+        f4_plain = f"📁 · {r['ago']}"
+    f4 = _clip_w(f4_plain, col_inner_w)
+    lines.append(f"{DIM}{f4}{RESET}")
+
+    return lines
+
+
+def render_kanban(rows: list[dict], width: int, show_dormant: bool) -> str:
+    cols = [BUCKET_NEEDS, BUCKET_WORKING, BUCKET_READY]
+    if show_dormant:
+        cols.append(BUCKET_DORMANT)
+    n_cols = len(cols)
+
+    # Outer gutters: 1 char left, 1 char right, 2 chars between columns.
+    gutter_total = 2 + (n_cols - 1) * 2
+    col_w = max(1, (width - gutter_total) // n_cols)
+    if col_w < KANBAN_MIN_COL_WIDTH:
+        # Too cramped — let the caller fall back.
+        return ""
+    col_inner_w = col_w  # we already accounted for gutters, content fills col_w
+
+    # Group rows by bucket.
+    buckets: dict[str, list[dict]] = {k: [] for k in cols}
+    for r in rows:
+        b = r["bucket"]
+        if b in buckets:
+            buckets[b].append(r)
+        # Sessions in BUCKET_DORMANT when show_dormant is off are dropped
+        # (consistent with the floating's "Show older" toggle off).
+
+    # Build a list of styled lines per column.
+    per_col_lines: list[list[str]] = []
+    for key in cols:
+        emoji, label, color = BUCKET_DISPLAY[key]
+        col_lines: list[str] = []
+        bucket_rows = buckets[key]
+        # Header row: "🔔 NEEDS YOU (2)".
+        header_plain = f"{emoji} {label} ({len(bucket_rows)})"
+        header_styled = f"{BOLD}{color}{_clip_w(header_plain, col_inner_w)}{RESET}"
+        col_lines.append(header_styled)
+        # Separator rule under the header.
+        rule = "─" * col_inner_w
+        col_lines.append(f"{DIM}{rule}{RESET}")
+        col_lines.append("")  # blank between rule and first card
+        for i, r in enumerate(bucket_rows):
+            col_lines.extend(_kanban_card_lines(r, col_inner_w))
+            # Blank separator between cards, but not after the last one.
+            if i < len(bucket_rows) - 1:
+                col_lines.append("")
+        per_col_lines.append(col_lines)
+
+    # Pad each column to the same vertical height by appending empty lines.
+    max_h = max(len(c) for c in per_col_lines) if per_col_lines else 0
+    for c in per_col_lines:
+        while len(c) < max_h:
+            c.append("")
+
+    # Zip rows together, padding each cell to col_w and joining with a
+    # 2-space gutter. 1-space outer indent.
+    out: list[str] = []
+    for row_idx in range(max_h):
+        cells = []
+        for c in per_col_lines:
+            cells.append(_pad_w(c[row_idx], col_w))
+        out.append(" " + "  ".join(cells).rstrip() + "\n")
+
+    # Empty-state banner if literally everything is empty.
+    if not any(buckets[k] for k in cols):
+        out.append(
+            f"\n{DIM}No sessions modified in the last "
+            f"{RECENT_HOURS:.0f} hours.{RESET}\n"
+        )
+
+    return "".join(out)
+
+
+def render(
+    sessions: list[dict],
+    view: str = "list",
+    show_dormant: bool = False,
+) -> None:
     try:
         width = os.get_terminal_size().columns
     except OSError:
@@ -855,89 +1132,156 @@ def render(sessions: list[dict]) -> None:
     parts: list[str] = [CLEAR]
     header = f"{BOLD}Claude Code Sessions{RESET}"
     clock = f"{DIM}{datetime.now().strftime('%H:%M:%S')}{RESET}"
-    parts.append(f"{header}   {clock}\n")
+    view_tag = f"{DIM}· {view}" + (" · +dormant" if show_dormant else "") + f"{RESET}"
+    parts.append(f"{header}   {clock}   {view_tag}\n")
     parts.append(f"{DIM}{'─' * width}{RESET}\n\n")
 
-    if not sessions:
+    # Build the Desktop-title index once per render (cheap — ~100ms,
+    # 23 files) so every row's title resolution sees user-set titles.
+    desktop_idx = desktop_titles()
+    live = live_session_ids()
+    rows = [_prepare_row(s, now_ts, desktop_idx, live) for s in sessions]
+
+    if view == "kanban" and width >= KANBAN_MIN_WIDTH:
+        body = render_kanban(rows, width, show_dormant)
+        if not body:
+            # Column-width fell below the floor — fall back with a hint.
+            parts.append(
+                f"{DIM}(terminal too narrow for kanban — showing list){RESET}\n\n"
+            )
+            parts.append(render_list(rows, width))
+        else:
+            parts.append(body)
+    elif view == "kanban":
         parts.append(
-            f"{DIM}No sessions modified in the last {RECENT_HOURS:.0f} hours.{RESET}\n"
+            f"{DIM}(terminal width {width} < {KANBAN_MIN_WIDTH} — showing list){RESET}\n\n"
         )
+        parts.append(render_list(rows, width))
     else:
-        # Build the Desktop-title index once per render (cheap — ~100ms,
-        # 23 files) so every row's title resolution sees user-set titles.
-        desktop_idx = desktop_titles()
-        for s in sessions:
-            full_path = s.get("fullPath", "")
-            meta = transcript_meta(full_path)
-            # Use the most recent user/assistant timestamp as "last activity".
-            # File mtime is unreliable — title metadata writes bump it.
-            last_epoch = meta.get("lastTurnEpoch")
-            if last_epoch is None:
-                last_epoch = s.get("fileMtime", 0) / 1000
-            ago_secs = now_ts - last_epoch
-            ago = format_ago(ago_secs)
-
-            phase_emoji, phase_label = infer_phase(meta)
-            state, color = state_for(meta, ago_secs)
-            hint = next_action(phase_label, meta.get("lastRole"), ago_secs)
-            # If the assistant is still mid-tool, the user shouldn't act —
-            # override any "Reply"/"Answer the question" hint.
-            if state == "Working…" and meta.get("lastRole") == "assistant":
-                hint = "Wait — Claude is mid-tool"
-
-            title = resolve_title(s, meta, desktop_idx)
-            # Reserve room for "▸ <emoji> <title>  [id]"
-            prefix_len = 4 + (2 if phase_emoji else 0) + 12
-            title = truncate(title, max(20, width - prefix_len))
-            project = meta.get("cwd") or s.get("_originalPath") or ""
-            project = truncate(project, width - 8)
-            action = truncate(meta.get("lastAction") or "", width - 8)
-            sid_short = (s.get("sessionId") or "")[:8]
-            gist = session_gist(s, meta, bucket=None) or ""
-            gist = truncate(gist, width - 8)
-
-            emoji_part = f"{phase_emoji} " if phase_emoji else ""
-            parts.append(
-                f"{BOLD}▸ {emoji_part}{title}{RESET}  {DIM}[{sid_short}]{RESET}\n"
-            )
-            if project:
-                parts.append(
-                    f"  {CYAN}📁{RESET} {DIM}{project} · {ago}{RESET}\n"
-                )
-            # Status + next-action on one line so it's the obvious focal point.
-            tail = f"  {DIM}— {hint}{RESET}" if hint else ""
-            phase_tag = f" {DIM}· {phase_label}{RESET}" if phase_label else ""
-            parts.append(
-                f"  {color}⏵ {state}{RESET}{phase_tag}{tail}\n"
-            )
-            # Gist line — what Claude is concretely working on right now.
-            if gist:
-                parts.append(f"  📌 {BOLD}{gist}{RESET}\n")
-            if action:
-                parts.append(f"  {MAGENTA}↳{RESET} {DIM}{action}{RESET}\n")
-            parts.append("\n")
+        parts.append(render_list(rows, width))
 
     footer = (
         f"{DIM}refreshing every {REFRESH_SECS}s · "
-        f"window {RECENT_HOURS:.0f}h · ctrl-c to exit{RESET}\n"
+        f"window {RECENT_HOURS:.0f}h · "
+        f"k=kanban  l=list  d=±dormant  q=quit{RESET}\n"
     )
     parts.append(footer)
     sys.stdout.write("".join(parts))
     sys.stdout.flush()
 
 
+def _setup_cbreak_stdin():
+    """Put stdin into cbreak mode for single-character reads. Returns
+    the saved termios attrs to restore on exit, or None if stdin isn't
+    a tty (e.g. piped output). Caller is responsible for restoring."""
+    if not sys.stdin.isatty():
+        return None
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return None
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+    except Exception:
+        return None
+    return saved
+
+
+def _restore_stdin(saved) -> None:
+    if saved is None:
+        return
+    try:
+        import termios
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
+    except Exception:
+        pass
+
+
+def _poll_key() -> str | None:
+    """Non-blocking single-char read from stdin. Returns None if nothing
+    pending. Safe to call even when stdin isn't a tty (returns None)."""
+    if not sys.stdin.isatty():
+        return None
+    try:
+        import select
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if r:
+            return sys.stdin.read(1)
+    except Exception:
+        return None
+    return None
+
+
 def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="claude-sessions-status-dashboard",
+        description="Live terminal view of recently-active Claude Code sessions.",
+    )
+    parser.add_argument("--kanban", action="store_true",
+                        help="Start in kanban (3-column) view")
+    parser.add_argument("--list", dest="list_view", action="store_true",
+                        help="Start in list view (default if no flag and no saved pref)")
+    parser.add_argument("--show-dormant", action="store_true",
+                        help="Show the DORMANT column / dormant sessions")
+    parser.add_argument("--save", action="store_true",
+                        help="Persist the chosen --kanban/--list to "
+                             "~/.claude-sessions-status-dashboard-mode")
+    args = parser.parse_args()
+
+    # Resolve initial view: explicit flag > saved preference > default.
+    if args.kanban:
+        view = "kanban"
+    elif args.list_view:
+        view = "list"
+    else:
+        view = _read_dashboard_mode()
+    if args.save:
+        _write_dashboard_mode(view)
+    show_dormant = bool(args.show_dormant)
+
     # Clean exit on ctrl-c without a traceback.
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
-    # Hide the cursor while the dashboard runs; restore on exit.
+    # Hide cursor + put stdin into cbreak for interactive keys.
     sys.stdout.write("\033[?25l")
     sys.stdout.flush()
+    saved_termios = _setup_cbreak_stdin()
     try:
         while True:
             sessions = recent_sessions(find_sessions())
-            render(sessions)
-            time.sleep(REFRESH_SECS)
+            render(sessions, view=view, show_dormant=show_dormant)
+            # Sleep in 100ms increments so keypresses feel responsive.
+            elapsed = 0.0
+            tick = 0.1
+            next_refresh = float(REFRESH_SECS)
+            while elapsed < next_refresh:
+                time.sleep(tick)
+                elapsed += tick
+                key = _poll_key()
+                if key is None:
+                    continue
+                ch = key.lower()
+                if ch == "q":
+                    return 0
+                if ch == "k" and view != "kanban":
+                    view = "kanban"
+                    _write_dashboard_mode(view)
+                    break  # re-render now
+                if ch == "l" and view != "list":
+                    view = "list"
+                    _write_dashboard_mode(view)
+                    break
+                if ch == "d":
+                    show_dormant = not show_dormant
+                    break
+                if ch == "r":  # manual refresh
+                    break
+                # Any other key is ignored — no help overlay yet.
     finally:
+        _restore_stdin(saved_termios)
         sys.stdout.write("\033[?25h")  # show cursor
         sys.stdout.write(RESET)
         sys.stdout.flush()
