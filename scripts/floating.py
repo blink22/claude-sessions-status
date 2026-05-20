@@ -41,7 +41,6 @@ try:
         NSAttributedString,
         NSBackingStoreBuffered,
         NSBezierPath,
-        NSBox,
         NSButton,
         NSColor,
         NSCursor,
@@ -49,10 +48,8 @@ try:
         NSFont,
         NSFontAttributeName,
         NSForegroundColorAttributeName,
-        NSFontWeightMedium,
         NSFontWeightRegular,
         NSFontWeightSemibold,
-        NSGradient,
         NSImage,
         NSImageSymbolConfiguration,
         NSKernAttributeName,
@@ -2333,80 +2330,6 @@ class PopoverVC(NSViewController):
             doc.setFrame_(NSMakeRect(0, 0, col_bounds_w, doc_h))
 
         self._update_mark_all_button()
-
-    @objc.python_method
-    def _build_single_bucket_attributed(
-        self,
-        key: str,
-        rows: list,
-        extra: tuple | None = None,
-    ) -> NSAttributedString:
-        """Build attributed content for one kanban column."""
-        header_font = NSFont.systemFontOfSize_weight_(10, NSFontWeightSemibold)
-        title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
-        gist_font = NSFont.systemFontOfSize_(12)
-        meta_font = _rounded_tabular_font(11.0, NSFontWeightRegular)
-        bar_font = NSFont.systemFontOfSize_(15)
-        dim = NSColor.secondaryLabelColor()
-        very_dim = NSColor.tertiaryLabelColor()
-
-        out = NSMutableAttributedString.alloc().init()
-
-        def append(text: str, attrs: dict) -> None:
-            out.appendAttributedString_(
-                NSAttributedString.alloc().initWithString_attributes_(text, attrs)
-            )
-
-        color = _bucket_tint(key)
-
-        # Header.
-        append(f"  {LABELS[key]}  ·  {len(rows)}\n", {
-            NSFontAttributeName: header_font,
-            NSForegroundColorAttributeName: color,
-            NSKernAttributeName: 0.8,
-        })
-        if not rows:
-            append("  —\n", {
-                NSFontAttributeName: gist_font,
-                NSForegroundColorAttributeName: dim,
-            })
-
-        # Kanban columns are narrower than list mode — set the tab stop
-        # closer in so the age sits at the column's right edge.
-        col_right_edge = (POPOVER_KANBAN_SIZE[0] / 3.0) - 32
-
-        for row in rows:
-            self._append_row(
-                out, row, color, title_font, gist_font, meta_font, bar_font,
-                dim, very_dim,
-                right_edge=col_right_edge,
-                show_preview=(key != "dormant"),
-                kanban_mode=True,
-            )
-
-        if extra:
-            extra_key, extra_rows = extra
-            if extra_rows:
-                ex_color = NSColor.tertiaryLabelColor()
-                out.appendAttributedString_(
-                    NSAttributedString.alloc().initWithString_attributes_(
-                        f"\n  {LABELS[extra_key]}  ·  {len(extra_rows)}\n",
-                        {
-                            NSFontAttributeName: header_font,
-                            NSForegroundColorAttributeName: ex_color,
-                            NSKernAttributeName: 0.8,
-                        },
-                    )
-                )
-                for row in extra_rows:
-                    self._append_row(
-                        out, row, ex_color, title_font, gist_font,
-                        meta_font, bar_font, dim, very_dim,
-                        right_edge=col_right_edge,
-                        show_preview=False,
-                        kanban_mode=True,
-                    )
-        return out
 
     @objc.python_method
     def _row_paragraph_style(self, right_edge: float):
