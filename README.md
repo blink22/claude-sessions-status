@@ -25,11 +25,10 @@ No daemon, no Anthropic API key required, no plugins to register inside Claude. 
 ## 🚀 Quick start
 
 ```bash
-brew install Blink22/tap/claude-sessions-status
-claude-sessions-status install
+curl -fsSL https://raw.githubusercontent.com/blink22/claude-sessions-status/main/install.sh | bash
 ```
 
-That's it. The installer wires up SwiftBar (the menu bar host), optionally prompts for an Anthropic API key to enable AI gists, and offers to add SwiftBar to macOS Login Items so the menu bar persists across reboots.
+That's it. The installer clones the repo to `~/.claude-sessions-status/`, symlinks entry points into `~/.local/bin/`, then runs the interactive setup — which wires up SwiftBar (the menu bar host), optionally prompts for an Anthropic API key to enable AI gists, and offers to add SwiftBar to macOS Login Items so the menu bar persists across reboots.
 
 Then pick your favourite view:
 
@@ -170,22 +169,39 @@ If the terminal is narrower than ~60 columns, the dashboard falls back to list v
 
 ## Install
 
-### Option A — Homebrew (recommended)
+### Option A — Shell installer (recommended)
 
 ```bash
-brew install Blink22/tap/claude-sessions-status
+curl -fsSL https://raw.githubusercontent.com/blink22/claude-sessions-status/main/install.sh | bash
+```
+
+What it does:
+1. Pre-flight checks (macOS, `git`, Python ≥ 3.9).
+2. `git clone` the repo to `~/.claude-sessions-status/` (or `git pull` if it already exists).
+3. Symlinks two entry points into `~/.local/bin/`:
+   - `claude-sessions-status`
+   - `claude-sessions-status-dashboard`
+4. Warns if `~/.local/bin` isn't on `PATH` and prints the exact line to add to `~/.zshrc`.
+5. Hands off to the interactive setup (`claude-sessions-status install`), which handles SwiftBar, the env file, and Login Items.
+
+To pin a specific version instead of `main`:
+
+```bash
+CSS_REF=v0.2.0 bash <(curl -fsSL https://raw.githubusercontent.com/blink22/claude-sessions-status/main/install.sh)
+```
+
+To upgrade later: re-run the same one-liner. It detects the existing checkout and does a `git pull`.
+
+### Option B — Homebrew (coming soon)
+
+A Homebrew formula exists in [`Formula/claude-sessions-status.rb`](https://github.com/blink22/homebrew-claude-sessions-status/blob/main/Formula/claude-sessions-status.rb) but the tap repo isn't published yet. Once it is, install will be:
+
+```bash
+brew install blink22/claude-sessions-status/claude-sessions-status
 claude-sessions-status install
 ```
 
-The first command installs the scripts and brings SwiftBar in as a dependency. The second walks you through API key prompt, SwiftBar plugin symlink, and (optional) Login Items wiring.
-
-### Option B — Shell installer
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Blink22/claude-sessions-status/main/install.sh | bash
-```
-
-Equivalent end state, no Homebrew needed. Clones to `~/.claude-sessions-status/` and symlinks entry points into `~/.local/bin/`.
+In the meantime, use Option A.
 
 ### Option C — Developer install (clone + edit)
 
