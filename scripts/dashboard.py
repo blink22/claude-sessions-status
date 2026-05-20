@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 import urllib.request
@@ -75,6 +76,15 @@ CLEAR = "\033[2J\033[H"
 # in the popover while the terminal stays in list mode (or vice-versa).
 HOME = Path(os.path.expanduser("~"))
 DASHBOARD_MODE_FILE = HOME / ".claude-sessions-status-dashboard-mode"
+
+# Quick-resume hotkey state (digit keys 1-9 in the main loop).
+# `_NUMBERED_SESSIONS` is rebuilt by render() every frame and indexed by
+# the keypress handler. `_LAST_ACTION_MSG` is a one-shot footer string set
+# by the keypress handler (e.g. "→ resumed session 3 …" or "no session
+# at slot 3"); render() prints it once, then clears it.
+QUICK_RESUME_MAX = 9
+_NUMBERED_SESSIONS: list[dict] = []
+_LAST_ACTION_MSG: str | None = None
 
 
 # Common emojis we emit. Most render as 2 terminal cells; everything else
@@ -981,16 +991,21 @@ def render_list(rows: list[dict], width: int) -> str:
             f"{DIM}No sessions modified in the last {RECENT_HOURS:.0f} hours.{RESET}\n"
         )
         return "".join(parts)
-    for r in rows:
-        # Reserve room for "▸ <emoji> <title>  [id]"
-        prefix_len = 4 + (2 if r["phase_emoji"] else 0) + 12
+    for idx, r in enumerate(rows):
+        # First QUICK_RESUME_MAX rows get a dim "[N] " prefix on the title
+        # line so the user knows which digit hotkey resumes which session.
+        slot_num = idx + 1 if idx < QUICK_RESUME_MAX else None
+        slot_prefix = f"{DIM}[{slot_num}]{RESET} " if slot_num else ""
+        # Reserve room for "[N] ▸ <emoji> <title>  [id]"
+        slot_len = 4 if slot_num else 0
+        prefix_len = 4 + slot_len + (2 if r["phase_emoji"] else 0) + 12
         title = truncate(r["title"], max(20, width - prefix_len))
         project = truncate(r["project"], width - 8)
         action = truncate(r["action"], width - 8)
         gist = truncate(r["gist"], width - 8)
         emoji_part = f"{r['phase_emoji']} " if r["phase_emoji"] else ""
         parts.append(
-            f"{BOLD}▸ {emoji_part}{title}{RESET}  {DIM}[{r['sid_short']}]{RESET}\n"
+            f"{slot_prefix}{BOLD}▸ {emoji_part}{title}{RESET}  {DIM}[{r['sid_short']}]{RESET}\n"
         )
         if project:
             parts.append(
@@ -1013,17 +1028,34 @@ def render_list(rows: list[dict], width: int) -> str:
 KANBAN_MIN_WIDTH = 60        # below this, fall back to list view with a banner
 KANBAN_MIN_COL_WIDTH = 28    # narrower than this per column → too cramped
 
-def _kanban_card_lines(r: dict, col_inner_w: int) -> list[str]:
+def _kanban_card_lines(
+    r: dict, col_inner_w: int, slot_num: int | None = None
+) -> list[str]:
     """Build the styled lines for one card. 4–5 lines; trailing blank
     line is added by the caller, not here, so column-zipping knows where
-    cards begin and end."""
+    cards begin and end.
+
+    `slot_num`, if set (1-9), is prefixed to the title line as a dim
+    "[N] " marker matching the digit hotkey that resumes this session."""
     lines: list[str] = []
 
-    # Line 1 — title (with phase emoji prefix).
+    # Line 1 — title (with optional slot-number + phase emoji prefix).
     emoji_part = f"{r['phase_emoji']} " if r["phase_emoji"] else ""
-    t1_plain = f"▸ {emoji_part}{r['title']}"
+    slot_prefix_plain = f"[{slot_num}] " if slot_num else ""
+    t1_plain = f"{slot_prefix_plain}▸ {emoji_part}{r['title']}"
     t1 = _clip_w(t1_plain, col_inner_w)
-    lines.append(f"{BOLD}{t1}{RESET}")
+    if slot_num:
+        # Style the "[N] " part dim, the rest bold, all inside the clipped
+        # string. Since _clip_w can truncate, only apply the dim wrapper
+        # when the slot prefix actually survived clipping.
+        prefix_str = f"[{slot_num}] "
+        if t1.startswith(prefix_str):
+            rest = t1[len(prefix_str):]
+            lines.append(f"{DIM}{prefix_str}{RESET}{BOLD}{rest}{RESET}")
+        else:
+            lines.append(f"{BOLD}{t1}{RESET}")
+    else:
+        lines.append(f"{BOLD}{t1}{RESET}")
 
     # Line 2 — gist (optional).
     if r["gist"]:
@@ -1073,6 +1105,23 @@ def render_kanban(rows: list[dict], width: int, show_dormant: bool) -> str:
         # Sessions in BUCKET_DORMANT when show_dormant is off are dropped
         # (consistent with the floating's "Show older" toggle off).
 
+    # Assign quick-resume slot numbers in column-major order: walk each
+    # visible column in display order, and within each column walk cards
+    # top-to-bottom. Cap at QUICK_RESUME_MAX. The mapping (id(r) → slot)
+    # is also exported via _NUMBERED_SESSIONS in render(), so the
+    # keypress handler resolves digit hits to the same session the user
+    # sees labeled "[N]".
+    slot_by_id: dict[int, int] = {}
+    next_slot = 1
+    for key in cols:
+        for r in buckets[key]:
+            if next_slot > QUICK_RESUME_MAX:
+                break
+            slot_by_id[id(r)] = next_slot
+            next_slot += 1
+        if next_slot > QUICK_RESUME_MAX:
+            break
+
     # Build a list of styled lines per column.
     per_col_lines: list[list[str]] = []
     for key in cols:
@@ -1088,7 +1137,8 @@ def render_kanban(rows: list[dict], width: int, show_dormant: bool) -> str:
         col_lines.append(f"{DIM}{rule}{RESET}")
         col_lines.append("")  # blank between rule and first card
         for i, r in enumerate(bucket_rows):
-            col_lines.extend(_kanban_card_lines(r, col_inner_w))
+            slot = slot_by_id.get(id(r))
+            col_lines.extend(_kanban_card_lines(r, col_inner_w, slot_num=slot))
             # Blank separator between cards, but not after the last one.
             if i < len(bucket_rows) - 1:
                 col_lines.append("")
@@ -1119,11 +1169,45 @@ def render_kanban(rows: list[dict], width: int, show_dormant: bool) -> str:
     return "".join(out)
 
 
+def _compute_numbered_sessions(
+    rows: list[dict], view: str, show_dormant: bool
+) -> list[dict]:
+    """Build the ordered list of sessions whose slot numbers (1..9) match
+    the "[N]" labels the user sees. Index 0 in the returned list is the
+    "[1]" session, etc. Both renderers and the keypress handler consult
+    this so numbering and lookup can never disagree.
+
+    Order rules (mirroring the renderers):
+      - list view: same order as `rows` (already sorted by recency).
+      - kanban view: column-major. Columns are NEEDS, WORKING, FINISHED
+        (and DORMANT if show_dormant). Within each column, recency order
+        (which is `rows` order, since `_prepare_row` doesn't reshuffle).
+    """
+    if view != "kanban":
+        return [r["session"] for r in rows[:QUICK_RESUME_MAX]]
+    cols = [BUCKET_NEEDS, BUCKET_WORKING, BUCKET_READY]
+    if show_dormant:
+        cols.append(BUCKET_DORMANT)
+    buckets: dict[str, list[dict]] = {k: [] for k in cols}
+    for r in rows:
+        b = r["bucket"]
+        if b in buckets:
+            buckets[b].append(r)
+    out: list[dict] = []
+    for key in cols:
+        for r in buckets[key]:
+            if len(out) >= QUICK_RESUME_MAX:
+                return out
+            out.append(r["session"])
+    return out
+
+
 def render(
     sessions: list[dict],
     view: str = "list",
     show_dormant: bool = False,
 ) -> None:
+    global _NUMBERED_SESSIONS, _LAST_ACTION_MSG
     try:
         width = os.get_terminal_size().columns
     except OSError:
@@ -1142,28 +1226,46 @@ def render(
     live = live_session_ids()
     rows = [_prepare_row(s, now_ts, desktop_idx, live) for s in sessions]
 
+    # Resolve which view the body will actually render in (kanban may fall
+    # back to list when the terminal is too narrow). The numbering must
+    # match the displayed view, not the requested one.
+    body: str
     if view == "kanban" and width >= KANBAN_MIN_WIDTH:
         body = render_kanban(rows, width, show_dormant)
         if not body:
-            # Column-width fell below the floor — fall back with a hint.
             parts.append(
                 f"{DIM}(terminal too narrow for kanban — showing list){RESET}\n\n"
             )
             parts.append(render_list(rows, width))
+            effective_view = "list"
         else:
             parts.append(body)
+            effective_view = "kanban"
     elif view == "kanban":
         parts.append(
             f"{DIM}(terminal width {width} < {KANBAN_MIN_WIDTH} — showing list){RESET}\n\n"
         )
         parts.append(render_list(rows, width))
+        effective_view = "list"
     else:
         parts.append(render_list(rows, width))
+        effective_view = "list"
+
+    # Publish the numbering so the keypress handler can resolve digits.
+    _NUMBERED_SESSIONS = _compute_numbered_sessions(
+        rows, effective_view, show_dormant
+    )
+
+    # One-shot status line (e.g. "→ resumed session 3 …" or "no session
+    # at slot 3"), printed once and cleared so the next frame is clean.
+    if _LAST_ACTION_MSG:
+        parts.append(f"{DIM}{_LAST_ACTION_MSG}{RESET}\n")
+        _LAST_ACTION_MSG = None
 
     footer = (
         f"{DIM}refreshing every {REFRESH_SECS}s · "
         f"window {RECENT_HOURS:.0f}h · "
-        f"k=kanban  l=list  d=±dormant  q=quit{RESET}\n"
+        f"k=kanban  l=list  d=±dormant  1-9=resume  q=quit{RESET}\n"
     )
     parts.append(footer)
     sys.stdout.write("".join(parts))
@@ -1215,7 +1317,40 @@ def _poll_key() -> str | None:
     return None
 
 
+def _resume_session_in_terminal(session_id: str) -> bool:
+    """Open a fresh Terminal.app window and run `claude --resume <sid>`.
+    Returns True on success (osascript launched without an exit error),
+    False otherwise. Never raises — the dashboard must keep running.
+
+    Shell-escaping note: the sessionId is the JSONL filename stem, so it's
+    a UUID-like token. We still defensively reject anything outside the
+    safe character set before composing the AppleScript so a hostile
+    transcript filename can't smuggle quotes / commands into `do script`.
+    """
+    if not session_id:
+        return False
+    # Defensive allow-list: UUIDs use [0-9a-fA-F-]. Anything else and we
+    # bail rather than risk command injection via `do script`.
+    safe_chars = set("0123456789abcdefABCDEF-_")
+    if any(c not in safe_chars for c in session_id):
+        return False
+    cmd = f"claude --resume {session_id}"
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e", 'tell application "Terminal" to activate',
+                "-e", f'tell application "Terminal" to do script "{cmd}"',
+            ],
+            check=False,
+        )
+    except OSError:
+        return False
+    return True
+
+
 def main() -> int:
+    global _LAST_ACTION_MSG
     import argparse
     parser = argparse.ArgumentParser(
         prog="claude-sessions-status-dashboard",
@@ -1278,6 +1413,23 @@ def main() -> int:
                     show_dormant = not show_dormant
                     break
                 if ch == "r":  # manual refresh
+                    break
+                # Digit hotkeys 1-9: resume the Nth visible session in a
+                # new Terminal window. We set _LAST_ACTION_MSG and break
+                # so the next frame re-renders with the footer status.
+                if ch.isdigit() and ch != "0":
+                    slot = int(ch)
+                    if slot - 1 < len(_NUMBERED_SESSIONS):
+                        target = _NUMBERED_SESSIONS[slot - 1]
+                        sid = target.get("sessionId") or ""
+                        if sid and _resume_session_in_terminal(sid):
+                            _LAST_ACTION_MSG = (
+                                f"→ resumed session {slot} in new Terminal window"
+                            )
+                        else:
+                            _LAST_ACTION_MSG = f"could not resume session {slot}"
+                    else:
+                        _LAST_ACTION_MSG = f"no session at slot {slot}"
                     break
                 # Any other key is ignored — no help overlay yet.
     finally:
