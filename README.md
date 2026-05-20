@@ -4,16 +4,17 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg" /></a>
   <img alt="macOS only" src="https://img.shields.io/badge/macOS-13%2B-lightgrey?logo=apple" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white" />
-  <img alt="Status: v0.1.0" src="https://img.shields.io/badge/status-v0.1.0%20preview-orange" />
+  <img alt="Status: v0.2.0" src="https://img.shields.io/badge/status-v0.2.0%20preview-orange" />
 </p>
 
 > **A glance at every Claude Code session you've got running** — in your menu bar, in a floating glass capsule, or in a full terminal dashboard.
 
-When you're driving several Claude Code sessions in parallel, it's easy to lose track of which one is asking you a question, which one is still working, and which ones have been silently waiting for an hour. `claude-sessions-status` watches Claude's local transcript files and surfaces the state of all your sessions in one of three ways:
+When you're driving several Claude Code sessions in parallel, it's easy to lose track of which one is asking you a question, which one is still working, and which ones have been silently waiting for an hour. `claude-sessions-status` watches Claude's local transcript files and surfaces the state of all your sessions in one of four ways:
 
 - 🔔 **Menu bar plugin** — three live counts in your top-right, click for a grouped dropdown
-- 🟢 **Floating glass badge** — a small always-on-top capsule, click to expand an attached popover
-- 🖥 **Terminal dashboard** — a full-screen grouped view for triage and planning
+- 🟢 **Floating glass badge** — a small always-on-top capsule, click to expand an attached popover (list or kanban, 3 density modes, click any session to jump to it)
+- 🪟 **Always-on-top panel** — a draggable, resizable window that stays in front, list or kanban
+- 🖥 **Terminal dashboard** — a full-screen grouped view for triage and planning, list or kanban, live hotkeys
 
 No daemon, no Anthropic API key required, no plugins to register inside Claude. Pure Python + AppKit, ~stdlib-only.
 
@@ -33,9 +34,11 @@ That's it. The installer wires up SwiftBar (the menu bar host), optionally promp
 Then pick your favourite view:
 
 ```bash
-claude-sessions-status badge          # small floating glass capsule
-claude-sessions-status panel          # always-on-top window
-claude-sessions-status-dashboard      # full-screen terminal
+claude-sessions-status badge              # small floating glass capsule + popover
+claude-sessions-status panel              # always-on-top window
+claude-sessions-status panel --kanban     # …in 3-column kanban layout
+claude-sessions-status-dashboard          # full-screen terminal
+claude-sessions-status-dashboard --kanban # terminal in 3-column kanban
 ```
 
 ---
@@ -79,7 +82,7 @@ Build audio plugin for Claude responses
 
 ---
 
-## Three ways to view sessions
+## Four ways to view sessions
 
 ### 1. Menu bar plugin (SwiftBar)
 
@@ -91,9 +94,9 @@ The default. Once installed and SwiftBar is running, your menu bar shows three s
 
 Click the menu bar item to drop down a list of all active sessions grouped by bucket.
 
-### 2. Floating glass badge
+### 2. Floating glass badge + popover
 
-A small always-on-top capsule (~150×36px) you can park anywhere on your desktop. Three tinted numerals (red / amber / green) with rounded underline accents, frosted-glass background via `NSVisualEffectView`. Click it and a native macOS popover slides out **attached to the badge** — with an arrow pointing back at it — listing the same sessions with a richer per-row layout.
+A small always-on-top capsule (~150×36px) you can park anywhere on your desktop. Three tinted numerals (red / amber / green) with rounded underline accents, frosted-glass background via `NSVisualEffectView`. Click it and a native macOS popover slides out **attached to the badge** — with an arrow pointing back at it — listing your sessions in a rich per-row layout.
 
 ```bash
 claude-sessions-status badge
@@ -112,15 +115,56 @@ Anatomy of the badge:
        NEEDS    WORKING   FINISHED
 ```
 
+The badge is visible on every Space, including alongside full-screen apps (it uses `NSWindowCollectionBehavior` flags `canJoinAllSpaces | stationary | fullScreenAuxiliary`). Drag it anywhere on screen — its position is remembered across launches.
+
+**Inside the popover:**
+
+- **Density popup (top-left)** — `Glance` / `Focus` / `Detail`. Glance is one line per session (title only), Focus is the standard 4-line card, Detail adds a richer assistant-follow-on summary. Your choice is persisted across launches.
+- **List ↔ Kanban toggle (top-bar segmented control)** — flip between a vertical list and a 3-column kanban (`NEEDS YOU` / `WORKING` / `FINISHED`). The popover auto-resizes between the two layouts.
+- **Show Older checkbox** — adds a 4th `DORMANT` column on the right of the kanban (not under FINISHED) for sessions you've drifted away from.
+- **"✓ Mark all N as read" button (top-right in kanban)** — clears the unread indicator on NEEDS-YOU cards you've already glanced at. Acknowledgements persist in `~/.claude-sessions-status-seen.json`.
+- **Click any card / list row** to jump straight to that Claude Code session — we focus the existing Terminal tab if the session is live, or spawn a new tab running `claude --resume <session-id>` if not.
+- **First click is honored** — clicking inside an inactive popover counts as a real click on the card, no double-clicking required.
+
 Built with PyObjC + AppKit; anchored via `NSPopover` so the expanded view stays visually tied to the badge.
 
-### 3. Terminal dashboard
+### 3. Always-on-top panel
 
-A full-screen grouped view, refreshing every 5 seconds. Useful for triage, or for parking in a side terminal window during a working session.
+A standalone window pinned in front of everything else — same data and layout as the popover, but in a draggable, resizable window of its own. Useful if you want the dashboard visible permanently in a corner of the screen without the click-to-expand step.
 
 ```bash
-claude-sessions-status-dashboard
+claude-sessions-status panel              # list mode (default)
+claude-sessions-status panel --kanban     # 3-column kanban
+claude-sessions-status panel --quit       # quit a running panel/badge
 ```
+
+The panel and the badge share state (popover mode, density, mark-as-read acknowledgements) — switching density or view in one updates the other on next refresh.
+
+### 4. Terminal dashboard
+
+A full-screen grouped view, refreshing every 5 seconds. Useful for triage, or for parking in a side terminal window during a working session. Supports the same kanban layout as the GUI views.
+
+```bash
+claude-sessions-status-dashboard                    # list (default)
+claude-sessions-status-dashboard --kanban           # 3-column kanban
+claude-sessions-status-dashboard --kanban --save    # remember --kanban for next launch
+claude-sessions-status-dashboard --show-dormant     # include the dormant column / sessions
+```
+
+**Live hotkeys while running** (no need to restart):
+
+| Key | Action |
+|---|---|
+| `k` | Switch to kanban view (auto-persists) |
+| `l` | Switch to list view (auto-persists) |
+| `d` | Toggle the dormant column / dormant sessions |
+| `r` | Force an immediate refresh |
+| `q` | Quit |
+| `1`–`9` | Resume the Nth visible session in a new Terminal window (`claude --resume <session-id>`) |
+
+Mode persists to `~/.claude-sessions-status-dashboard-mode`, independent of the badge/popover preference — so you can have the GUI in list mode and the terminal in kanban (or vice versa) without them stomping on each other.
+
+If the terminal is narrower than ~60 columns, the dashboard falls back to list view with a small banner — kanban needs the horizontal room to be useful.
 
 ---
 
@@ -192,6 +236,22 @@ After it finishes, the menu-bar icon appears within ~5 seconds. The floating bad
 | `~/.claude-sessions-status-off` | Touchfile that mutes the menu bar (handy during screen recordings). |
 | `~/.claude-sessions-status-prompt.txt` | _(reserved)_ Custom system prompt for AI gist generation. |
 
+### State files (auto-managed)
+
+These are written by the badge / panel / terminal dashboard themselves — you don't normally edit them, but deleting one resets that particular preference.
+
+| File | What it stores |
+|---|---|
+| `~/.claude-sessions-status-density` | Popover density: `glance` / `focus` / `detail`. |
+| `~/.claude-sessions-status-popover-mode` | Badge popover layout: `list` or `kanban`. |
+| `~/.claude-sessions-status-panel-mode` | Standalone panel layout: `list` or `kanban`. |
+| `~/.claude-sessions-status-dashboard-mode` | Terminal dashboard layout: `list` or `kanban` (independent of the GUI views). |
+| `~/.claude-sessions-status-show-dormant` | Touchfile — when present, the popover kanban shows the 4th DORMANT column. |
+| `~/.claude-sessions-status-seen.json` | Which NEEDS-YOU sessions you've acknowledged via "Mark all N as read". |
+| `~/.claude-sessions-status-badge.json` | Saved badge x/y position. |
+| `~/.claude-sessions-status-window.json` | Saved panel window x/y/w/h. |
+| `~/.claude-sessions-status-cache.json` | Cached AI gist phrases (keyed on transcript size). |
+
 ### Cost / privacy of AI gist mode
 
 AI gist mode calls Claude Haiku once per real conversation turn, per session. The result is cached at `~/.claude-sessions-status-cache.json` and reused on every refresh until that session's transcript grows again. Typical usage is single-digit cents per month.
@@ -203,20 +263,26 @@ Without an API key, the tool falls back to a free heuristic (latest user prompt,
 ## Subcommands
 
 ```
-claude-sessions-status install         # interactive setup
-claude-sessions-status uninstall       # reverse install interactively
-claude-sessions-status doctor          # verify wiring
-claude-sessions-status logs            # tail ~/.claude-sessions-status.log
+claude-sessions-status install                  # interactive setup
+claude-sessions-status uninstall                # reverse install interactively
+claude-sessions-status doctor                   # verify wiring
+claude-sessions-status logs                     # tail ~/.claude-sessions-status.log
 
-claude-sessions-status panel           # full always-on-top window (list mode)
-claude-sessions-status panel --kanban  # 3-column window mode
-claude-sessions-status panel --quit    # quit a running panel/badge
+claude-sessions-status panel                    # full always-on-top window (list mode)
+claude-sessions-status panel --kanban           # 3-column window mode
+claude-sessions-status panel --quit             # quit a running panel/badge
 
-claude-sessions-status badge           # small floating glass capsule
-claude-sessions-status badge --quit    # quit the badge
+claude-sessions-status badge                    # small floating glass capsule
+claude-sessions-status badge --quit             # quit the badge
 
-claude-sessions-status-dashboard       # full-screen terminal view
+claude-sessions-status-dashboard                # full-screen terminal view (list)
+claude-sessions-status-dashboard --kanban       # terminal kanban (3 columns)
+claude-sessions-status-dashboard --list         # explicit list mode
+claude-sessions-status-dashboard --show-dormant # include the dormant column / sessions
+claude-sessions-status-dashboard --kanban --save  # also persist the view choice
 ```
+
+While the terminal dashboard is running, single-key hotkeys (`k`/`l`/`d`/`r`/`q` and `1`–`9`) let you toggle modes, refresh, quit, or resume a specific session — see the hotkey table above.
 
 ---
 
@@ -362,6 +428,19 @@ claude-sessions-status badge
 ```
 
 First launch installs `pyobjc-framework-Cocoa` into `~/.claude-sessions-status-venv/` (~10 second one-time setup).
+
+**Badge invisible after launch (off-screen / behind a notch)**
+
+The badge remembers its last position. If that position is now off-screen (external monitor unplugged, resolution changed), reset it:
+
+```bash
+rm ~/.claude-sessions-status-badge.json
+claude-sessions-status badge --quit && claude-sessions-status badge
+```
+
+**Terminal kanban looks broken / columns squished**
+
+Kanban needs ≥ 60 columns of terminal width. Below that the dashboard auto-falls back to list view with a banner. Resize the terminal wider, or press `l` to switch to list mode explicitly.
 
 ---
 

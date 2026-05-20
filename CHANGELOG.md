@@ -4,6 +4,73 @@ All notable changes to this project are documented here. Format roughly
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.0 — 2026-05-20
+
+This release is mostly about the **floating glass badge popover** and the
+**terminal dashboard** catching up to each other in feature parity —
+kanban view, density modes, and click-to-resume now work everywhere.
+
+### Added
+
+- **Density modes** in the badge popover: `glance` (title only),
+  `focus` (4-line card, default), `detail` (richer assistant follow-on
+  line). Chosen via an `NSPopUpButton` in the popover's top-left,
+  persisted to `~/.claude-sessions-status-density`.
+- **Kanban view in the popover**: 3 columns (`NEEDS YOU` / `WORKING` /
+  `FINISHED`) toggled via an `NSSegmentedControl` in the popover top bar.
+  Choice persists to `~/.claude-sessions-status-popover-mode`.
+- **Optional 4th DORMANT column** in popover kanban, controlled by a
+  "Show Older" checkbox. Renders to the right of FINISHED (not below it).
+  State persists via the `~/.claude-sessions-status-show-dormant` touchfile.
+- **"✓ Mark all N as read" button** in the kanban top-right that clears
+  the unread indicator on NEEDS-YOU cards. Acknowledgements persist in
+  `~/.claude-sessions-status-seen.json`.
+- **Click-to-resume on cards and list rows**: clicking a session focuses
+  its existing Terminal tab if live, otherwise spawns a new tab running
+  `claude --resume <session-id>` in the session's `cwd`.
+- **Badge visible on every Space**, including alongside full-screen apps,
+  via `NSWindowCollectionBehavior` flags `canJoinAllSpaces | stationary |
+  fullScreenAuxiliary`.
+- **First-click on the popover is honored** — no more clicking twice to
+  hit a card inside an inactive popover.
+- **Terminal dashboard kanban view** with `--kanban`, `--list`,
+  `--show-dormant`, and `--save` CLI flags. Falls back to list view
+  with a banner when terminal width < 60 cols.
+- **Live terminal hotkeys**: `k` (kanban), `l` (list), `d` (toggle
+  dormant), `r` (force refresh), `q` (quit). `k`/`l` auto-persist.
+- **Digit hotkeys `1`–`9` in the terminal dashboard** select the Nth
+  visible session in display order and resume that Claude Code session in
+  a new Terminal window via `claude --resume <session-id>`.
+- **Terminal mode persistence** independent of the GUI views, in
+  `~/.claude-sessions-status-dashboard-mode` — so the badge popover and
+  the terminal can use different layouts without fighting.
+- New state files documented in the README: `~/.claude-sessions-status-density`,
+  `~/.claude-sessions-status-popover-mode`, `~/.claude-sessions-status-dashboard-mode`,
+  `~/.claude-sessions-status-seen.json`, `~/.claude-sessions-status-badge.json`.
+
+### Changed
+
+- Badge position is now saved/restored across launches
+  (`~/.claude-sessions-status-badge.json`); drag the badge anywhere and
+  it stays put next time you launch.
+- README restructured: "Three ways to view sessions" → "Four ways to view
+  sessions" (the always-on-top panel got its own section), with the
+  popover/terminal/panel kanban behavior documented in full.
+- Popover layout auto-resizes between list / kanban / kanban-with-dormant
+  widths so the kanban columns always have enough room.
+
+### Fixed
+
+- Kanban cards now respond to the very first click after the popover
+  opens, instead of requiring a second click to activate the window first.
+- Top-bar overlap in list mode (density popup vs. segmented control)
+  resolved.
+- Kanban "Mark all read" was missing in kanban mode in an earlier build —
+  now present both as a footer link (list mode) and a top-bar button
+  (kanban mode).
+- Dormant column placement: previously stacked below FINISHED, now
+  renders as a proper 4th column to the right.
+
 ## [0.1.0] — Initial public release
 
 First open-source release. Three ways to view Claude Code sessions:
