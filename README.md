@@ -18,7 +18,7 @@ When you're driving several Claude Code sessions in parallel, it's easy to lose 
 
 No daemon, no Anthropic API key required, no plugins to register inside Claude. Pure Python + AppKit, ~stdlib-only.
 
-> _Screenshots / demo GIF coming in a follow-up commit._
+![Kanban popover — NEEDS YOU · WORKING · FINISHED columns](docs/screenshots/popover-kanban.png)
 
 ---
 
@@ -93,6 +93,8 @@ The default. Once installed and SwiftBar is running, your menu bar shows three s
 
 Click the menu bar item to drop down a list of all active sessions grouped by bucket.
 
+![SwiftBar dropdown showing sessions grouped by bucket](docs/screenshots/menubar-dropdown.png)
+
 ### 2. Floating glass badge + popover
 
 A small always-on-top capsule (~150×36px) you can park anywhere on your desktop. Three tinted numerals (red / amber / green) with rounded underline accents, frosted-glass background via `NSVisualEffectView`. Click it and a native macOS popover slides out **attached to the badge** — with an arrow pointing back at it — listing your sessions in a rich per-row layout.
@@ -114,16 +116,24 @@ Anatomy of the badge:
        NEEDS    WORKING   FINISHED
 ```
 
+![Floating glass badge — three tinted bucket counts](docs/screenshots/badge.png)
+
 The badge is visible on every Space, including alongside full-screen apps (it uses `NSWindowCollectionBehavior` flags `canJoinAllSpaces | stationary | fullScreenAuxiliary`). Drag it anywhere on screen — its position is remembered across launches.
 
 **Inside the popover:**
 
 - **Density popup (top-left)** — `Glance` / `Focus` / `Detail`. Glance is one line per session (title only), Focus is the standard 4-line card, Detail adds a richer assistant-follow-on summary. Your choice is persisted across launches.
 - **List ↔ Kanban toggle (top-bar segmented control)** — flip between a vertical list and a 3-column kanban (`NEEDS YOU` / `WORKING` / `FINISHED`). The popover auto-resizes between the two layouts.
-- **Show Older checkbox** — adds a 4th `DORMANT` column on the right of the kanban (not under FINISHED) for sessions you've drifted away from.
+- **Show Older checkbox** — adds a 4th `DORMANT` column on the right of the kanban (not under FINISHED) for sessions you've drifted away from. See the screenshot below for what this looks like with several dormant sessions.
+
+![Kanban popover with the DORMANT column expanded via "Show older"](docs/screenshots/popover-kanban-dormant.png)
 - **"✓ Mark all N as read" button (top-right in kanban)** — clears the unread indicator on NEEDS-YOU cards you've already glanced at. Acknowledgements persist in `~/.claude-sessions-status-seen.json`.
 - **Click any card / list row** to jump straight to that Claude Code session — we focus the existing Terminal tab if the session is live, or spawn a new tab running `claude --resume <session-id>` if not.
 - **First click is honored** — clicking inside an inactive popover counts as a real click on the card, no double-clicking required.
+
+<img src="docs/screenshots/density-dropdown.png" alt="Glance / Focus / Detail density picker" width="120" align="right" />
+
+The density picker (top-left corner of the popover) lets you tune how much information each session card shows — from a single title line (Glance) up to a rich 4-line card with phase, task gist, folder, and assistant preview (Detail).
 
 Built with PyObjC + AppKit; anchored via `NSPopover` so the expanded view stays visually tied to the badge.
 
@@ -162,6 +172,8 @@ claude-sessions-status-dashboard --show-dormant     # include the dormant column
 | `1`–`9` | Resume the Nth visible session in a new Terminal window (`claude --resume <session-id>`) |
 
 Mode persists to `~/.claude-sessions-status-dashboard-mode`, independent of the badge/popover preference — so you can have the GUI in list mode and the terminal in kanban (or vice versa) without them stomping on each other.
+
+![Terminal kanban view — three columns with live hotkey bar at bottom](docs/screenshots/terminal-kanban.png)
 
 If the terminal is narrower than ~60 columns, the dashboard falls back to list view with a small banner — kanban needs the horizontal room to be useful.
 
