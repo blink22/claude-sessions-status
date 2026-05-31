@@ -47,6 +47,8 @@ from dashboard import (  # noqa: E402
     session_gist,
     subagent_summary,
     subagents_for_session,
+    SUBAGENT_MAX_DISPLAY,
+    SUBAGENT_RUNNING,
     classify as _classify_canonical,
     BUCKET_NEEDS as _CANON_NEEDS,
     BUCKET_WORKING as _CANON_WORKING,
@@ -212,22 +214,26 @@ def _emit_session(row: dict, accent: str) -> None:
     if bucket in (BUCKET_READY, BUCKET_NEEDS) and snippet:
         print(f"   ↳ {snippet} | size=10 color=#a0a8b0 symbolize=false")
 
-    # Line 5 (optional): sub-agent chip when the session spawned children
-    # via the Task tool. Teal/cyan if any are running, dim otherwise.
-    sub_sum = row.get("subagent_summary") or {}
-    if sub_sum.get("total"):
-        chip_parts: list[str] = [
-            f"{sub_sum['total']} agent{'s' if sub_sum['total'] != 1 else ''}"
-        ]
-        if sub_sum.get("running"):
-            chip_parts.append(f"{sub_sum['running']} working")
-        if sub_sum.get("done"):
-            chip_parts.append(f"{sub_sum['done']} done")
-        if sub_sum.get("interrupted"):
-            chip_parts.append(f"{sub_sum['interrupted']} interrupted")
-        chip_text = "↳ " + " · ".join(chip_parts)
-        chip_color = "#39c5cf" if sub_sum.get("running") else "#a0a8b0"
-        print(f"   {_clean(chip_text, 130)} | size=10 color={chip_color} symbolize=false")
+    # Lines 5+ (optional): one teal line per actively-running sub-agent,
+    # using its .meta.json description as a brief ("◐ <type> · <desc>").
+    # Done / interrupted children intentionally produce no lines — the
+    # menu bar surface only reports what's happening RIGHT NOW.
+    subs = row.get("subagents") or []
+    running_subs = [s for s in subs if s.get("state") == SUBAGENT_RUNNING]
+    if running_subs:
+        teal = "#39c5cf"
+        shown = running_subs[:SUBAGENT_MAX_DISPLAY]
+        for sub in shown:
+            atype = (sub.get("agent_type") or "").strip()
+            desc = (sub.get("name") or "agent").strip()
+            line = f"◐ {atype} · {desc}" if atype else f"◐ {desc}"
+            print(f"   {_clean(line, 130)} | size=10 color={teal} symbolize=false")
+        extra = len(running_subs) - len(shown)
+        if extra > 0:
+            print(
+                f"   + {extra} more working | "
+                f"size=10 color=#a0a8b0 symbolize=false"
+            )
 
 
 def _emit_dormant(row: dict) -> None:
@@ -285,6 +291,12 @@ def render_menubar() -> None:
         else:
             bucket = active_bucket
         subs = subagents_for_session(full_path, now)
+        sub_sum = subagent_summary(subs)
+        # Promote to WORKING when any sub-agent is actively running.
+        # Mirrors dashboard.py:_prepare_row + floating.py:_get_buckets.
+        if sub_sum.get("running"):
+            bucket = BUCKET_WORKING
+            state = "Working…"
         enriched.append({
             "s": s, "meta": meta, "ago_s": ago_s, "emoji": emoji,
             "phase_label": phase_label, "state": state,
@@ -296,8 +308,10 @@ def render_menubar() -> None:
             # heuristic by default; Haiku when TALK_BACK_DASH_AI=1.
             # Skipped for DORMANT to avoid spending API tokens on stale.
             "gist": session_gist(s, meta, bucket),
-            # Sub-agents (Task-spawned children). Empty list when none.
-            "subagent_summary": subagent_summary(subs),
+            # Sub-agents: full list + summary so _emit_session can list
+            # each actively-running one with a brief.
+            "subagents": subs,
+            "subagent_summary": sub_sum,
         })
 
     buckets: dict[str, list[dict]] = {k: [] for k, *_ in BUCKET_SPEC}
