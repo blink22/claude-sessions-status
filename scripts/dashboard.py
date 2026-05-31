@@ -909,6 +909,7 @@ def _ai_tasks_log(msg: str) -> None:
 #                            failure_count, last_failure_ts}}
 _ai_tasks_cache_lock = None  # set lazily on first use
 _ai_tasks_cache_mem: dict | None = None
+_ai_tasks_cache_mem_mtime: float = 0.0
 
 
 def _ai_tasks_lock():
@@ -921,14 +922,23 @@ def _ai_tasks_lock():
 
 
 def _load_ai_tasks_cache() -> dict:
-    """Read the on-disk cache once into memory. Subsequent reads use the
-    in-memory copy — writers mutate it under the lock and flush."""
-    global _ai_tasks_cache_mem
+    """Read the on-disk cache, reloading from disk if the file has been
+    modified since our last load. This lets multiple processes (badge,
+    panel, terminal, ad-hoc scripts) share the cache cleanly — each one
+    picks up the others' writes within one refresh tick."""
+    global _ai_tasks_cache_mem, _ai_tasks_cache_mem_mtime
     with _ai_tasks_lock():
-        if _ai_tasks_cache_mem is not None:
+        try:
+            disk_mtime = AI_TASKS_CACHE_FILE.stat().st_mtime
+        except OSError:
+            # Missing — return the memoized copy (or an empty dict).
+            if _ai_tasks_cache_mem is None:
+                _ai_tasks_cache_mem = {}
             return _ai_tasks_cache_mem
-        if not AI_TASKS_CACHE_FILE.exists():
-            _ai_tasks_cache_mem = {}
+        if (
+            _ai_tasks_cache_mem is not None
+            and disk_mtime <= _ai_tasks_cache_mem_mtime
+        ):
             return _ai_tasks_cache_mem
         try:
             data = json.loads(AI_TASKS_CACHE_FILE.read_text(encoding="utf-8"))
@@ -937,11 +947,13 @@ def _load_ai_tasks_cache() -> dict:
         except (OSError, ValueError):
             data = {}
         _ai_tasks_cache_mem = data
+        _ai_tasks_cache_mem_mtime = disk_mtime
         return _ai_tasks_cache_mem
 
 
 def _save_ai_tasks_cache_entry(session_id: str, entry: dict) -> None:
     """Merge one session's entry into the cache and atomically flush."""
+    global _ai_tasks_cache_mem_mtime
     with _ai_tasks_lock():
         cache = _load_ai_tasks_cache()
         cache[session_id] = entry
@@ -949,6 +961,13 @@ def _save_ai_tasks_cache_entry(session_id: str, entry: dict) -> None:
             tmp = AI_TASKS_CACHE_FILE.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(cache, indent=0), encoding="utf-8")
             os.replace(tmp, AI_TASKS_CACHE_FILE)
+            # Update our in-memory mtime to the post-write value so the
+            # next _load_ai_tasks_cache call doesn't re-read our own
+            # write back from disk.
+            try:
+                _ai_tasks_cache_mem_mtime = AI_TASKS_CACHE_FILE.stat().st_mtime
+            except OSError:
+                pass
         except OSError as e:
             _ai_tasks_log(f"cache write failed: {e!r}")
 
