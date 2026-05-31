@@ -136,10 +136,13 @@ def _pad_w(s: str, width: int) -> str:
     return s + " " * (width - n)
 
 
+DASHBOARD_MODES = ("list", "kanban", "tasks")
+
+
 def _read_dashboard_mode() -> str:
     try:
         v = DASHBOARD_MODE_FILE.read_text(encoding="utf-8").strip()
-        if v in ("list", "kanban"):
+        if v in DASHBOARD_MODES:
             return v
     except OSError:
         pass
@@ -147,7 +150,7 @@ def _read_dashboard_mode() -> str:
 
 
 def _write_dashboard_mode(mode: str) -> None:
-    if mode not in ("list", "kanban"):
+    if mode not in DASHBOARD_MODES:
         return
     try:
         DASHBOARD_MODE_FILE.write_text(mode, encoding="utf-8")
@@ -364,6 +367,118 @@ def subagents_for_session(parent_jsonl_path: str, now_ts: float) -> list[dict]:
     # Most-recently-active first. Within same mtime, stable.
     results.sort(key=lambda r: r["last_epoch"], reverse=True)
     return results
+
+
+# ---------- TodoWrite-derived tasks ----------
+# Claude Code's built-in `TodoWrite` tool lets the model lay out its plan
+# as a list of {content, activeForm, status} entries. Each subsequent
+# TodoWrite call is a FULL SNAPSHOT — so the last one in the JSONL is
+# the ground truth for "what is this session working on right now."
+#
+# We surface that as a Tasks view: per-session vertical list, running
+# sub-agents nested under the (typically unique) in_progress todo.
+#
+# Status values seen in the wild: "pending" | "in_progress" | "completed".
+TODO_PENDING = "pending"
+TODO_IN_PROGRESS = "in_progress"
+TODO_COMPLETED = "completed"
+
+# Cache: parent_jsonl_path → (mtime, todos list). Stable terminal states
+# never invalidate; running sessions re-scan only when the file grows.
+_todos_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def todos_for_session(parent_jsonl_path: str) -> list[dict]:
+    """Return the most-recent TodoWrite snapshot from this session's
+    parent transcript. Empty list when the session never called the
+    tool (which is fine — most short sessions don't).
+
+    Each todo is a dict: {content, activeForm, status, index}.
+    `index` preserves array position from the snapshot — the only
+    stable identity TodoWrite gives us (no `id` field exists)."""
+    p = Path(parent_jsonl_path)
+    try:
+        current_mtime = p.stat().st_mtime
+    except OSError:
+        return []
+    cached = _todos_cache.get(parent_jsonl_path)
+    if cached and cached[0] == current_mtime:
+        return cached[1]
+
+    last_todos: list[dict] = []
+    try:
+        with p.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                # Cheap pre-filter: TodoWrite is a tool name string, so
+                # only fully-parse lines that mention it.
+                if "TodoWrite" not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                msg = obj.get("message") if isinstance(obj, dict) else None
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                        and block.get("name") == "TodoWrite"
+                    ):
+                        todos_input = (
+                            block.get("input", {}).get("todos")
+                            if isinstance(block.get("input"), dict) else None
+                        )
+                        if isinstance(todos_input, list):
+                            last_todos = todos_input
+    except OSError:
+        return []
+
+    # Normalize: keep only the fields we care about, add stable index.
+    out: list[dict] = []
+    for i, t in enumerate(last_todos):
+        if not isinstance(t, dict):
+            continue
+        out.append({
+            "index": i,
+            "content": t.get("content") or "",
+            "activeForm": t.get("activeForm") or "",
+            "status": t.get("status") or TODO_PENDING,
+        })
+
+    _todos_cache[parent_jsonl_path] = (current_mtime, out)
+    return out
+
+
+def todo_summary(todos: list[dict]) -> dict:
+    """Aggregate counts by status — useful for chip / header rendering."""
+    counts = {TODO_PENDING: 0, TODO_IN_PROGRESS: 0, TODO_COMPLETED: 0}
+    for t in todos:
+        st = t.get("status") or TODO_PENDING
+        if st in counts:
+            counts[st] += 1
+        else:
+            counts[TODO_PENDING] += 1
+    return {
+        "total": len(todos),
+        "pending": counts[TODO_PENDING],
+        "in_progress": counts[TODO_IN_PROGRESS],
+        "completed": counts[TODO_COMPLETED],
+    }
+
+
+def find_in_progress_todo(todos: list[dict]) -> dict | None:
+    """Return the first in_progress todo, or None. Claude Code's
+    convention is to keep exactly one todo in_progress at a time, so
+    "first" is almost always "only" — but we don't enforce that."""
+    for t in todos:
+        if t.get("status") == TODO_IN_PROGRESS:
+            return t
+    return None
 
 
 def subagent_summary(subs: list[dict]) -> dict:
@@ -1108,6 +1223,8 @@ def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> d
 
     subs = subagents_for_session(full_path, now_ts)
     sub_sum = subagent_summary(subs)
+    todos = todos_for_session(full_path)
+    todo_sum = todo_summary(todos)
 
     # If any sub-agent is actively running, the session as a whole is
     # in-progress regardless of what the parent transcript's tail says.
@@ -1138,6 +1255,8 @@ def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> d
         "gist": session_gist(s, meta, bucket=bucket) or "",
         "subagents": subs,
         "subagent_summary": sub_sum,
+        "todos": todos,
+        "todo_summary": todo_sum,
     }
 
 
@@ -1402,6 +1521,108 @@ def _compute_numbered_sessions(
     return out
 
 
+def render_tasks(rows: list[dict], width: int) -> str:
+    """Per-session vertical list of TodoWrite todos with running sub-agents
+    nested under the in_progress todo. Sessions with no todos are skipped.
+
+    Layout — matches the popover Tasks tab vocabulary:
+
+      ▾ <title>                  3/5 ◐   2m ago
+        ✓ Completed todo content
+        ◐ In-progress todo               [2 agents]
+            ├ ◐ general-purpose · brief
+            └ ◐ code-reviewer · brief
+        ○ Pending todo content
+    """
+    sessions_with_todos = [r for r in rows if r.get("todos")]
+    if not sessions_with_todos:
+        return (
+            f"\n{DIM}No tasks yet. Claude writes todos when it plans "
+            f"multi-step work — open a session and watch them appear here.{RESET}\n"
+        )
+
+    icons = {
+        TODO_PENDING: "○",
+        TODO_IN_PROGRESS: "◐",
+        TODO_COMPLETED: "✓",
+    }
+    colors = {
+        TODO_PENDING: DIM,
+        TODO_IN_PROGRESS: CYAN,
+        TODO_COMPLETED: DIM,
+    }
+
+    parts: list[str] = []
+    for r in sessions_with_todos:
+        todos = r.get("todos") or []
+        summ = r.get("todo_summary") or {}
+        running_subs = [
+            s for s in (r.get("subagents") or [])
+            if s.get("state") == SUBAGENT_RUNNING
+        ]
+        title = truncate(r.get("title") or "(untitled)", max(20, width - 40))
+        done_n = summ.get("completed", 0)
+        total_n = summ.get("total", 0) or 1
+        in_progress_n = summ.get("in_progress", 0)
+        progress_glyph = "◐" if in_progress_n else "○"
+        progress_color = CYAN if in_progress_n else DIM
+        # Header — title + progress + age.
+        parts.append(
+            f"{BOLD}▸ {title}{RESET}   "
+            f"{progress_color}{done_n}/{total_n} {progress_glyph}{RESET}"
+            f"   {DIM}{r.get('ago', '')}{RESET}\n"
+        )
+        for todo in todos:
+            status = todo.get("status") or TODO_PENDING
+            icon = icons.get(status, "·")
+            color = colors.get(status, RESET)
+            # Pick the right verbalization for the status.
+            text = (
+                todo.get("activeForm") if status == TODO_IN_PROGRESS
+                else todo.get("content")
+            ) or todo.get("content") or ""
+            text = truncate(text, max(20, width - 12))
+            # Strikethrough on completed (ANSI 9) so finished todos visibly
+            # fall back — terminal-equivalent of the popover's strikethrough.
+            if status == TODO_COMPLETED:
+                line_body = f"\033[9m{text}\033[29m"
+            else:
+                line_body = text
+            badge = ""
+            if status == TODO_IN_PROGRESS and running_subs:
+                badge = (
+                    f"   {CYAN}[{len(running_subs)} agent"
+                    f"{'s' if len(running_subs) != 1 else ''}]{RESET}"
+                )
+            parts.append(f"  {color}{icon}{RESET}  {line_body}{badge}\n")
+
+            # Nest running sub-agents under the in_progress todo only.
+            if status == TODO_IN_PROGRESS and running_subs:
+                shown_subs = running_subs[:SUBAGENT_MAX_DISPLAY]
+                for i, sub in enumerate(shown_subs):
+                    is_last = (
+                        i == len(shown_subs) - 1
+                        and len(running_subs) <= SUBAGENT_MAX_DISPLAY
+                    )
+                    connector = "└" if is_last else "├"
+                    atype = (sub.get("agent_type") or "").strip()
+                    desc = (sub.get("name") or "agent").strip()
+                    line = (
+                        f"{connector} ◐ {atype} · {desc}"
+                        if atype else f"{connector} ◐ {desc}"
+                    )
+                    parts.append(
+                        f"      {CYAN}{truncate(line, max(20, width - 8))}{RESET}\n"
+                    )
+                overflow = len(running_subs) - len(shown_subs)
+                if overflow > 0:
+                    parts.append(
+                        f"      {DIM}└ + {overflow} more working{RESET}\n"
+                    )
+        parts.append("\n")
+    return "".join(parts)
+
+
 def render(
     sessions: list[dict],
     view: str = "list",
@@ -1430,7 +1651,10 @@ def render(
     # back to list when the terminal is too narrow). The numbering must
     # match the displayed view, not the requested one.
     body: str
-    if view == "kanban" and width >= KANBAN_MIN_WIDTH:
+    if view == "tasks":
+        parts.append(render_tasks(rows, width))
+        effective_view = "tasks"
+    elif view == "kanban" and width >= KANBAN_MIN_WIDTH:
         body = render_kanban(rows, width, show_dormant)
         if not body:
             parts.append(
@@ -1465,7 +1689,7 @@ def render(
     footer = (
         f"{DIM}refreshing every {REFRESH_SECS}s · "
         f"window {RECENT_HOURS:.0f}h · "
-        f"k=kanban  l=list  d=±dormant  1-9=resume  q=quit{RESET}\n"
+        f"k=kanban  l=list  t=tasks  d=±dormant  1-9=resume  q=quit{RESET}\n"
     )
     parts.append(footer)
     sys.stdout.write("".join(parts))
@@ -1560,15 +1784,19 @@ def main() -> int:
                         help="Start in kanban (3-column) view")
     parser.add_argument("--list", dest="list_view", action="store_true",
                         help="Start in list view (default if no flag and no saved pref)")
+    parser.add_argument("--tasks", action="store_true",
+                        help="Start in tasks view (TodoWrite-derived per-session todos)")
     parser.add_argument("--show-dormant", action="store_true",
                         help="Show the DORMANT column / dormant sessions")
     parser.add_argument("--save", action="store_true",
-                        help="Persist the chosen --kanban/--list to "
+                        help="Persist the chosen view to "
                              "~/.claude-sessions-status-dashboard-mode")
     args = parser.parse_args()
 
     # Resolve initial view: explicit flag > saved preference > default.
-    if args.kanban:
+    if args.tasks:
+        view = "tasks"
+    elif args.kanban:
         view = "kanban"
     elif args.list_view:
         view = "list"
@@ -1607,6 +1835,10 @@ def main() -> int:
                     break  # re-render now
                 if ch == "l" and view != "list":
                     view = "list"
+                    _write_dashboard_mode(view)
+                    break
+                if ch == "t" and view != "tasks":
+                    view = "tasks"
                     _write_dashboard_mode(view)
                     break
                 if ch == "d":
