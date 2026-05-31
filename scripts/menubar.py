@@ -45,6 +45,8 @@ from dashboard import (  # noqa: E402
     is_dormant,
     desktop_titles,
     session_gist,
+    subagent_summary,
+    subagents_for_session,
     classify as _classify_canonical,
     BUCKET_NEEDS as _CANON_NEEDS,
     BUCKET_WORKING as _CANON_WORKING,
@@ -210,6 +212,23 @@ def _emit_session(row: dict, accent: str) -> None:
     if bucket in (BUCKET_READY, BUCKET_NEEDS) and snippet:
         print(f"   ↳ {snippet} | size=10 color=#a0a8b0 symbolize=false")
 
+    # Line 5 (optional): sub-agent chip when the session spawned children
+    # via the Task tool. Teal/cyan if any are running, dim otherwise.
+    sub_sum = row.get("subagent_summary") or {}
+    if sub_sum.get("total"):
+        chip_parts: list[str] = [
+            f"{sub_sum['total']} agent{'s' if sub_sum['total'] != 1 else ''}"
+        ]
+        if sub_sum.get("running"):
+            chip_parts.append(f"{sub_sum['running']} working")
+        if sub_sum.get("done"):
+            chip_parts.append(f"{sub_sum['done']} done")
+        if sub_sum.get("interrupted"):
+            chip_parts.append(f"{sub_sum['interrupted']} interrupted")
+        chip_text = "↳ " + " · ".join(chip_parts)
+        chip_color = "#39c5cf" if sub_sum.get("running") else "#a0a8b0"
+        print(f"   {_clean(chip_text, 130)} | size=10 color={chip_color} symbolize=false")
+
 
 def _emit_dormant(row: dict) -> None:
     """Compact one-line representation for a dormant session. No hint or
@@ -265,6 +284,7 @@ def render_menubar() -> None:
             bucket = BUCKET_DORMANT
         else:
             bucket = active_bucket
+        subs = subagents_for_session(full_path, now)
         enriched.append({
             "s": s, "meta": meta, "ago_s": ago_s, "emoji": emoji,
             "phase_label": phase_label, "state": state,
@@ -276,6 +296,8 @@ def render_menubar() -> None:
             # heuristic by default; Haiku when TALK_BACK_DASH_AI=1.
             # Skipped for DORMANT to avoid spending API tokens on stale.
             "gist": session_gist(s, meta, bucket),
+            # Sub-agents (Task-spawned children). Empty list when none.
+            "subagent_summary": subagent_summary(subs),
         })
 
     buckets: dict[str, list[dict]] = {k: [] for k, *_ in BUCKET_SPEC}

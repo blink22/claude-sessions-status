@@ -241,6 +241,148 @@ def _text_from_content(content) -> str:
     return ""
 
 
+# ---------- sub-agents (Task-tool-spawned children) ----------
+# When a parent agent calls the `Task` tool, Claude Code writes the
+# sub-agent's transcript to `<projects>/<proj>/<parent-sess>/subagents/
+# agent-<id>.jsonl`, paired with a tiny `agent-<id>.meta.json` containing
+# {agentType, description, toolUseId}. We surface a count + breakdown on
+# each parent's row so the user can see "3 agents · 2 done · 1 working"
+# without opening the session. Pure presentation — does not affect
+# bucket/state classification of the parent itself.
+SUBAGENT_MAX_DISPLAY = 5           # cards/popover/menubar show at most N
+SUBAGENT_RUNNING_GRACE_SECS = 60   # mtime newer than this ⇒ still running
+
+# state strings (kept as bare ASCII so menubar/SwiftBar pass them
+# through untouched):
+SUBAGENT_RUNNING = "running"
+SUBAGENT_DONE = "done"
+SUBAGENT_INTERRUPTED = "interrupted"
+
+# Cache keyed on agent JSONL path. Stores (jsonl_mtime, state, last_epoch).
+# Most sub-agents finish quickly and never change again — once we see a
+# terminal state on a stable file we never re-read it. Running agents are
+# the only ones we re-stat each tick.
+_subagent_state_cache: dict[str, tuple[float, str, float]] = {}
+
+
+def _peek_last_line(p: Path) -> dict | None:
+    """Read just the final JSONL line and decode it. Returns None on
+    any failure (empty file, mid-write, malformed JSON)."""
+    try:
+        with p.open("r", encoding="utf-8", errors="ignore") as f:
+            tail = deque(f, maxlen=1)
+    except OSError:
+        return None
+    if not tail:
+        return None
+    try:
+        return json.loads(tail[-1])
+    except (ValueError, TypeError):
+        return None
+
+
+def _derive_subagent_state(jsonl_path: Path, now_ts: float) -> str:
+    """Three-state classifier: running / done / interrupted. Cheap path
+    is mtime ⇒ running; for stale files we peek the last JSONL line."""
+    try:
+        mtime = jsonl_path.stat().st_mtime
+    except OSError:
+        return SUBAGENT_DONE  # treat unreadable as terminal
+    if now_ts - mtime < SUBAGENT_RUNNING_GRACE_SECS:
+        return SUBAGENT_RUNNING
+    last = _peek_last_line(jsonl_path)
+    if last is None:
+        return SUBAGENT_DONE
+    msg = last.get("message") if isinstance(last, dict) else None
+    if not isinstance(msg, dict):
+        return SUBAGENT_DONE
+    # Interrupt marker is always a user-role entry with literal text.
+    if last.get("type") == "user":
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list) and content:
+            first = content[0]
+            if isinstance(first, dict) and first.get("type") == "text":
+                text = first.get("text", "") or ""
+        if isinstance(text, str) and text.startswith("[Request interrupted"):
+            return SUBAGENT_INTERRUPTED
+    return SUBAGENT_DONE
+
+
+def subagents_for_session(parent_jsonl_path: str, now_ts: float) -> list[dict]:
+    """Return one dict per sub-agent under this parent session, sorted
+    by mtime descending (most recently active first). Empty list if the
+    session has no `subagents/` subdir.
+
+    Each dict: {id, name, agent_type, state, last_epoch}.
+    """
+    # Sub-agents live at `<proj>/<sess-uuid>/subagents/agent-*.jsonl` —
+    # a sibling DIR next to the parent's `<sess-uuid>.jsonl`, NOT inside
+    # the same JSONL file.
+    p = Path(parent_jsonl_path)
+    subdir = p.parent / p.stem / "subagents"
+    if not subdir.is_dir():
+        return []
+
+    results: list[dict] = []
+    try:
+        entries = list(subdir.glob("agent-*.meta.json"))
+    except OSError:
+        return []
+    for meta_p in entries:
+        try:
+            with meta_p.open("r", encoding="utf-8", errors="ignore") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue
+        agent_id = meta_p.stem[:-5] if meta_p.stem.endswith(".meta") else meta_p.stem
+        # `.meta.json` → stem is `agent-<id>.meta`. Strip the trailing `.meta`.
+        jsonl_p = subdir / (agent_id + ".jsonl")
+        # Stat jsonl up-front so we can both cache-key on its mtime and use
+        # it as `last_epoch` for sorting.
+        try:
+            mtime = jsonl_p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        # Cache lookup: stable terminal states never change.
+        cached = _subagent_state_cache.get(str(jsonl_p))
+        if cached and cached[0] == mtime and cached[1] != SUBAGENT_RUNNING:
+            state = cached[1]
+        else:
+            state = _derive_subagent_state(jsonl_p, now_ts)
+            _subagent_state_cache[str(jsonl_p)] = (mtime, state, mtime)
+        results.append({
+            "id": agent_id,
+            "name": (meta.get("description") or "").strip() or "agent",
+            "agent_type": meta.get("agentType") or "",
+            "state": state,
+            "last_epoch": mtime,
+        })
+
+    # Most-recently-active first. Within same mtime, stable.
+    results.sort(key=lambda r: r["last_epoch"], reverse=True)
+    return results
+
+
+def subagent_summary(subs: list[dict]) -> dict:
+    """Aggregate counts by state. Used by the renderers."""
+    counts = {SUBAGENT_RUNNING: 0, SUBAGENT_DONE: 0, SUBAGENT_INTERRUPTED: 0}
+    for s in subs:
+        st = s.get("state") or SUBAGENT_DONE
+        if st in counts:
+            counts[st] += 1
+        else:
+            counts[SUBAGENT_DONE] += 1
+    return {
+        "total": len(subs),
+        "running": counts[SUBAGENT_RUNNING],
+        "done": counts[SUBAGENT_DONE],
+        "interrupted": counts[SUBAGENT_INTERRUPTED],
+    }
+
+
 # Caches keyed on session file path. Stores (mtime, meta) tuples so
 # we can skip the full transcript scan whenever the file hasn't grown
 # since last read. Combined with `cwd` / `firstPrompt` being immutable
@@ -964,6 +1106,7 @@ def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> d
     if is_dormant(sid, ago_secs, live, bucket):
         bucket = BUCKET_DORMANT
 
+    subs = subagents_for_session(full_path, now_ts)
     return {
         "session": s,
         "meta": meta,
@@ -980,7 +1123,30 @@ def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> d
         "action": meta.get("lastAction") or "",
         "sid_short": sid[:8],
         "gist": session_gist(s, meta, bucket=bucket) or "",
+        "subagents": subs,
+        "subagent_summary": subagent_summary(subs),
     }
+
+
+def _subagent_chip_plain(row: dict) -> str:
+    """Compact one-line chip describing the sub-agents under a session.
+    Returns "" if the session has no sub-agents.
+
+    Format: "↳ 3 agents · 1 working · 2 done" — only non-zero counts
+    appear. Plain ASCII + an arrow glyph so terminal/menubar/popover can
+    all reuse the same string."""
+    summ = row.get("subagent_summary") or {}
+    total = summ.get("total", 0)
+    if not total:
+        return ""
+    parts: list[str] = [f"{total} agent{'s' if total != 1 else ''}"]
+    if summ.get("running"):
+        parts.append(f"{summ['running']} working")
+    if summ.get("done"):
+        parts.append(f"{summ['done']} done")
+    if summ.get("interrupted"):
+        parts.append(f"{summ['interrupted']} interrupted")
+    return "↳ " + " · ".join(parts)
 
 
 # ---------- list view (original layout) ----------
@@ -1020,6 +1186,13 @@ def render_list(rows: list[dict], width: int) -> str:
             parts.append(f"  📌 {BOLD}{gist}{RESET}\n")
         if action:
             parts.append(f"  {MAGENTA}↳{RESET} {DIM}{action}{RESET}\n")
+        chip = _subagent_chip_plain(r)
+        if chip:
+            # Cyan when something's still running (attention), dim when all
+            # terminal states. Either way the line stays compact.
+            running = (r.get("subagent_summary") or {}).get("running", 0)
+            chip_color = CYAN if running else DIM
+            parts.append(f"  {chip_color}{chip}{RESET}\n")
         parts.append("\n")
     return "".join(parts)
 
@@ -1078,6 +1251,15 @@ def _kanban_card_lines(
         f4_plain = f"📁 · {r['ago']}"
     f4 = _clip_w(f4_plain, col_inner_w)
     lines.append(f"{DIM}{f4}{RESET}")
+
+    # Line 5 (optional) — sub-agent chip. Cyan when one is still running,
+    # dim otherwise. Skipped when the session has no sub-agents.
+    chip_plain = _subagent_chip_plain(r)
+    if chip_plain:
+        running = (r.get("subagent_summary") or {}).get("running", 0)
+        chip_clipped = _clip_w(chip_plain, col_inner_w)
+        chip_color = CYAN if running else DIM
+        lines.append(f"{chip_color}{chip_clipped}{RESET}")
 
     return lines
 
