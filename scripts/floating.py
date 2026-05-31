@@ -69,10 +69,12 @@ try:
         NSSegmentedControl,
         NSSegmentStyleAutomatic,
         NSSegmentSwitchTrackingSelectOne,
+        NSStrikethroughStyleAttributeName,
         NSTextTab,
         NSStackView,
         NSTextField,
         NSTextView,
+        NSUnderlineStyleSingle,
         NSView,
         NSViewController,
         NSViewHeightSizable,
@@ -117,6 +119,7 @@ import dashboard  # noqa: E402
 from dashboard import (  # noqa: E402
     classify,
     desktop_titles,
+    find_in_progress_todo,
     find_sessions,
     format_ago,
     infer_phase,
@@ -129,11 +132,16 @@ from dashboard import (  # noqa: E402
     state_for,
     subagent_summary,
     subagents_for_session,
+    todo_summary,
+    todos_for_session,
     transcript_meta,
     SUBAGENT_DONE,
     SUBAGENT_INTERRUPTED,
     SUBAGENT_MAX_DISPLAY,
     SUBAGENT_RUNNING,
+    TODO_COMPLETED,
+    TODO_IN_PROGRESS,
+    TODO_PENDING,
 )
 
 
@@ -159,12 +167,18 @@ POPOVER_KANBAN_SIZE = (720.0, 480.0)
 # sessions render as a 4th column on the right. The popover widens
 # to give that column room without squeezing the other three.
 POPOVER_KANBAN_WITH_DORMANT_SIZE = (940.0, 480.0)
+# Tasks view: a per-session vertical list of TodoWrite todos with
+# running sub-agents nested under the in_progress todo. Wider than
+# list view to fit todo text + indented sub-agent rows.
+POPOVER_TASKS_SIZE = (480.0, 480.0)
+
+POPOVER_MODES = ("list", "kanban", "tasks")
 
 
 def _read_popover_mode() -> str:
     try:
         v = POPOVER_MODE_FILE.read_text(encoding="utf-8").strip()
-        if v in ("list", "kanban"):
+        if v in POPOVER_MODES:
             return v
     except OSError:
         pass
@@ -172,7 +186,7 @@ def _read_popover_mode() -> str:
 
 
 def _write_popover_mode(mode: str) -> None:
-    if mode not in ("list", "kanban"):
+    if mode not in POPOVER_MODES:
         return
     _atomic_write_text(POPOVER_MODE_FILE, mode)
 
@@ -748,6 +762,8 @@ def _get_buckets() -> dict[str, list[dict]]:
         bucket = "dormant" if is_dormant(sid, ago_s, live_ids, active_bucket) else active_bucket
         subs = subagents_for_session(full_path, now)
         sub_sum = subagent_summary(subs)
+        todos = todos_for_session(full_path)
+        todo_sum = todo_summary(todos)
         # Promote to WORKING when any sub-agent is actively running, even
         # if the parent transcript looks idle or dormant. Mirrors the
         # override in dashboard.py:_prepare_row.
@@ -776,6 +792,10 @@ def _get_buckets() -> dict[str, list[dict]]:
             # carried in `subagents` but not displayed.
             "subagents": subs,
             "subagent_summary": sub_sum,
+            # TodoWrite-derived todos. Empty list when the session
+            # never called TodoWrite. The Tasks tab consumes these.
+            "todos": todos,
+            "todo_summary": todo_sum,
         }
         buckets[bucket].append(row)
     return buckets
@@ -1934,22 +1954,30 @@ class PopoverVC(NSViewController):
                 NSColor.windowBackgroundColor().CGColor()
             )
 
-        # ---- Top bar: segmented control (List | Kanban) ----
-        # Width is tight enough that it fits in the 360pt list-mode
-        # popover without colliding with the density popup (left) or
-        # the dormant toggle (right).
+        # ---- Top bar: segmented control (List | Kanban | Tasks) ----
+        # 3 segments, centered. Fits in the 360pt list-mode popover
+        # without colliding with the density popup (left) or the dormant
+        # toggle (right). The Tasks tab surfaces TodoWrite-derived todos
+        # per session, with running sub-agents nested beneath the
+        # in_progress todo.
         TOP_BAR_HEIGHT = 32.0
         seg = NSSegmentedControl.alloc().init()
-        seg.setSegmentCount_(2)
+        seg.setSegmentCount_(3)
         seg.setLabel_forSegment_("List", 0)
         seg.setLabel_forSegment_("Kanban", 1)
+        seg.setLabel_forSegment_("Tasks", 2)
         seg.setSegmentStyle_(NSSegmentStyleAutomatic)
         seg.setTrackingMode_(NSSegmentSwitchTrackingSelectOne)
-        seg.setSelectedSegment_(0 if self.mode == "list" else 1)
+        seg.setSelectedSegment_(
+            0 if self.mode == "list"
+            else 1 if self.mode == "kanban"
+            else 2
+        )
         seg.setTarget_(self)
         seg.setAction_("segmentChanged:")
-        # Center the segmented control horizontally in the top bar.
-        seg_w = 130.0
+        # Center the 3-segment control horizontally. ~165pt fits 3 labels
+        # at the system default font without truncation.
+        seg_w = 175.0
         seg.setFrame_(NSMakeRect((w - seg_w) / 2, h - TOP_BAR_HEIGHT + 4, seg_w, 22))
         seg.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin)
         container.addSubview_(seg)
@@ -2140,7 +2168,9 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _install_layout(self):
-        """Swap whichever content view is in the host based on self.mode."""
+        """Swap whichever content view is in the host based on self.mode.
+        Tasks mode reuses the list_scroll surface (single NSTextView) —
+        only the attributed-string builder differs."""
         if self.content_host is None:
             return
         for sub in list(self.content_host.subviews()):
@@ -2149,12 +2179,15 @@ class PopoverVC(NSViewController):
             self.kanban_stack.setFrame_(self.content_host.bounds())
             self.content_host.addSubview_(self.kanban_stack)
         else:
+            # Both "list" and "tasks" render into list_scroll.
             self.list_scroll.setFrame_(self.content_host.bounds())
             self.content_host.addSubview_(self.list_scroll)
 
     @objc.python_method
     def _target_popover_size(self) -> tuple:
         """Pick the right popover (w, h) for the current mode + toggle."""
+        if self.mode == "tasks":
+            return POPOVER_TASKS_SIZE
         if self.mode != "kanban":
             return POPOVER_LIST_SIZE
         if self.show_dormant:
@@ -2210,7 +2243,11 @@ class PopoverVC(NSViewController):
     def segmentChanged_(self, sender):
         try:
             idx = sender.selectedSegment()
-            new_mode = "kanban" if idx == 1 else "list"
+            new_mode = (
+                "list" if idx == 0
+                else "kanban" if idx == 1
+                else "tasks"
+            )
             if new_mode == self.mode:
                 return
             self.mode = new_mode
@@ -2298,6 +2335,8 @@ class PopoverVC(NSViewController):
 
         if self.mode == "kanban":
             self._render_kanban(buckets)
+        elif self.mode == "tasks":
+            self._render_tasks(buckets)
         else:
             self._render_list(buckets)
 
@@ -2315,6 +2354,199 @@ class PopoverVC(NSViewController):
         mas = self._build_attributed(buckets)
         self.list_text_view.textStorage().setAttributedString_(mas)
         self._update_mark_all_button()
+
+    @objc.python_method
+    def _render_tasks(self, buckets):
+        """Build the Tasks tab — per-session vertical list of TodoWrite
+        todos, with running sub-agents nested under the in_progress todo."""
+        if self.list_text_view is None:
+            return
+        mas = self._build_tasks_attributed(buckets)
+        self.list_text_view.textStorage().setAttributedString_(mas)
+        # Hide the kanban-only "Mark all read" button while in Tasks mode.
+        self._update_mark_all_button()
+
+    @objc.python_method
+    def _build_tasks_attributed(self, buckets):
+        """Render the Tasks view as an attributed string.
+
+        Layout per session (only sessions with ≥ 1 todo appear):
+
+            ▾ <title>                            2/5 ◐
+              ○  Pending todo content
+              ◐  In-progress todo content        [2 agents]
+                  ├ ◐ general-purpose · brief
+                  └ ◐ code-reviewer · brief
+              ✓  Completed todo content
+
+        Sub-agents nest as a 2-level indented tree under the in_progress
+        todo only. Completed sub-agents are not shown (consistent with
+        the v0.3 "right now" design)."""
+        title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        todo_font = NSFont.systemFontOfSize_(12)
+        sub_font = NSFont.systemFontOfSize_(11)
+        meta_font = _rounded_tabular_font(11, NSFontWeightRegular)
+        label = NSColor.labelColor()
+        secondary = NSColor.secondaryLabelColor()
+        tertiary = NSColor.tertiaryLabelColor()
+        teal = (
+            NSColor.systemTealColor()
+            if hasattr(NSColor, "systemTealColor") else NSColor.labelColor()
+        )
+
+        out = NSMutableAttributedString.alloc().init()
+
+        def add(text, attrs):
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+            )
+
+        # Flatten + sort sessions by recency. Filter to those with ≥ 1 todo.
+        flat_rows: list = []
+        for k in ("needs", "working", "ready", "dormant"):
+            flat_rows.extend(buckets.get(k) or [])
+        sessions_with_todos = [r for r in flat_rows if r.get("todos")]
+        sessions_with_todos.sort(key=lambda r: r.get("ago_s", 0))
+
+        if not sessions_with_todos:
+            # Empty state — short, two-line text. Centered visually via
+            # leading padding; we don't bother with real centering since
+            # the popover is narrow.
+            add("\n\n", {NSFontAttributeName: title_font})
+            add("    No tasks yet\n", {
+                NSFontAttributeName: title_font,
+                NSForegroundColorAttributeName: secondary,
+            })
+            add(
+                "    Claude writes todos when it plans multi-step work.\n"
+                "    Open a session to see them here.",
+                {
+                    NSFontAttributeName: todo_font,
+                    NSForegroundColorAttributeName: tertiary,
+                },
+            )
+            return out
+
+        # Status → glyph mapping. Reuses the v0.3 vocabulary so the user
+        # learns one symbol set across all tabs.
+        TODO_ICONS = {
+            TODO_PENDING: "○",
+            TODO_IN_PROGRESS: "◐",
+            TODO_COMPLETED: "✓",
+        }
+        TODO_COLORS = {
+            TODO_PENDING: tertiary,
+            TODO_IN_PROGRESS: teal,
+            TODO_COMPLETED: secondary,
+        }
+
+        for r in sessions_with_todos:
+            todos = r.get("todos") or []
+            summ = r.get("todo_summary") or {}
+            sub_list = r.get("subagents") or []
+            running_subs = [s for s in sub_list if s.get("state") == SUBAGENT_RUNNING]
+
+            # Header: title + progress + age.
+            title = (r.get("title") or "(untitled)").strip()
+            ago = format_ago(r.get("ago_s") or 0)
+            done_n = summ.get("completed", 0)
+            total_n = summ.get("total", 0) or 1
+            in_progress_n = summ.get("in_progress", 0)
+            progress_glyph = "◐" if in_progress_n else "○"
+
+            add("▾  ", {
+                NSFontAttributeName: title_font,
+                NSForegroundColorAttributeName: tertiary,
+            })
+            add(title, {
+                NSFontAttributeName: title_font,
+                NSForegroundColorAttributeName: label,
+            })
+            add(f"     {done_n}/{total_n} {progress_glyph}     ", {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: (
+                    teal if in_progress_n else tertiary
+                ),
+            })
+            add(f"{ago}\n", {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: tertiary,
+            })
+
+            # Todos, in array order.
+            for todo in todos:
+                status = todo.get("status") or TODO_PENDING
+                icon = TODO_ICONS.get(status, "·")
+                color = TODO_COLORS.get(status, label)
+                # Use activeForm for in_progress (it's a verb phrase like
+                # "Restructuring project..."), content otherwise.
+                content_text = (
+                    todo.get("activeForm") if status == TODO_IN_PROGRESS
+                    else todo.get("content")
+                ) or todo.get("content") or ""
+                # Truncate long todos so they don't blow out the popover.
+                if len(content_text) > 90:
+                    content_text = content_text[:89] + "…"
+                add(f"    {icon}  ", {
+                    NSFontAttributeName: todo_font,
+                    NSForegroundColorAttributeName: color,
+                })
+                # Strike-through completed todos for at-a-glance scanning.
+                content_attrs = {
+                    NSFontAttributeName: todo_font,
+                    NSForegroundColorAttributeName: (
+                        label if status == TODO_IN_PROGRESS else color
+                    ),
+                }
+                if status == TODO_COMPLETED:
+                    content_attrs[NSStrikethroughStyleAttributeName] = (
+                        NSUnderlineStyleSingle
+                    )
+                add(content_text, content_attrs)
+                # Agent count badge on the in_progress todo.
+                if status == TODO_IN_PROGRESS and running_subs:
+                    add(
+                        f"     [{len(running_subs)} agent{'s' if len(running_subs) != 1 else ''}]",
+                        {
+                            NSFontAttributeName: meta_font,
+                            NSForegroundColorAttributeName: teal,
+                        },
+                    )
+                add("\n", {NSFontAttributeName: todo_font})
+
+                # Nest sub-agents under the in_progress todo only.
+                if status == TODO_IN_PROGRESS and running_subs:
+                    shown_subs = running_subs[:SUBAGENT_MAX_DISPLAY]
+                    for i, sub in enumerate(shown_subs):
+                        is_last = (
+                            i == len(shown_subs) - 1
+                            and len(running_subs) <= SUBAGENT_MAX_DISPLAY
+                        )
+                        connector = "└" if is_last else "├"
+                        atype = (sub.get("agent_type") or "").strip()
+                        desc = (sub.get("name") or "agent").strip()
+                        if len(desc) > 70:
+                            desc = desc[:69] + "…"
+                        line = (
+                            f"        {connector} ◐ {atype} · {desc}"
+                            if atype
+                            else f"        {connector} ◐ {desc}"
+                        )
+                        add(f"{line}\n", {
+                            NSFontAttributeName: sub_font,
+                            NSForegroundColorAttributeName: teal,
+                        })
+                    overflow = len(running_subs) - len(shown_subs)
+                    if overflow > 0:
+                        add(f"        └ + {overflow} more working\n", {
+                            NSFontAttributeName: meta_font,
+                            NSForegroundColorAttributeName: tertiary,
+                        })
+
+            # Inter-session gap.
+            add("\n", {NSFontAttributeName: todo_font})
+
+        return out
 
     @objc.python_method
     def _render_kanban(self, buckets):
