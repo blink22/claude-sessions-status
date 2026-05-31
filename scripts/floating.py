@@ -171,8 +171,11 @@ POPOVER_KANBAN_WITH_DORMANT_SIZE = (940.0, 480.0)
 # running sub-agents nested under the in_progress todo. Wider than
 # list view to fit todo text + indented sub-agent rows.
 POPOVER_TASKS_SIZE = (480.0, 480.0)
+# AI Tasks view: per-session AI-derived tasks with rich summaries +
+# confidence + evidence quotes. Wider than Tasks to fit prose-y rows.
+POPOVER_AI_TASKS_SIZE = (520.0, 520.0)
 
-POPOVER_MODES = ("list", "kanban", "tasks")
+POPOVER_MODES = ("list", "kanban", "tasks", "ai")
 
 
 def _read_popover_mode() -> str:
@@ -1954,30 +1957,32 @@ class PopoverVC(NSViewController):
                 NSColor.windowBackgroundColor().CGColor()
             )
 
-        # ---- Top bar: segmented control (List | Kanban | Tasks) ----
-        # 3 segments, centered. Fits in the 360pt list-mode popover
-        # without colliding with the density popup (left) or the dormant
-        # toggle (right). The Tasks tab surfaces TodoWrite-derived todos
-        # per session, with running sub-agents nested beneath the
-        # in_progress todo.
+        # ---- Top bar: segmented control (List | Kanban | Tasks | AI) ----
+        # 4 segments, centered. "AI" stays a 2-char label so the control
+        # fits in the narrowest popover (List mode, 360pt) without
+        # colliding with the density popup (left) or the dormant toggle
+        # (right). The Tasks tab mirrors TodoWrite literally; the AI tab
+        # is Haiku-derived synthesis over the conversation.
         TOP_BAR_HEIGHT = 32.0
         seg = NSSegmentedControl.alloc().init()
-        seg.setSegmentCount_(3)
+        seg.setSegmentCount_(4)
         seg.setLabel_forSegment_("List", 0)
         seg.setLabel_forSegment_("Kanban", 1)
         seg.setLabel_forSegment_("Tasks", 2)
+        seg.setLabel_forSegment_("AI", 3)
         seg.setSegmentStyle_(NSSegmentStyleAutomatic)
         seg.setTrackingMode_(NSSegmentSwitchTrackingSelectOne)
         seg.setSelectedSegment_(
             0 if self.mode == "list"
             else 1 if self.mode == "kanban"
-            else 2
+            else 2 if self.mode == "tasks"
+            else 3
         )
         seg.setTarget_(self)
         seg.setAction_("segmentChanged:")
-        # Center the 3-segment control horizontally. ~165pt fits 3 labels
+        # Center the 4-segment control horizontally. ~210pt fits 4 labels
         # at the system default font without truncation.
-        seg_w = 175.0
+        seg_w = 210.0
         seg.setFrame_(NSMakeRect((w - seg_w) / 2, h - TOP_BAR_HEIGHT + 4, seg_w, 22))
         seg.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin)
         container.addSubview_(seg)
@@ -2188,6 +2193,8 @@ class PopoverVC(NSViewController):
         """Pick the right popover (w, h) for the current mode + toggle."""
         if self.mode == "tasks":
             return POPOVER_TASKS_SIZE
+        if self.mode == "ai":
+            return POPOVER_AI_TASKS_SIZE
         if self.mode != "kanban":
             return POPOVER_LIST_SIZE
         if self.show_dormant:
@@ -2246,7 +2253,8 @@ class PopoverVC(NSViewController):
             new_mode = (
                 "list" if idx == 0
                 else "kanban" if idx == 1
-                else "tasks"
+                else "tasks" if idx == 2
+                else "ai"
             )
             if new_mode == self.mode:
                 return
@@ -2337,6 +2345,8 @@ class PopoverVC(NSViewController):
             self._render_kanban(buckets)
         elif self.mode == "tasks":
             self._render_tasks(buckets)
+        elif self.mode == "ai":
+            self._render_ai_tasks(buckets)
         else:
             self._render_list(buckets)
 
@@ -2365,6 +2375,286 @@ class PopoverVC(NSViewController):
         self.list_text_view.textStorage().setAttributedString_(mas)
         # Hide the kanban-only "Mark all read" button while in Tasks mode.
         self._update_mark_all_button()
+
+    @objc.python_method
+    def _render_ai_tasks(self, buckets):
+        """Build the AI tab — Haiku-derived per-session task synthesis.
+        Distinct from Tasks: tasks here are inferred from the
+        conversation, not mirrored from TodoWrite."""
+        if self.list_text_view is None:
+            return
+        mas = self._build_ai_tasks_attributed(buckets)
+        self.list_text_view.textStorage().setAttributedString_(mas)
+        self._update_mark_all_button()
+
+    @objc.python_method
+    def _build_ai_tasks_attributed(self, buckets):
+        """Render the AI tab as an attributed string. The visual
+        differentiator from Tasks: a "✨ AI-detected" header chip, plus
+        a purple-tinted in_progress glyph and an optional "·NN%"
+        confidence suffix when confidence < 0.9. Status icons (○ ◐ ✓)
+        remain identical to Tasks so the user doesn't relearn a
+        vocabulary."""
+        title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        task_font = NSFont.systemFontOfSize_(12)
+        summary_font = NSFont.systemFontOfSize_(11)
+        meta_font = _rounded_tabular_font(11, NSFontWeightRegular)
+        label = NSColor.labelColor()
+        secondary = NSColor.secondaryLabelColor()
+        tertiary = NSColor.tertiaryLabelColor()
+        # The "AI tint" — system purple at 0.85, falling back to label
+        # color on systems that don't expose systemPurpleColor.
+        purple = (
+            NSColor.systemPurpleColor()
+            if hasattr(NSColor, "systemPurpleColor") else NSColor.labelColor()
+        )
+
+        out = NSMutableAttributedString.alloc().init()
+
+        def add(text, attrs):
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+            )
+
+        # Detect the "key missing" empty state by enabledness — this
+        # mirrors the dashboard.py gate. Renderer doesn't import the
+        # function directly to avoid a heavy cross-import.
+        ai_enabled = bool(os.environ.get("ANTHROPIC_API_KEY")) and (
+            os.environ.get("CLAUDE_SESSIONS_AI_TASKS", "").strip()
+            in ("1", "true", "yes", "on")
+        )
+
+        # ---- Header chip — "✨ AI-detected · <freshness>" ----
+        # Computed across all rows: youngest classified_ts wins.
+        flat_rows: list = []
+        for k in ("needs", "working", "ready", "dormant"):
+            flat_rows.extend(buckets.get(k) or [])
+        with_classification = [
+            r for r in flat_rows
+            if (r.get("ai_tasks") or {}).get("classified_ts")
+        ]
+        any_computing = any(
+            (r.get("ai_tasks") or {}).get("status") == "computing"
+            for r in flat_rows
+        )
+        if with_classification:
+            youngest = max(
+                (r.get("ai_tasks") or {}).get("classified_ts", 0)
+                for r in with_classification
+            )
+            ago_s = max(0.0, time.time() - youngest)
+            sync_text = f"synced {format_ago(ago_s)}"
+        else:
+            sync_text = "no sessions classified yet"
+
+        chip_color = purple if ai_enabled else tertiary
+        add("✨ AI-detected", {
+            NSFontAttributeName: meta_font,
+            NSForegroundColorAttributeName: chip_color,
+        })
+        add(f"  ·  {sync_text}", {
+            NSFontAttributeName: meta_font,
+            NSForegroundColorAttributeName: tertiary,
+        })
+        if any_computing:
+            add("  ·  classifying…", {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: purple,
+            })
+        add("\n\n", {NSFontAttributeName: meta_font})
+
+        # ---- Three empty states, in priority order ----
+        if not ai_enabled:
+            add("\n", {NSFontAttributeName: title_font})
+            add("Enable AI Tasks\n", {
+                NSFontAttributeName: title_font,
+                NSForegroundColorAttributeName: secondary,
+            })
+            add(
+                "Add an Anthropic API key and turn the feature on:\n\n"
+                "  1.  Edit  ~/.claude-sessions-status.env\n"
+                "  2.  Add   ANTHROPIC_API_KEY=sk-…\n"
+                "  3.  Add   CLAUDE_SESSIONS_AI_TASKS=1\n\n"
+                "Cost is throttled — typically a few cents/day. "
+                "The first classification appears within a minute.",
+                {
+                    NSFontAttributeName: task_font,
+                    NSForegroundColorAttributeName: tertiary,
+                },
+            )
+            return out
+
+        # Filter to sessions that have any AI task data (either cached
+        # tasks OR are currently being classified). Sessions with status
+        # "disabled"/"empty" never appear.
+        sessions_with_ai: list = []
+        for r in flat_rows:
+            ai = r.get("ai_tasks") or {}
+            status = ai.get("status") or "empty"
+            if status in ("ok", "stale", "computing", "errored") and (
+                ai.get("tasks") or status == "computing"
+            ):
+                sessions_with_ai.append(r)
+
+        # Sort by recency.
+        sessions_with_ai.sort(key=lambda r: r.get("ago_s", 0))
+
+        if not sessions_with_ai:
+            if any_computing:
+                add("\n", {NSFontAttributeName: title_font})
+                add("Classifying your sessions…\n", {
+                    NSFontAttributeName: title_font,
+                    NSForegroundColorAttributeName: secondary,
+                })
+                add(
+                    "First results appear within a few seconds. "
+                    "If this persists for more than a minute, check ~/.claude-sessions-status.log.",
+                    {
+                        NSFontAttributeName: task_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    },
+                )
+            else:
+                add("\n", {NSFontAttributeName: title_font})
+                add("No AI tasks yet\n", {
+                    NSFontAttributeName: title_font,
+                    NSForegroundColorAttributeName: secondary,
+                })
+                add(
+                    "Active sessions will appear here after their next\n"
+                    "user/assistant turn (classification is gated on\n"
+                    "real conversation activity, not refresh ticks).",
+                    {
+                        NSFontAttributeName: task_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    },
+                )
+            return out
+
+        # Status icons (identical to Tasks tab so the vocabulary is shared).
+        STATUS_ICONS = {
+            "pending": "○",
+            "in_progress": "◐",
+            "completed": "✓",
+        }
+        STATUS_COLORS = {
+            "pending": tertiary,
+            "in_progress": purple,   # the AI-tab differentiator
+            "completed": secondary,
+        }
+
+        for r in sessions_with_ai:
+            ai = r.get("ai_tasks") or {}
+            tasks = ai.get("tasks") or []
+            session_intent = ai.get("session_intent") or ""
+            entry_status = ai.get("status") or "ok"
+            classified_ts = ai.get("classified_ts") or 0
+
+            # Session header — title + age + session_intent line (which
+            # is the AI's one-phrase summary of what this session is for).
+            title = (r.get("title") or "(untitled)").strip()
+            ago = format_ago(r.get("ago_s") or 0)
+
+            add("▾  ", {
+                NSFontAttributeName: title_font,
+                NSForegroundColorAttributeName: tertiary,
+            })
+            add(title, {
+                NSFontAttributeName: title_font,
+                NSForegroundColorAttributeName: label,
+            })
+            # Per-session freshness indicator next to the title.
+            if classified_ts:
+                age_s = max(0.0, time.time() - classified_ts)
+                add(f"     synced {format_ago(age_s)}     ", {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: tertiary,
+                })
+            else:
+                add("     ", {NSFontAttributeName: meta_font})
+            add(f"{ago}\n", {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: tertiary,
+            })
+
+            # Per-session error indicator (one-line, dim) — overrides the
+            # task list to be honest about the failure.
+            if entry_status == "errored":
+                fail_n = ai.get("failure_count", 0)
+                add(
+                    f"    ⚠︎ last classification failed "
+                    f"({fail_n} time{'s' if fail_n != 1 else ''}) — retrying after backoff\n",
+                    {
+                        NSFontAttributeName: summary_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    },
+                )
+
+            # Session intent — italicized via secondary color since
+            # NSTextView attributed strings don't trivially do italics
+            # without a font descriptor variation.
+            if session_intent:
+                add(f"    {session_intent}\n", {
+                    NSFontAttributeName: summary_font,
+                    NSForegroundColorAttributeName: secondary,
+                })
+
+            # Tasks list.
+            for task in tasks:
+                status = task.get("status") or "pending"
+                icon = STATUS_ICONS.get(status, "·")
+                icon_color = STATUS_COLORS.get(status, label)
+                title_text = (task.get("title") or "").strip()
+                summary = (task.get("summary") or "").strip()
+                confidence = task.get("confidence") or 1.0
+                evidence = (task.get("evidence") or "").strip()
+
+                add(f"    {icon}  ", {
+                    NSFontAttributeName: task_font,
+                    NSForegroundColorAttributeName: icon_color,
+                })
+                # Strike-through completed task titles.
+                title_attrs = {
+                    NSFontAttributeName: task_font,
+                    NSForegroundColorAttributeName: (
+                        label if status == "in_progress" else
+                        secondary if status == "completed" else label
+                    ),
+                }
+                if status == "completed":
+                    title_attrs[NSStrikethroughStyleAttributeName] = (
+                        NSUnderlineStyleSingle
+                    )
+                add(title_text, title_attrs)
+
+                # Confidence suffix — only when uncertain (UX agent's call).
+                if confidence < 0.9:
+                    pct = int(round(confidence * 100))
+                    add(f"   ·{pct}%", {
+                        NSFontAttributeName: meta_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    })
+                add("\n", {NSFontAttributeName: task_font})
+
+                # Summary on its own line (skip for completed to reduce noise).
+                if summary and status != "completed":
+                    add(f"       {summary}\n", {
+                        NSFontAttributeName: summary_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    })
+                # Evidence on its own line, only on in_progress where
+                # the user is most likely scrutinizing.
+                if evidence and status == "in_progress":
+                    quoted = evidence if len(evidence) < 100 else evidence[:99] + "…"
+                    add(f"       “{quoted}”\n", {
+                        NSFontAttributeName: summary_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    })
+
+            # Inter-session gap.
+            add("\n", {NSFontAttributeName: task_font})
+
+        return out
 
     @objc.python_method
     def _build_tasks_attributed(self, buckets):
