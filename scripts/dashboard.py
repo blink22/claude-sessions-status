@@ -136,7 +136,7 @@ def _pad_w(s: str, width: int) -> str:
     return s + " " * (width - n)
 
 
-DASHBOARD_MODES = ("list", "kanban", "tasks")
+DASHBOARD_MODES = ("list", "kanban", "tasks", "ai")
 
 
 def _read_dashboard_mode() -> str:
@@ -866,6 +866,517 @@ def session_gist(session: dict, meta: dict, bucket: str | None = None) -> str | 
     return _free_gist(meta)
 
 
+# ---------- AI Tasks (LLM-derived task list per session) ----------
+# A bounded slice of each session's transcript goes to Haiku; the model
+# returns a structured list of "what's this session actually working on"
+# tasks. Separate from the TodoWrite mirror (which can be stale or
+# missing) — this tab is "intelligence layered on top".
+#
+# Cost: ~$0.004/call. Gated by (real-turn-occurred AND size-grew-≥2KB AND
+# ≥60s-since-last-call). Worker thread keeps the LLM out of the UI tick.
+AI_TASKS_CACHE_FILE = Path(os.path.expanduser("~/.claude-sessions-status-ai-tasks.json"))
+AI_TASK_MAX = 6
+AI_TASK_RECLASSIFY_COOLDOWN_S = 60
+AI_TASK_SIZE_DELTA_BYTES = 2048
+AI_TASK_INPUT_USER_PROMPTS = 20
+AI_TASK_INPUT_ASSISTANT_SNIPPETS = 5
+AI_TASK_HTTP_TIMEOUT = 12
+AI_TASK_FAIL_BACKOFF_S = 300  # after a hard error, don't retry for 5 min
+
+# Statuses — kept identical to TodoWrite (UX agent's call). Haiku returns
+# these strings; we validate on parse.
+AI_TASK_PENDING = "pending"
+AI_TASK_IN_PROGRESS = "in_progress"
+AI_TASK_COMPLETED = "completed"
+AI_TASK_STATUSES = (AI_TASK_PENDING, AI_TASK_IN_PROGRESS, AI_TASK_COMPLETED)
+
+
+def _ai_tasks_log(msg: str) -> None:
+    """Append a line to ~/.claude-sessions-status.log. Reuses gist log
+    file so users have one place to look for AI-feature diagnostics."""
+    try:
+        log_p = Path(os.path.expanduser("~/.claude-sessions-status.log"))
+        with log_p.open("a", encoding="utf-8") as f:
+            f.write(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ai-tasks] {msg}\n"
+            )
+    except OSError:
+        pass
+
+
+# Cache shape: {session_id: {tasks, session_intent, classified_size,
+#                            classified_ts, last_turn_epoch, model,
+#                            failure_count, last_failure_ts}}
+_ai_tasks_cache_lock = None  # set lazily on first use
+_ai_tasks_cache_mem: dict | None = None
+
+
+def _ai_tasks_lock():
+    """Thread-safety primitive for the on-disk + in-memory cache."""
+    global _ai_tasks_cache_lock
+    if _ai_tasks_cache_lock is None:
+        import threading
+        _ai_tasks_cache_lock = threading.RLock()
+    return _ai_tasks_cache_lock
+
+
+def _load_ai_tasks_cache() -> dict:
+    """Read the on-disk cache once into memory. Subsequent reads use the
+    in-memory copy — writers mutate it under the lock and flush."""
+    global _ai_tasks_cache_mem
+    with _ai_tasks_lock():
+        if _ai_tasks_cache_mem is not None:
+            return _ai_tasks_cache_mem
+        if not AI_TASKS_CACHE_FILE.exists():
+            _ai_tasks_cache_mem = {}
+            return _ai_tasks_cache_mem
+        try:
+            data = json.loads(AI_TASKS_CACHE_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        _ai_tasks_cache_mem = data
+        return _ai_tasks_cache_mem
+
+
+def _save_ai_tasks_cache_entry(session_id: str, entry: dict) -> None:
+    """Merge one session's entry into the cache and atomically flush."""
+    with _ai_tasks_lock():
+        cache = _load_ai_tasks_cache()
+        cache[session_id] = entry
+        try:
+            tmp = AI_TASKS_CACHE_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(cache, indent=0), encoding="utf-8")
+            os.replace(tmp, AI_TASKS_CACHE_FILE)
+        except OSError as e:
+            _ai_tasks_log(f"cache write failed: {e!r}")
+
+
+def _build_ai_task_payload(jsonl_path: str, todos: list[dict]) -> dict:
+    """Construct the bounded input slice we send to Haiku.
+
+    Returns: {first_prompt, user_prompts, assistant_snippets,
+              tool_histogram, todo_snapshot}. The slice size is bounded
+              regardless of transcript length — that's the whole point.
+    """
+    p = Path(jsonl_path)
+    if not p.exists():
+        return {}
+
+    user_prompts: list[str] = []
+    assistant_snippets: list[str] = []
+    tool_counts: dict[str, int] = {}
+    first_prompt = ""
+
+    try:
+        with p.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                t = obj.get("type")
+                msg = obj.get("message") if isinstance(obj, dict) else None
+                if not isinstance(msg, dict):
+                    continue
+                if t == "user":
+                    text = _text_from_content(msg.get("content"))
+                    if not text:
+                        continue
+                    # Skip metadata-looking entries (task notifications,
+                    # interrupts, tool-result wrappers) — they bloat the
+                    # slice without informing intent.
+                    if text.startswith("<") or text.startswith("[Request"):
+                        continue
+                    text = text[:500]
+                    if not first_prompt:
+                        first_prompt = text
+                    if len(text) >= 10:
+                        user_prompts.append(text)
+                elif t == "assistant":
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for b in content:
+                            if not isinstance(b, dict):
+                                continue
+                            if b.get("type") == "text":
+                                txt = (b.get("text") or "").strip()
+                                if txt:
+                                    assistant_snippets.append(txt[:400])
+                            elif b.get("type") == "tool_use":
+                                name = b.get("name") or "?"
+                                tool_counts[name] = tool_counts.get(name, 0) + 1
+    except OSError:
+        return {}
+
+    # Keep only the last N of each, to bound the payload.
+    user_prompts = user_prompts[-AI_TASK_INPUT_USER_PROMPTS:]
+    assistant_snippets = assistant_snippets[-AI_TASK_INPUT_ASSISTANT_SNIPPETS:]
+    # Top 10 tools by count (the histogram is the *summary* of activity,
+    # so a full enumeration would just be noise).
+    top_tools = sorted(tool_counts.items(), key=lambda kv: -kv[1])[:10]
+
+    todo_snapshot = [
+        {"content": t.get("content", "")[:160], "status": t.get("status", "")}
+        for t in (todos or [])
+    ][:30]
+
+    return {
+        "first_prompt": first_prompt[:400],
+        "user_prompts": user_prompts,
+        "assistant_snippets": assistant_snippets,
+        "tool_histogram": top_tools,
+        "todo_snapshot": todo_snapshot,
+    }
+
+
+_AI_TASKS_SYSTEM_PROMPT = (
+    "You extract a current task list from a Claude Code session transcript "
+    "for a developer dashboard. You will receive: the session's first user "
+    "prompt, the last 20 user prompts, the last 5 assistant text snippets, "
+    "a tool-use histogram, and the session's most recent TodoWrite snapshot "
+    "(may be empty or stale).\n\n"
+    "Return STRICT JSON matching this schema:\n"
+    "{\n"
+    "  \"session_intent\": \"<one short phrase—what this session is fundamentally about>\",\n"
+    "  \"tasks\": [\n"
+    "    {\"title\": str, \"status\": str, \"summary\": str, \"evidence\": str, \"confidence\": float}\n"
+    "  ]\n"
+    "}\n\n"
+    "Rules:\n"
+    "- 1–6 tasks max. Group related TodoWrite items into ONE task when they share intent—\n"
+    "  TodoWrite's granularity is often too fine; collapse aggressively.\n"
+    "- status ∈ {\"pending\",\"in_progress\",\"completed\"}.\n"
+    "  \"in_progress\" = work clearly underway in the last few user/assistant turns.\n"
+    "  \"completed\" = explicitly finished AND not contradicted later.\n"
+    "  \"pending\" = upcoming or proposed but not started.\n"
+    "- title: ≤ 60 chars, imperative phrasing (\"Fix X\", not \"Fixing X\").\n"
+    "- summary: 1–2 plain-text sentences. No markdown. Describe the WHAT and WHY.\n"
+    "- evidence: one verbatim quote (≤ 120 chars) from user or assistant message.\n"
+    "- confidence: float in [0,1]. Use ≤ 0.5 when signals are sparse or contradictory.\n"
+    "- If the transcript is too short to identify any task, return tasks: [].\n"
+    "Output JSON only. No prose, no markdown fences."
+)
+
+
+def _ai_task_call_haiku(payload: dict) -> dict | None:
+    """One Haiku call. Returns parsed JSON dict or None on any failure."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    user_content = (
+        f"First user prompt:\n{payload.get('first_prompt') or '(empty)'}\n\n"
+        f"Recent user prompts (most recent last):\n"
+        + "\n---\n".join(payload.get("user_prompts") or []) + "\n\n"
+        f"Recent assistant snippets:\n"
+        + "\n---\n".join(payload.get("assistant_snippets") or []) + "\n\n"
+        f"Tool usage (name: count):\n"
+        + "\n".join(f"  {n}: {c}" for n, c in payload.get("tool_histogram") or [])
+        + "\n\n"
+        + "Most recent TodoWrite snapshot (may be empty):\n"
+        + json.dumps(payload.get("todo_snapshot") or [], indent=0)
+    )
+    body_obj = {
+        "model": HAIKU_MODEL,
+        "max_tokens": 900,
+        "system": _AI_TASKS_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": user_content}],
+    }
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(body_obj).encode("utf-8"),
+        headers={
+            "content-type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=AI_TASK_HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:  # noqa: BLE001
+        _ai_tasks_log(f"haiku call failed: {e!r}")
+        return None
+    blocks = data.get("content") or []
+    raw = " ".join(
+        b.get("text", "") for b in blocks if b.get("type") == "text"
+    ).strip()
+    if not raw:
+        return None
+    # Strip markdown fences the model sometimes adds despite instructions.
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        # Drop a leading "json\n" if present.
+        if raw.lower().startswith("json"):
+            raw = raw[4:].lstrip()
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as e:
+        _ai_tasks_log(f"haiku response parse failed: {e!r}; raw[:300]={raw[:300]!r}")
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _normalize_ai_task_response(parsed: dict) -> dict:
+    """Validate + clamp the LLM output. Drops malformed tasks, enforces
+    cap, normalizes statuses."""
+    intent = parsed.get("session_intent") or ""
+    if not isinstance(intent, str):
+        intent = ""
+    raw_tasks = parsed.get("tasks") or []
+    if not isinstance(raw_tasks, list):
+        raw_tasks = []
+    clean: list[dict] = []
+    for t in raw_tasks:
+        if not isinstance(t, dict):
+            continue
+        title = (t.get("title") or "").strip()
+        if not title:
+            continue
+        status = (t.get("status") or "").strip()
+        if status not in AI_TASK_STATUSES:
+            status = AI_TASK_PENDING
+        summary = (t.get("summary") or "").strip()
+        evidence = (t.get("evidence") or "").strip()
+        confidence = t.get("confidence")
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 0.5
+        confidence = max(0.0, min(1.0, confidence))
+        clean.append({
+            "title": title[:80],
+            "status": status,
+            "summary": summary[:300],
+            "evidence": evidence[:160],
+            "confidence": round(confidence, 2),
+        })
+        if len(clean) >= AI_TASK_MAX:
+            break
+    return {"session_intent": intent[:120], "tasks": clean}
+
+
+# Worker thread + queue. The refresh tick enqueues jobs; the worker pops
+# them serially and writes results to the cache. Single worker keeps
+# concurrency bounded — heavy bursts queue up but won't fan out into
+# many parallel HTTP requests.
+_ai_task_queue = None
+_ai_task_worker = None
+_ai_task_inflight: set = set()
+_ai_task_inflight_lock = None
+
+
+def _ai_task_inflight_lock_get():
+    global _ai_task_inflight_lock
+    if _ai_task_inflight_lock is None:
+        import threading
+        _ai_task_inflight_lock = threading.Lock()
+    return _ai_task_inflight_lock
+
+
+def _start_ai_task_worker() -> None:
+    global _ai_task_queue, _ai_task_worker
+    import threading, queue as _q
+    if _ai_task_worker is not None and _ai_task_worker.is_alive():
+        return
+    if _ai_task_queue is None:
+        _ai_task_queue = _q.Queue()
+    _ai_task_worker = threading.Thread(
+        target=_ai_task_worker_loop, daemon=True, name="ai-tasks-worker",
+    )
+    _ai_task_worker.start()
+
+
+def _ai_task_worker_loop() -> None:
+    """Single-threaded consumer. Pops jobs serially and classifies."""
+    while True:
+        job = _ai_task_queue.get()  # blocks
+        if job is None:
+            return  # shutdown sentinel
+        try:
+            _classify_session(job)
+        except Exception as e:  # noqa: BLE001
+            _ai_tasks_log(f"worker exception: {e!r}")
+        finally:
+            sid = job.get("session_id")
+            with _ai_task_inflight_lock_get():
+                _ai_task_inflight.discard(sid)
+
+
+def _classify_session(job: dict) -> None:
+    """Classify ONE session. Reads its current state, calls Haiku,
+    writes the result to the cache. Best-effort — failures degrade
+    silently (failure_count + last_failure_ts get logged for backoff)."""
+    session_id = job.get("session_id")
+    jsonl_path = job.get("jsonl_path")
+    todos = job.get("todos") or []
+    size = job.get("size", 0)
+    last_turn_epoch = job.get("last_turn_epoch", 0.0)
+    if not session_id or not jsonl_path:
+        return
+
+    payload = _build_ai_task_payload(jsonl_path, todos)
+    if not payload or not payload.get("user_prompts"):
+        # Nothing meaningful to classify yet — write an empty entry so
+        # the gate logic doesn't keep retrying immediately.
+        _save_ai_tasks_cache_entry(session_id, {
+            "tasks": [],
+            "session_intent": "",
+            "classified_size": size,
+            "classified_ts": time.time(),
+            "last_turn_epoch": last_turn_epoch,
+            "model": HAIKU_MODEL,
+            "failure_count": 0,
+            "last_failure_ts": 0,
+        })
+        return
+
+    parsed = _ai_task_call_haiku(payload)
+    if parsed is None:
+        # Hard failure — bump the backoff counter so we don't hammer.
+        with _ai_tasks_lock():
+            cache = _load_ai_tasks_cache()
+            prev = cache.get(session_id) or {}
+            prev["failure_count"] = (prev.get("failure_count") or 0) + 1
+            prev["last_failure_ts"] = time.time()
+            cache[session_id] = prev
+            try:
+                AI_TASKS_CACHE_FILE.write_text(json.dumps(cache, indent=0), encoding="utf-8")
+            except OSError:
+                pass
+        return
+
+    norm = _normalize_ai_task_response(parsed)
+    _save_ai_tasks_cache_entry(session_id, {
+        "tasks": norm["tasks"],
+        "session_intent": norm["session_intent"],
+        "classified_size": size,
+        "classified_ts": time.time(),
+        "last_turn_epoch": last_turn_epoch,
+        "model": HAIKU_MODEL,
+        "failure_count": 0,
+        "last_failure_ts": 0,
+    })
+
+
+def _ai_tasks_enabled() -> bool:
+    """Independent toggle from CLAUDE_SESSIONS_AI (gist mode). A user
+    can have one feature on and not the other."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return False
+    return os.environ.get("CLAUDE_SESSIONS_AI_TASKS", "").strip() in (
+        "1", "true", "yes", "on"
+    )
+
+
+def ai_tasks_for_session(
+    session_id: str,
+    jsonl_path: str,
+    meta: dict,
+    todos: list[dict],
+    bucket: str | None = None,
+) -> dict:
+    """Return the cached AI task result for a session. Enqueues a
+    re-classification if the cache is stale and all gates pass.
+
+    Returns a dict shaped like the cache entry:
+        {tasks, session_intent, classified_ts, last_turn_epoch,
+         failure_count, last_failure_ts, status} where status is one of:
+         "ok" | "computing" | "stale" | "errored" | "disabled" | "empty".
+    """
+    # Fast path: AI tasks disabled.
+    if not _ai_tasks_enabled():
+        return {"status": "disabled", "tasks": []}
+
+    # Don't classify dormant sessions — they're not changing, and the
+    # cost would be wasted. Existing cached result (if any) is fine to
+    # show though.
+    cache = _load_ai_tasks_cache()
+    entry = cache.get(session_id) or {}
+    if bucket == "dormant":
+        return {
+            **entry,
+            "status": "ok" if entry.get("tasks") else "empty",
+        }
+
+    # Compute gate values.
+    try:
+        size = Path(jsonl_path).stat().st_size
+    except OSError:
+        size = 0
+    last_size = entry.get("classified_size", 0)
+    last_ts = entry.get("classified_ts", 0)
+    last_turn_epoch = meta.get("lastTurnEpoch") or 0
+    cached_turn_epoch = entry.get("last_turn_epoch", 0)
+    now = time.time()
+    failures = entry.get("failure_count", 0) or 0
+    last_failure_ts = entry.get("last_failure_ts", 0) or 0
+
+    # Backoff after repeated failures.
+    in_backoff = (
+        failures > 0
+        and (now - last_failure_ts) < AI_TASK_FAIL_BACKOFF_S
+    )
+
+    # Three gates must all pass to fire a new classification.
+    has_data = size > 0
+    size_grew = (size - last_size) >= AI_TASK_SIZE_DELTA_BYTES
+    new_turn = last_turn_epoch and last_turn_epoch > cached_turn_epoch
+    cooled = (now - last_ts) >= AI_TASK_RECLASSIFY_COOLDOWN_S
+    # First-time classification is allowed even without size delta /
+    # cooldown — we just need data.
+    first_time = not entry and has_data and last_turn_epoch
+
+    should_classify = (
+        not in_backoff
+        and has_data
+        and (first_time or (size_grew and new_turn and cooled))
+    )
+
+    if should_classify:
+        with _ai_task_inflight_lock_get():
+            if session_id not in _ai_task_inflight:
+                _ai_task_inflight.add(session_id)
+                _start_ai_task_worker()
+                _ai_task_queue.put({
+                    "session_id": session_id,
+                    "jsonl_path": jsonl_path,
+                    "size": size,
+                    "last_turn_epoch": last_turn_epoch,
+                    "todos": todos,
+                })
+                computing = True
+            else:
+                computing = True
+    else:
+        with _ai_task_inflight_lock_get():
+            computing = session_id in _ai_task_inflight
+
+    # Status string for the renderer.
+    if computing and not entry.get("tasks"):
+        status = "computing"
+    elif in_backoff:
+        status = "errored"
+    elif entry.get("tasks"):
+        # Stale = data exists but session has grown a lot since we last
+        # classified. UI uses this to dim slightly.
+        age = now - last_ts
+        status = "stale" if age > 300 and size_grew else "ok"
+    elif entry:
+        status = "empty"
+    else:
+        status = "computing" if computing else "empty"
+
+    return {
+        **entry,
+        "status": status,
+    }
+
+
 def resolve_title(
     session: dict, meta: dict, desktop_index: dict[str, dict] | None = None
 ) -> str:
@@ -1257,6 +1768,9 @@ def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> d
         "subagent_summary": sub_sum,
         "todos": todos,
         "todo_summary": todo_sum,
+        "ai_tasks": ai_tasks_for_session(
+            sid, full_path, meta, todos, bucket=bucket,
+        ),
     }
 
 
@@ -1623,6 +2137,130 @@ def render_tasks(rows: list[dict], width: int) -> str:
     return "".join(parts)
 
 
+def render_ai_tasks(rows: list[dict], width: int) -> str:
+    """Terminal companion for the AI tab — same data, plain-ANSI layout.
+
+    Empty states mirror the popover (no key / classifying / nothing yet).
+    Sessions with cached AI tasks render with the same status icons
+    (○ ◐ ✓) plus optional ·NN% confidence suffix on uncertain ones."""
+    ai_enabled = bool(os.environ.get("ANTHROPIC_API_KEY")) and (
+        os.environ.get("CLAUDE_SESSIONS_AI_TASKS", "").strip()
+        in ("1", "true", "yes", "on")
+    )
+
+    parts: list[str] = []
+    # Header chip line.
+    any_classified = any(
+        (r.get("ai_tasks") or {}).get("classified_ts") for r in rows
+    )
+    any_computing = any(
+        (r.get("ai_tasks") or {}).get("status") == "computing" for r in rows
+    )
+    chip_status = "(no sessions classified yet)" if not any_classified else "synced"
+    suffix = "  ·  classifying…" if any_computing else ""
+    parts.append(
+        f"{MAGENTA}✨ AI-detected{RESET}   {DIM}{chip_status}{suffix}{RESET}\n\n"
+    )
+
+    # Empty state: no key / not enabled.
+    if not ai_enabled:
+        parts.append(
+            f"{BOLD}Enable AI Tasks{RESET}\n"
+            f"Add an Anthropic API key + toggle to {DIM}~/.claude-sessions-status.env{RESET}:\n\n"
+            f"  ANTHROPIC_API_KEY=sk-…\n"
+            f"  CLAUDE_SESSIONS_AI_TASKS=1\n\n"
+            f"{DIM}First classification appears within ~1 min.{RESET}\n"
+        )
+        return "".join(parts)
+
+    # Sessions with usable AI task data.
+    sessions_with_ai: list[dict] = []
+    for r in rows:
+        ai = r.get("ai_tasks") or {}
+        status = ai.get("status") or "empty"
+        if status in ("ok", "stale", "computing", "errored") and (
+            ai.get("tasks") or status == "computing"
+        ):
+            sessions_with_ai.append(r)
+
+    if not sessions_with_ai:
+        if any_computing:
+            parts.append(
+                f"{DIM}Classifying your sessions… first results in a few seconds.{RESET}\n"
+            )
+        else:
+            parts.append(
+                f"{DIM}No AI tasks yet. Sessions will appear here after their "
+                f"next user/assistant turn.{RESET}\n"
+            )
+        return "".join(parts)
+
+    icons = {"pending": "○", "in_progress": "◐", "completed": "✓"}
+    colors = {"pending": DIM, "in_progress": MAGENTA, "completed": DIM}
+
+    for r in sessions_with_ai:
+        ai = r.get("ai_tasks") or {}
+        tasks = ai.get("tasks") or []
+        intent = (ai.get("session_intent") or "").strip()
+        classified_ts = ai.get("classified_ts") or 0
+        title = truncate(r.get("title") or "(untitled)", max(20, width - 40))
+
+        synced = ""
+        if classified_ts:
+            ago_secs = max(0.0, time.time() - classified_ts)
+            synced = f"   {DIM}synced {format_ago(ago_secs)}{RESET}"
+        parts.append(
+            f"{BOLD}▸ {title}{RESET}{synced}   {DIM}{r.get('ago', '')}{RESET}\n"
+        )
+
+        if ai.get("status") == "errored":
+            fail_n = ai.get("failure_count", 0)
+            parts.append(
+                f"  {DIM}⚠ last classification failed "
+                f"({fail_n} time{'s' if fail_n != 1 else ''}) — retrying after backoff{RESET}\n"
+            )
+
+        if intent:
+            parts.append(
+                f"  {DIM}{truncate(intent, max(20, width - 6))}{RESET}\n"
+            )
+
+        for task in tasks:
+            status = task.get("status") or "pending"
+            icon = icons.get(status, "·")
+            icon_color = colors.get(status, RESET)
+            title_text = (task.get("title") or "").strip()
+            summary = (task.get("summary") or "").strip()
+            confidence = task.get("confidence") or 1.0
+            evidence = (task.get("evidence") or "").strip()
+
+            # Strikethrough completed (ANSI 9).
+            if status == "completed":
+                title_styled = f"\033[9m{title_text}\033[29m"
+            elif status == "in_progress":
+                title_styled = f"{BOLD}{title_text}{RESET}"
+            else:
+                title_styled = title_text
+            conf_suffix = ""
+            if confidence < 0.9:
+                pct = int(round(confidence * 100))
+                conf_suffix = f"   {DIM}·{pct}%{RESET}"
+            parts.append(
+                f"  {icon_color}{icon}{RESET}  {title_styled}{conf_suffix}\n"
+            )
+            if summary and status != "completed":
+                parts.append(
+                    f"      {DIM}{truncate(summary, max(20, width - 8))}{RESET}\n"
+                )
+            if evidence and status == "in_progress":
+                quoted = evidence if len(evidence) < 100 else evidence[:99] + "…"
+                parts.append(
+                    f"      {DIM}“{truncate(quoted, max(20, width - 10))}”{RESET}\n"
+                )
+        parts.append("\n")
+    return "".join(parts)
+
+
 def render(
     sessions: list[dict],
     view: str = "list",
@@ -1651,7 +2289,10 @@ def render(
     # back to list when the terminal is too narrow). The numbering must
     # match the displayed view, not the requested one.
     body: str
-    if view == "tasks":
+    if view == "ai":
+        parts.append(render_ai_tasks(rows, width))
+        effective_view = "ai"
+    elif view == "tasks":
         parts.append(render_tasks(rows, width))
         effective_view = "tasks"
     elif view == "kanban" and width >= KANBAN_MIN_WIDTH:
@@ -1689,7 +2330,7 @@ def render(
     footer = (
         f"{DIM}refreshing every {REFRESH_SECS}s · "
         f"window {RECENT_HOURS:.0f}h · "
-        f"k=kanban  l=list  t=tasks  d=±dormant  1-9=resume  q=quit{RESET}\n"
+        f"k=kanban  l=list  t=tasks  a=ai  d=±dormant  1-9=resume  q=quit{RESET}\n"
     )
     parts.append(footer)
     sys.stdout.write("".join(parts))
@@ -1786,6 +2427,8 @@ def main() -> int:
                         help="Start in list view (default if no flag and no saved pref)")
     parser.add_argument("--tasks", action="store_true",
                         help="Start in tasks view (TodoWrite-derived per-session todos)")
+    parser.add_argument("--ai-tasks", dest="ai_tasks", action="store_true",
+                        help="Start in AI tasks view (Haiku-derived per-session synthesis)")
     parser.add_argument("--show-dormant", action="store_true",
                         help="Show the DORMANT column / dormant sessions")
     parser.add_argument("--save", action="store_true",
@@ -1794,7 +2437,9 @@ def main() -> int:
     args = parser.parse_args()
 
     # Resolve initial view: explicit flag > saved preference > default.
-    if args.tasks:
+    if args.ai_tasks:
+        view = "ai"
+    elif args.tasks:
         view = "tasks"
     elif args.kanban:
         view = "kanban"
@@ -1839,6 +2484,10 @@ def main() -> int:
                     break
                 if ch == "t" and view != "tasks":
                     view = "tasks"
+                    _write_dashboard_mode(view)
+                    break
+                if ch == "a" and view != "ai":
+                    view = "ai"
                     _write_dashboard_mode(view)
                     break
                 if ch == "d":
