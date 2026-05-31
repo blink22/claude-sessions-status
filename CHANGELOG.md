@@ -4,6 +4,56 @@ All notable changes to this project are documented here. Format roughly
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0 — 2026-05-31
+
+Sessions can now see one level deeper: the **sub-agents** a parent
+dispatches via Claude Code's `Task` / `Agent` tool show up on the same
+card the parent does, so an "agent team" stops being invisible from
+the dashboard's POV.
+
+### Added
+
+- **Sub-agent discovery.** The parser now reads
+  `<projects>/<proj>/<sess-uuid>/subagents/agent-*.jsonl` (paired with
+  the tiny `agent-*.meta.json`) instead of skipping nested transcripts.
+  Each session row carries a `subagents` list + `subagent_summary`.
+- **Per-running-agent brief on every card.** When a session has at
+  least one sub-agent currently working, the card shows one line per
+  active child: `◐ <agent_type> · <description>` — the description
+  comes from the original `Task` call's `.meta.json`. Capped at 5
+  visible rows with `+ N more working` if exceeded.
+- **Three-state classifier** per sub-agent — `running` (file mtime
+  inside a 60-second grace window), `interrupted` (last JSONL entry
+  is the literal `[Request interrupted…]` user marker), `done`
+  (otherwise). Cached per agent-jsonl path; terminal states are
+  sticky and never re-read.
+
+### Changed
+
+- **A session with a running sub-agent is now classified as WORKING**,
+  even if the parent transcript's own tail looks idle or has fallen
+  into DORMANT by age. This rescues parent sessions that fire off
+  long-running children and then quietly wait — without this override
+  they would drift out of the WORKING column.
+- **Done and interrupted sub-agents render invisibly.** The card only
+  ever surfaces what's actively running; finished children carry no
+  noise. This is a deliberate "right now" signal, not a history view.
+  If a session has only finished children, the card renders exactly
+  as it did pre-0.3.0.
+- Consistent rendering across all five surfaces: terminal list,
+  terminal kanban, badge popover (Focus + Detail), always-on-top
+  panel, SwiftBar menu-bar dropdown. Cyan (terminal) / teal (popover
+  + panel) / `#39c5cf` (SwiftBar).
+
+### Docs
+
+- README restructured for scannability: install + four views moved to
+  the top, configuration / FAQ / troubleshooting / architecture
+  collapsed into `<details>` toggles.
+- Six in-tree screenshots wired into the README at the right sections.
+- `install.sh` promoted to the primary install path; Homebrew tap
+  marked "coming soon" until the tap repo is published.
+
 ## 0.2.0 — 2026-05-20
 
 This release is mostly about the **floating glass badge popover** and the

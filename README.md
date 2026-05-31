@@ -4,7 +4,7 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg" /></a>
   <img alt="macOS only" src="https://img.shields.io/badge/macOS-13%2B-lightgrey?logo=apple" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white" />
-  <img alt="Status: v0.2.0" src="https://img.shields.io/badge/status-v0.2.0%20preview-orange" />
+  <img alt="Status: v0.3.0" src="https://img.shields.io/badge/status-v0.3.0%20preview-orange" />
 </p>
 
 > **A glance at every Claude Code session you've got running** — in your menu bar, a floating badge, or a full terminal dashboard.
