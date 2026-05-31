@@ -117,6 +117,7 @@ except ImportError as e:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dashboard  # noqa: E402
 from dashboard import (  # noqa: E402
+    ai_tasks_for_session,
     classify,
     desktop_titles,
     find_in_progress_todo,
@@ -799,6 +800,13 @@ def _get_buckets() -> dict[str, list[dict]]:
             # never called TodoWrite. The Tasks tab consumes these.
             "todos": todos,
             "todo_summary": todo_sum,
+            # AI-derived task synthesis. Returns a status dict — may be
+            # "disabled"/"empty"/"computing"/"ok"/"stale"/"errored".
+            # Also triggers a background classification when all gates
+            # pass; harmless when AI tasks are off.
+            "ai_tasks": ai_tasks_for_session(
+                sid, full_path, meta, todos, bucket=bucket,
+            ),
         }
         buckets[bucket].append(row)
     return buckets
