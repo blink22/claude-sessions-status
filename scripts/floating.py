@@ -747,6 +747,13 @@ def _get_buckets() -> dict[str, list[dict]]:
         sid = s.get("sessionId") or ""
         bucket = "dormant" if is_dormant(sid, ago_s, live_ids, active_bucket) else active_bucket
         subs = subagents_for_session(full_path, now)
+        sub_sum = subagent_summary(subs)
+        # Promote to WORKING when any sub-agent is actively running, even
+        # if the parent transcript looks idle or dormant. Mirrors the
+        # override in dashboard.py:_prepare_row.
+        if sub_sum.get("running"):
+            bucket = "working"
+            state = "Working…"
         row = {
             "s": s,
             "meta": meta,
@@ -764,11 +771,11 @@ def _get_buckets() -> dict[str, list[dict]]:
             # Carry the resolved epoch so mark-as-read can persist it
             # without re-deriving from meta.
             "lastTurnEpoch": last_epoch,
-            # Sub-agents (Task-spawned children). Empty list for the
-            # majority of sessions; non-empty enables a chip on Focus
-            # density and an expanded list in Detail density.
+            # Sub-agents (Task-spawned children). The renderers only
+            # surface the actively-running ones; done/interrupted are
+            # carried in `subagents` but not displayed.
             "subagents": subs,
-            "subagent_summary": subagent_summary(subs),
+            "subagent_summary": sub_sum,
         }
         buckets[bucket].append(row)
     return buckets
@@ -833,24 +840,29 @@ def _build_session_block(row: dict, bucket_color, *, indent: str = "") -> NSAttr
                 _attr(f"{indent}   ↳ {snippet}\n", tiny, dim)
             )
 
-    # Sub-agent chip — one dim line below everything else when present.
-    sub_sum = row.get("subagent_summary") or {}
-    if sub_sum.get("total"):
-        chip_parts: list[str] = [
-            f"{sub_sum['total']} agent{'s' if sub_sum['total'] != 1 else ''}"
-        ]
-        if sub_sum.get("running"):
-            chip_parts.append(f"{sub_sum['running']} working")
-        if sub_sum.get("done"):
-            chip_parts.append(f"{sub_sum['done']} done")
-        if sub_sum.get("interrupted"):
-            chip_parts.append(f"{sub_sum['interrupted']} interrupted")
-        chip_text = f"{indent}   ↳ " + " · ".join(chip_parts) + "\n"
-        chip_color = (
-            NSColor.systemTealColor() if sub_sum.get("running") and hasattr(NSColor, "systemTealColor")
-            else dim
+    # One teal line per actively-running sub-agent below the card —
+    # "◐ <type> · <description>" using the .meta.json description as
+    # a brief. Done / interrupted children are hidden.
+    subs = row.get("subagents") or []
+    running_subs = [s for s in subs if s.get("state") == SUBAGENT_RUNNING]
+    if running_subs:
+        teal = (
+            NSColor.systemTealColor()
+            if hasattr(NSColor, "systemTealColor") else bucket_color
         )
-        out.appendAttributedString_(_attr(chip_text, tiny, chip_color))
+        shown = running_subs[:SUBAGENT_MAX_DISPLAY]
+        for sub in shown:
+            atype = (sub.get("agent_type") or "").strip()
+            desc = (sub.get("name") or "agent").strip()
+            if len(desc) > 100:
+                desc = desc[:99] + "…"
+            line = f"{indent}   ◐ {atype} · {desc}\n" if atype else f"{indent}   ◐ {desc}\n"
+            out.appendAttributedString_(_attr(line, tiny, teal))
+        extra = len(running_subs) - len(shown)
+        if extra > 0:
+            out.appendAttributedString_(
+                _attr(f"{indent}   + {extra} more working\n", tiny, dim)
+            )
 
     return out
 
@@ -1670,37 +1682,38 @@ class KanbanCardView(NSView):
                     NSForegroundColorAttributeName: label,
                 })
 
-        # Sub-agents chip — present on Focus + Detail densities when the
-        # session spawned children via the Task tool. Cyan-ish accent if
-        # one is still running, secondary otherwise. Detail mode below
-        # expands the chip into a per-agent list, so in Detail we promote
-        # the chip to a "N agents" header without the per-state counts
-        # (which the list then makes explicit).
+        # Sub-agents — Focus + Detail. One line per actively-running
+        # child sub-agent: "◐ <agent_type> · <description>". Done /
+        # interrupted children are intentionally hidden so the section
+        # only ever conveys "what's happening right now" — not history.
+        # When zero running, this block emits nothing regardless of how
+        # many have already finished.
         subs = row.get("subagents") or []
-        sub_sum = row.get("subagent_summary") or {}
-        sub_total = sub_sum.get("total", 0)
-        sub_running = sub_sum.get("running", 0)
-        if sub_total:
-            chip_parts: list[str] = [f"{sub_total} agent{'s' if sub_total != 1 else ''}"]
-            if density != "detail":
-                if sub_running:
-                    chip_parts.append(f"{sub_running} working")
-                if sub_sum.get("done"):
-                    chip_parts.append(f"{sub_sum['done']} done")
-                if sub_sum.get("interrupted"):
-                    chip_parts.append(f"{sub_sum['interrupted']} interrupted")
-            chip_text = "↳ " + " · ".join(chip_parts)
-            chip_color = (
-                NSColor.systemTealColor() if sub_running and hasattr(NSColor, "systemTealColor")
-                else (color if sub_running else secondary)
+        running_subs = [s for s in subs if s.get("state") == SUBAGENT_RUNNING]
+        if running_subs and density != "glance":
+            teal = (
+                NSColor.systemTealColor()
+                if hasattr(NSColor, "systemTealColor") else color or label
             )
-            add("\n\n", {NSFontAttributeName: tiny_spacer})
-            add(chip_text, {
-                NSFontAttributeName: meta_font,
-                NSForegroundColorAttributeName: chip_color,
-            })
+            shown = running_subs[:SUBAGENT_MAX_DISPLAY]
+            remaining = len(running_subs) - len(shown)
+            for sub in shown:
+                add("\n\n", {NSFontAttributeName: tiny_spacer})
+                atype = (sub.get("agent_type") or "").strip()
+                desc = _clip(sub.get("name") or "agent", 100)
+                line = f"◐ {atype} · {desc}" if atype else f"◐ {desc}"
+                add(line, {
+                    NSFontAttributeName: snippet_font,
+                    NSForegroundColorAttributeName: teal,
+                })
+            if remaining > 0:
+                add("\n\n", {NSFontAttributeName: tiny_spacer})
+                add(f"   + {remaining} more working", {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: tertiary,
+                })
 
-        # Detail only: user prompt → tools → cwd → sub-agent list
+        # Detail only: user prompt → tools → cwd
         # (Assistant snippet now lives in line 2 above.)
         if density == "detail":
             if user_prompt:
@@ -1731,36 +1744,6 @@ class KanbanCardView(NSView):
                     NSFontAttributeName: meta_font,
                     NSForegroundColorAttributeName: tertiary,
                 })
-            # One line per sub-agent (capped at SUBAGENT_MAX_DISPLAY).
-            # State icon → agent_type → description. Sorted most-recently-
-            # active first by the parser; we trust that ordering.
-            if subs:
-                state_icon = {
-                    SUBAGENT_RUNNING: "◐",
-                    SUBAGENT_DONE: "✓",
-                    SUBAGENT_INTERRUPTED: "⨯",
-                }
-                shown = subs[:SUBAGENT_MAX_DISPLAY]
-                remaining = len(subs) - len(shown)
-                for sub in shown:
-                    add("\n", {NSFontAttributeName: tiny_spacer})
-                    icon = state_icon.get(sub.get("state"), "·")
-                    atype = sub.get("agent_type") or ""
-                    desc = _clip(sub.get("name") or "", 80)
-                    line = f"{icon}  {atype} · {desc}" if atype else f"{icon}  {desc}"
-                    sub_color = (
-                        color if sub.get("state") == SUBAGENT_RUNNING else secondary
-                    )
-                    add(line, {
-                        NSFontAttributeName: snippet_font,
-                        NSForegroundColorAttributeName: sub_color,
-                    })
-                if remaining > 0:
-                    add("\n", {NSFontAttributeName: tiny_spacer})
-                    add(f"   +{remaining} more", {
-                        NSFontAttributeName: meta_font,
-                        NSForegroundColorAttributeName: tertiary,
-                    })
 
         # Footer (age) — Focus + Detail
         add("\n\n", {NSFontAttributeName: tiny_spacer})

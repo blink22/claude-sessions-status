@@ -1107,6 +1107,19 @@ def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> d
         bucket = BUCKET_DORMANT
 
     subs = subagents_for_session(full_path, now_ts)
+    sub_sum = subagent_summary(subs)
+
+    # If any sub-agent is actively running, the session as a whole is
+    # in-progress regardless of what the parent transcript's tail says.
+    # A parent often goes quiet waiting on its children; from the user's
+    # POV that's still WORKING. Override after the dormant check so this
+    # also rescues sessions whose parent file mtime is stale.
+    if sub_sum.get("running"):
+        bucket = BUCKET_WORKING
+        state = "Working…"
+        color = YELLOW
+        hint = ""  # the agent listing carries the "what's happening" signal
+
     return {
         "session": s,
         "meta": meta,
@@ -1124,29 +1137,39 @@ def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> d
         "sid_short": sid[:8],
         "gist": session_gist(s, meta, bucket=bucket) or "",
         "subagents": subs,
-        "subagent_summary": subagent_summary(subs),
+        "subagent_summary": sub_sum,
     }
 
 
-def _subagent_chip_plain(row: dict) -> str:
-    """Compact one-line chip describing the sub-agents under a session.
-    Returns "" if the session has no sub-agents.
+def _subagent_chip_lines(row: dict) -> list[str]:
+    """One plain-text line per actively-running sub-agent, summarizing
+    what it's doing (agent_type + meta.json description).
 
-    Format: "↳ 3 agents · 1 working · 2 done" — only non-zero counts
-    appear. Plain ASCII + an arrow glyph so terminal/menubar/popover can
-    all reuse the same string."""
-    summ = row.get("subagent_summary") or {}
-    total = summ.get("total", 0)
-    if not total:
-        return ""
-    parts: list[str] = [f"{total} agent{'s' if total != 1 else ''}"]
-    if summ.get("running"):
-        parts.append(f"{summ['running']} working")
-    if summ.get("done"):
-        parts.append(f"{summ['done']} done")
-    if summ.get("interrupted"):
-        parts.append(f"{summ['interrupted']} interrupted")
-    return "↳ " + " · ".join(parts)
+    Returns [] when no sub-agents are running — done/interrupted children
+    are intentionally invisible so the chip is purely a "right now"
+    signal. Capped at SUBAGENT_MAX_DISPLAY visible rows with a "+N more"
+    suffix line when exceeded.
+
+    Format per line: "◐ <agent_type> · <description>" — the leading
+    half-circle glyph mirrors the running state icon used in popover
+    Detail density, so the terminal/menubar/popover share a vocabulary."""
+    subs = row.get("subagents") or []
+    running = [s for s in subs if s.get("state") == SUBAGENT_RUNNING]
+    if not running:
+        return []
+    lines: list[str] = []
+    shown = running[:SUBAGENT_MAX_DISPLAY]
+    for sub in shown:
+        atype = (sub.get("agent_type") or "").strip()
+        desc = (sub.get("name") or "agent").strip()
+        if atype:
+            lines.append(f"◐ {atype} · {desc}")
+        else:
+            lines.append(f"◐ {desc}")
+    extra = len(running) - len(shown)
+    if extra > 0:
+        lines.append(f"+ {extra} more working")
+    return lines
 
 
 # ---------- list view (original layout) ----------
@@ -1186,13 +1209,11 @@ def render_list(rows: list[dict], width: int) -> str:
             parts.append(f"  📌 {BOLD}{gist}{RESET}\n")
         if action:
             parts.append(f"  {MAGENTA}↳{RESET} {DIM}{action}{RESET}\n")
-        chip = _subagent_chip_plain(r)
-        if chip:
-            # Cyan when something's still running (attention), dim when all
-            # terminal states. Either way the line stays compact.
-            running = (r.get("subagent_summary") or {}).get("running", 0)
-            chip_color = CYAN if running else DIM
-            parts.append(f"  {chip_color}{chip}{RESET}\n")
+        # One line per actively-running sub-agent, in cyan. Sessions with
+        # no running children render no chip at all — done/interrupted
+        # are intentionally hidden.
+        for chip_line in _subagent_chip_lines(r):
+            parts.append(f"  {CYAN}{chip_line}{RESET}\n")
         parts.append("\n")
     return "".join(parts)
 
@@ -1252,14 +1273,11 @@ def _kanban_card_lines(
     f4 = _clip_w(f4_plain, col_inner_w)
     lines.append(f"{DIM}{f4}{RESET}")
 
-    # Line 5 (optional) — sub-agent chip. Cyan when one is still running,
-    # dim otherwise. Skipped when the session has no sub-agents.
-    chip_plain = _subagent_chip_plain(r)
-    if chip_plain:
-        running = (r.get("subagent_summary") or {}).get("running", 0)
-        chip_clipped = _clip_w(chip_plain, col_inner_w)
-        chip_color = CYAN if running else DIM
-        lines.append(f"{chip_color}{chip_clipped}{RESET}")
+    # Lines 5+ (optional) — one cyan row per actively-running sub-agent
+    # ("◐ <type> · <description>"), plus a "+N more working" suffix if
+    # capped. Skipped entirely when zero sub-agents are running.
+    for chip_line in _subagent_chip_lines(r):
+        lines.append(f"{CYAN}{_clip_w(chip_line, col_inner_w)}{RESET}")
 
     return lines
 
