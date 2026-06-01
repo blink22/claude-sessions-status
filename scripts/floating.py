@@ -168,15 +168,214 @@ POPOVER_KANBAN_SIZE = (720.0, 480.0)
 # sessions render as a 4th column on the right. The popover widens
 # to give that column room without squeezing the other three.
 POPOVER_KANBAN_WITH_DORMANT_SIZE = (940.0, 480.0)
-# Tasks view: a per-session vertical list of TodoWrite todos with
-# running sub-agents nested under the in_progress todo. Wider than
-# list view to fit todo text + indented sub-agent rows.
-POPOVER_TASKS_SIZE = (480.0, 480.0)
-# AI Tasks view: per-session AI-derived tasks with rich summaries +
-# confidence + evidence quotes. Wider than Tasks to fit prose-y rows.
-POPOVER_AI_TASKS_SIZE = (520.0, 520.0)
+# AI Tasks view: kanban layout (Pending | In Progress | Completed),
+# aggregating across all sessions. Wider than the session kanban
+# because each card carries an extra "from: <session>" line plus
+# (for in_progress) nested running sub-agents.
+POPOVER_AI_TASKS_SIZE = (1020.0, 560.0)
 
-POPOVER_MODES = ("list", "kanban", "tasks", "ai")
+POPOVER_MODES = ("list", "kanban", "ai")
+
+# AI tab sub-mode: group tasks by status (kanban) or by source session
+# (vertical list). Persisted across launches.
+AI_GROUP_MODE_FILE = HOME / ".claude-sessions-status-ai-group-mode"
+AI_GROUP_MODES = ("status", "session")
+
+
+def _read_ai_group_mode() -> str:
+    try:
+        v = AI_GROUP_MODE_FILE.read_text(encoding="utf-8").strip()
+        if v in AI_GROUP_MODES:
+            return v
+    except OSError:
+        pass
+    return "status"
+
+
+def _write_ai_group_mode(mode: str) -> None:
+    if mode not in AI_GROUP_MODES:
+        return
+    _atomic_write_text(AI_GROUP_MODE_FILE, mode)
+
+
+# ---------- User status overrides for AI targets ----------
+# Haiku assigns a status to each target based on conversation context.
+# The user can override that status — and crucially, the override
+# WINS for rendering purposes. This is how the "→ pending / → in
+# progress / → done" links work: each click writes a new override,
+# and the effective-status projection returns the override instead
+# of Haiku's vote.
+#
+# Cache shape:
+#   {<session_id>: {<task_key>: {"status_override": str, "ts": float}}}
+# Legacy entries with {"confirmed": True, ...} are migrated on read
+# to the new shape (confirmed=true ⇒ status_override="completed").
+# task_key is a sha1 of the normalized title.
+AI_TASK_CONFIRMS_FILE = HOME / ".claude-sessions-status-ai-task-confirms.json"
+AI_TASK_USER_STATUSES = ("pending", "in_progress", "completed")
+
+
+def _task_confirm_key(title: str) -> str:
+    """Stable-ish key for a task. Lower-case, whitespace-collapsed,
+    sha1-prefixed. Same input → same key across runs."""
+    import hashlib
+    norm = " ".join((title or "").lower().split())
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12]
+
+
+def _load_task_confirms() -> dict:
+    """Load the user-status-overrides file. Legacy entries with
+    `confirmed: true` are migrated in-place to `status_override:
+    "completed"` so older installs keep working."""
+    try:
+        if AI_TASK_CONFIRMS_FILE.exists():
+            data = json.loads(AI_TASK_CONFIRMS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                # In-memory migration: legacy `confirmed: true` becomes
+                # an explicit `status_override: "completed"`. Doesn't
+                # rewrite the file — next write does that.
+                for sess in data.values():
+                    if not isinstance(sess, dict):
+                        continue
+                    for entry in sess.values():
+                        if (
+                            isinstance(entry, dict)
+                            and entry.get("confirmed")
+                            and not entry.get("status_override")
+                        ):
+                            entry["status_override"] = "completed"
+                return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save_task_status_override(
+    session_id: str, task_key: str, new_status: str,
+) -> None:
+    """Persist a user-chosen status override for one target. `new_status`
+    must be one of AI_TASK_USER_STATUSES. Atomic write."""
+    if not session_id or not task_key:
+        return
+    if new_status not in AI_TASK_USER_STATUSES:
+        return
+    data = _load_task_confirms()
+    sess = data.get(session_id) or {}
+    entry = sess.get(task_key) or {}
+    entry["status_override"] = new_status
+    entry["ts"] = time.time()
+    # Keep the legacy `confirmed` field in sync so any external tools
+    # reading the old shape continue to work.
+    entry["confirmed"] = (new_status == "completed")
+    sess[task_key] = entry
+    data[session_id] = sess
+    try:
+        tmp = AI_TASK_CONFIRMS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=0), encoding="utf-8")
+        os.replace(tmp, AI_TASK_CONFIRMS_FILE)
+    except OSError as e:
+        sys.stderr.write(f"[_save_task_status_override] {e!r}\n")
+
+
+def _save_task_confirm(session_id: str, task_key: str) -> None:
+    """Back-compat shim — still used by the cssconfirm:// link handler.
+    Equivalent to overriding status to 'completed'."""
+    _save_task_status_override(session_id, task_key, "completed")
+
+
+def _user_status_override(
+    confirms: dict, session_id: str, title: str,
+) -> str | None:
+    """Return the user's explicit status override for this target, or
+    None if the user hasn't moved it. Honors both the new
+    status_override field and the legacy confirmed=true bool."""
+    sess = confirms.get(session_id) or {}
+    entry = sess.get(_task_confirm_key(title)) or {}
+    override = entry.get("status_override")
+    if override in AI_TASK_USER_STATUSES:
+        return override
+    if entry.get("confirmed"):
+        return "completed"
+    return None
+
+
+def _is_task_confirmed(confirms: dict, session_id: str, title: str) -> bool:
+    """Back-compat: True when the user has marked this target completed."""
+    return _user_status_override(confirms, session_id, title) == "completed"
+
+
+# Effective task statuses include an intermediate "awaiting_confirm"
+# bucket that's visualized in the IN PROGRESS column but rendered with
+# a confirmation affordance. The raw Haiku status is unchanged on disk
+# — this is a view-time projection.
+AI_TASK_AWAITING = "awaiting_confirm"
+
+
+# ---------- AI task manual merges ----------
+# When Haiku over-fragments work into 2-3 similar cards, the title
+# similarity dedup catches most cases automatically. For the rest, the
+# user can click "↑ merge above" on any card whose previous card in
+# the same column is from the same session. The override is persisted
+# here keyed by source-task-key → target-task-key.
+AI_TASK_MERGES_FILE = HOME / ".claude-sessions-status-ai-task-merges.json"
+
+
+def _load_task_merges() -> dict:
+    try:
+        if AI_TASK_MERGES_FILE.exists():
+            data = json.loads(AI_TASK_MERGES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save_task_merge(session_id: str, src_key: str, dst_key: str) -> None:
+    """Record that src_key is the same task as dst_key — src will hide
+    on subsequent renders. Atomic write."""
+    if not session_id or not src_key or not dst_key or src_key == dst_key:
+        return
+    data = _load_task_merges()
+    sess = data.get(session_id) or {}
+    sess[src_key] = {"merged_into": dst_key, "ts": time.time()}
+    data[session_id] = sess
+    try:
+        tmp = AI_TASK_MERGES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=0), encoding="utf-8")
+        os.replace(tmp, AI_TASK_MERGES_FILE)
+    except OSError as e:
+        sys.stderr.write(f"[_save_task_merge] {e!r}\n")
+
+
+def _is_task_merged(merges: dict, session_id: str, title: str) -> bool:
+    """True when this task has been manually merged into another card
+    and should be suppressed from rendering."""
+    return _task_confirm_key(title) in (merges.get(session_id) or {})
+
+
+def _effective_task_status(raw_status: str, user_override) -> str:
+    """Resolve the user-visible target status.
+
+    - User has an explicit status override → that status wins. Any of
+      pending / in_progress / completed can be user-chosen — this is
+      what powers the "→ pending / → in progress / → done" status-move
+      links on each card.
+    - Haiku voted "completed" but the user hasn't acted → AI_TASK_AWAITING
+      (renders in In Progress with a ✓ confirm link).
+    - Otherwise → pass through Haiku's raw status.
+
+    `user_override` accepts a status string (new shape) or any truthy
+    non-string (legacy bool, treated as a "completed" override) — so
+    callers that still pass `confirmed: bool` keep working.
+    """
+    if isinstance(user_override, str) and user_override in AI_TASK_USER_STATUSES:
+        return user_override
+    if user_override:
+        return "completed"
+    if raw_status == "completed":
+        return AI_TASK_AWAITING
+    return raw_status or "pending"
 
 
 def _read_popover_mode() -> str:
@@ -184,6 +383,10 @@ def _read_popover_mode() -> str:
         v = POPOVER_MODE_FILE.read_text(encoding="utf-8").strip()
         if v in POPOVER_MODES:
             return v
+        # Migration from v0.4/v0.5: the "tasks" tab was removed in favour
+        # of the AI tab (which now mirrors TodoWrite + classifier output).
+        if v == "tasks":
+            return "ai"
     except OSError:
         pass
     return "list"
@@ -542,6 +745,15 @@ COLOR_HEX = {
     "dormant": "#6e7681",
 }
 BUCKET_ORDER = ("needs", "working", "ready", "dormant")
+# Human-facing labels for session buckets. Used on AI tab cards next
+# to the session name so the user can see at a glance which sessions
+# their AI tasks belong to and what state those sessions are in.
+BUCKET_LABEL = {
+    "needs":   "NEEDS YOU",
+    "working": "WORKING",
+    "ready":   "FINISHED",
+    "dormant": "DORMANT",
+}
 
 
 # ---------- Helpers ----------
@@ -1883,6 +2095,19 @@ class _FirstMouseButton(NSButton):
         return True
 
 
+class _FirstMouseTextView(NSTextView):
+    """NSTextView that activates link clicks on the first mouse-down
+    even when its window isn't key. Default NSTextView in an inactive
+    popover consumes the first click as a focus event, only
+    forwarding the SECOND click to `textView:clickedOnLink:atIndex:`.
+    Returning True from acceptsFirstMouse_ skips that intermediate
+    focus step so the user's first click on a "✓ mark done" link
+    activates it immediately."""
+
+    def acceptsFirstMouse_(self, _event):
+        return True
+
+
 class KanbanColumnDocView(NSView):
     """Flipped NSView used as the document view of each kanban
     NSScrollView. We lay subviews out top-to-bottom manually rather
@@ -1912,6 +2137,17 @@ class PopoverVC(NSViewController):
     # where "stack" holds the KanbanCardView subviews and "header" is
     # the NSTextField at the top of the column. Rebuilt on every refresh.
     kanban_columns = objc.ivar("kanban_columns")
+    # AI Tasks kanban: simpler than the session kanban — 3 NSScrollViews
+    # each with an NSTextView rendering tasks-for-one-status. Tasks are
+    # not interactive (no click-to-jump in v1), so attributed strings
+    # are enough; we don't need KanbanCardView instances.
+    ai_kanban_stack = objc.ivar("ai_kanban_stack")
+    ai_kanban_columns = objc.ivar("ai_kanban_columns")
+    # AI tab sub-mode: "status" (3-column kanban) or "session" (vertical
+    # list grouped by source session). Visible-only-in-AI-mode top-bar
+    # segmented control toggles it.
+    ai_group_mode = objc.ivar("ai_group_mode")
+    ai_group_seg = objc.ivar("ai_group_seg")
     popover_ref = objc.ivar("popover_ref")    # NSPopover, set by BadgeController
     last_rendered_rows = objc.ivar("last_rendered_rows")  # for mark-all-read
     show_dormant = objc.ivar("show_dormant")   # bool — toggle to hide dormant
@@ -1941,10 +2177,11 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _load_view_safely(self):
-        # Restore last-used mode + density + show_dormant.
+        # Restore last-used mode + density + show_dormant + ai-group.
         self.mode = _read_popover_mode()
         self.density = _read_density()
         self.show_dormant = _read_show_dormant()
+        self.ai_group_mode = _read_ai_group_mode()
         # The dormant column adds a 4th lane in kanban → wider popover.
         size = (
             POPOVER_KANBAN_WITH_DORMANT_SIZE
@@ -1965,32 +2202,28 @@ class PopoverVC(NSViewController):
                 NSColor.windowBackgroundColor().CGColor()
             )
 
-        # ---- Top bar: segmented control (List | Kanban | Tasks | AI) ----
-        # 4 segments, centered. "AI" stays a 2-char label so the control
-        # fits in the narrowest popover (List mode, 360pt) without
-        # colliding with the density popup (left) or the dormant toggle
-        # (right). The Tasks tab mirrors TodoWrite literally; the AI tab
-        # is Haiku-derived synthesis over the conversation.
+        # ---- Top bar: segmented control (List | Kanban | Tasks) ----
+        # 3 segments, centered. The Tasks tab is the Haiku-classified
+        # task view (the mode key still persists as "ai" on disk for
+        # back-compat — only the label changed).
         TOP_BAR_HEIGHT = 32.0
         seg = NSSegmentedControl.alloc().init()
-        seg.setSegmentCount_(4)
+        seg.setSegmentCount_(3)
         seg.setLabel_forSegment_("List", 0)
         seg.setLabel_forSegment_("Kanban", 1)
         seg.setLabel_forSegment_("Tasks", 2)
-        seg.setLabel_forSegment_("AI", 3)
         seg.setSegmentStyle_(NSSegmentStyleAutomatic)
         seg.setTrackingMode_(NSSegmentSwitchTrackingSelectOne)
         seg.setSelectedSegment_(
             0 if self.mode == "list"
             else 1 if self.mode == "kanban"
-            else 2 if self.mode == "tasks"
-            else 3
+            else 2
         )
         seg.setTarget_(self)
         seg.setAction_("segmentChanged:")
-        # Center the 4-segment control horizontally. ~210pt fits 4 labels
-        # at the system default font without truncation.
-        seg_w = 210.0
+        # Center the 3-segment control horizontally. ~175pt to fit the
+        # "Tasks" label comfortably alongside Kanban + List.
+        seg_w = 175.0
         seg.setFrame_(NSMakeRect((w - seg_w) / 2, h - TOP_BAR_HEIGHT + 4, seg_w, 22))
         seg.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin)
         container.addSubview_(seg)
@@ -2036,6 +2269,34 @@ class PopoverVC(NSViewController):
         container.addSubview_(dormant_btn)
         self.dormant_btn = dormant_btn
 
+        # ---- Top bar (right, AI mode only): "Group by" toggle ----
+        # 2-segment control switching the AI tab between status-kanban
+        # and per-session grouped list. Visible only when mode == "ai";
+        # we toggle setHidden_ from segmentChanged_ alongside the
+        # dormant_btn (which is kanban-only).
+        ai_group_seg = NSSegmentedControl.alloc().init()
+        ai_group_seg.setSegmentCount_(2)
+        ai_group_seg.setLabel_forSegment_("By status", 0)
+        ai_group_seg.setLabel_forSegment_("By session", 1)
+        ai_group_seg.setSegmentStyle_(NSSegmentStyleAutomatic)
+        ai_group_seg.setTrackingMode_(NSSegmentSwitchTrackingSelectOne)
+        ai_group_seg.setSelectedSegment_(
+            0 if self.ai_group_mode == "status" else 1,
+        )
+        ai_group_seg.setTarget_(self)
+        ai_group_seg.setAction_("aiGroupChanged:")
+        ag_w = 165.0
+        ai_group_seg.setFrame_(NSMakeRect(
+            w - ag_w - 12,
+            h - TOP_BAR_HEIGHT + 4,
+            ag_w, 22,
+        ))
+        ai_group_seg.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+        # Hidden by default — only visible when AI mode is active.
+        ai_group_seg.setHidden_(self.mode != "ai")
+        container.addSubview_(ai_group_seg)
+        self.ai_group_seg = ai_group_seg
+
         # ---- Top bar (right, kanban only): "Mark all N read" button ----
         # Hidden in list mode (which already has an inline footer link
         # inside the NSTextView) and when there are zero unreads. We
@@ -2074,7 +2335,9 @@ class PopoverVC(NSViewController):
         # Build BOTH layouts upfront; only the current one is in the host.
         self._build_list_views()
         self._build_kanban_views()
+        self._build_ai_kanban_views()
         self._install_layout()
+        self._sync_topbar_visibility()
 
         self.setView_(container)
 
@@ -2180,10 +2443,84 @@ class PopoverVC(NSViewController):
         self.kanban_footer = None
 
     @objc.python_method
+    def _build_ai_kanban_views(self):
+        """3-column kanban for AI tasks (Pending | In Progress | Completed).
+        Aggregates tasks across all sessions. Each column is an NSScrollView
+        wrapping an NSTextView with an attributed string — much simpler
+        than the session kanban (which uses interactive KanbanCardView
+        instances). AI task cards are non-interactive in v1."""
+        host_bounds = self.content_host.bounds()
+        if host_bounds.size.width < 10:
+            host_bounds = NSMakeRect(
+                0, 0, POPOVER_AI_TASKS_SIZE[0], POPOVER_AI_TASKS_SIZE[1] - 32,
+            )
+
+        stack = NSStackView.alloc().initWithFrame_(host_bounds)
+        stack.setOrientation_(NS_USER_INTERFACE_LAYOUT_ORIENTATION_HORIZONTAL)
+        stack.setSpacing_(8.0)
+        stack.setDistribution_(NS_STACK_VIEW_DISTRIBUTION_FILL_EQUALLY)
+        stack.setEdgeInsets_((4.0, 6.0, 4.0, 6.0))
+        stack.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+
+        col_w0 = max(1.0, (host_bounds.size.width - 32) / 3.0)
+        col_h0 = max(1.0, host_bounds.size.height - 8)
+
+        # Order: Pending → In Progress → Completed. Reads left-to-right
+        # like a real kanban: queue, active work, archive. The middle
+        # column is the focus (where running sub-agents nest) which
+        # mirrors most physical kanbans where "Doing" sits between
+        # "To Do" and "Done".
+        columns: list[dict] = []
+        for status in ("pending", "in_progress", "completed"):
+            col_scroll = NSScrollView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, col_w0, col_h0),
+            )
+            col_scroll.setHasVerticalScroller_(True)
+            col_scroll.setHasHorizontalScroller_(False)
+            col_scroll.setBorderType_(0)
+            col_scroll.setDrawsBackground_(False)
+            col_scroll.setAutoresizingMask_(
+                NSViewWidthSizable | NSViewHeightSizable,
+            )
+
+            # _FirstMouseTextView lets the very first click on a link
+            # activate it — otherwise a popover that just opened
+            # consumes the first click as a window-focus event.
+            tv = _FirstMouseTextView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, col_w0, col_h0),
+            )
+            tv.setEditable_(False)
+            tv.setSelectable_(True)
+            tv.setRichText_(True)
+            tv.setHorizontallyResizable_(False)
+            tv.setVerticallyResizable_(True)
+            tv.setAutoresizingMask_(NSViewWidthSizable)
+            tv.textContainer().setWidthTracksTextView_(True)
+            tv.setDrawsBackground_(False)
+            tv.setTextContainerInset_(NSMakeSize(8, 8))
+
+            col_scroll.setDocumentView_(tv)
+            stack.addArrangedSubview_(col_scroll)
+            # Hook the delegate so cssconfirm:// and cssmerge:// link
+            # clicks route through textView_clickedOnLink_atIndex_.
+            # The same handler already serves the list_scroll for
+            # cssread:// — we just add the new URL schemes there.
+            tv.setDelegate_(self)
+
+            columns.append({
+                "status": status,
+                "scroll": col_scroll,
+                "tv": tv,
+            })
+
+        self.ai_kanban_stack = stack
+        self.ai_kanban_columns = columns
+
+    @objc.python_method
     def _install_layout(self):
         """Swap whichever content view is in the host based on self.mode.
-        Tasks mode reuses the list_scroll surface (single NSTextView) —
-        only the attributed-string builder differs."""
+        AI mode always uses the 3-column kanban — the by-session toggle
+        only changes how tasks group WITHIN each column, not the layout."""
         if self.content_host is None:
             return
         for sub in list(self.content_host.subviews()):
@@ -2191,16 +2528,17 @@ class PopoverVC(NSViewController):
         if self.mode == "kanban":
             self.kanban_stack.setFrame_(self.content_host.bounds())
             self.content_host.addSubview_(self.kanban_stack)
+        elif self.mode == "ai":
+            self.ai_kanban_stack.setFrame_(self.content_host.bounds())
+            self.content_host.addSubview_(self.ai_kanban_stack)
         else:
-            # Both "list" and "tasks" render into list_scroll.
+            # "list" renders into list_scroll.
             self.list_scroll.setFrame_(self.content_host.bounds())
             self.content_host.addSubview_(self.list_scroll)
 
     @objc.python_method
     def _target_popover_size(self) -> tuple:
         """Pick the right popover (w, h) for the current mode + toggle."""
-        if self.mode == "tasks":
-            return POPOVER_TASKS_SIZE
         if self.mode == "ai":
             return POPOVER_AI_TASKS_SIZE
         if self.mode != "kanban":
@@ -2261,7 +2599,6 @@ class PopoverVC(NSViewController):
             new_mode = (
                 "list" if idx == 0
                 else "kanban" if idx == 1
-                else "tasks" if idx == 2
                 else "ai"
             )
             if new_mode == self.mode:
@@ -2269,12 +2606,42 @@ class PopoverVC(NSViewController):
             self.mode = new_mode
             _write_popover_mode(new_mode)
             self._apply_popover_size()
+            self._sync_topbar_visibility()
             self._install_layout()
             self.refresh()
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[segmentChanged_] {e!r}\n")
             import traceback
             traceback.print_exc(file=sys.stderr)
+
+    def aiGroupChanged_(self, sender):
+        """Handle the AI-tab 'By status' / 'By session' toggle. Only
+        meaningful when self.mode == 'ai'; the segmented control is
+        hidden otherwise so this handler can only fire then."""
+        try:
+            new_group = "status" if sender.selectedSegment() == 0 else "session"
+            if new_group == self.ai_group_mode:
+                return
+            self.ai_group_mode = new_group
+            _write_ai_group_mode(new_group)
+            self._install_layout()
+            self.refresh()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[aiGroupChanged_] {e!r}\n")
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+
+    @objc.python_method
+    def _sync_topbar_visibility(self):
+        """Mode-dependent visibility for the right-corner widgets.
+        Dormant checkbox is meaningful in list/kanban/tasks; AI-group
+        segmented is meaningful only in AI mode. They share the same
+        right-edge slot."""
+        is_ai = self.mode == "ai"
+        if self.ai_group_seg is not None:
+            self.ai_group_seg.setHidden_(not is_ai)
+        if self.dormant_btn is not None:
+            self.dormant_btn.setHidden_(is_ai)
 
     def toggleDormant_(self, sender):
         """Flip whether dormant sessions are shown in the popover. In
@@ -2351,8 +2718,6 @@ class PopoverVC(NSViewController):
 
         if self.mode == "kanban":
             self._render_kanban(buckets)
-        elif self.mode == "tasks":
-            self._render_tasks(buckets)
         elif self.mode == "ai":
             self._render_ai_tasks(buckets)
         else:
@@ -2374,95 +2739,580 @@ class PopoverVC(NSViewController):
         self._update_mark_all_button()
 
     @objc.python_method
-    def _render_tasks(self, buckets):
-        """Build the Tasks tab — per-session vertical list of TodoWrite
-        todos, with running sub-agents nested under the in_progress todo."""
-        if self.list_text_view is None:
-            return
-        mas = self._build_tasks_attributed(buckets)
-        self.list_text_view.textStorage().setAttributedString_(mas)
-        # Hide the kanban-only "Mark all read" button while in Tasks mode.
-        self._update_mark_all_button()
-
-    @objc.python_method
     def _render_ai_tasks(self, buckets):
-        """Build the AI tab — Haiku-derived per-session task synthesis.
-        Distinct from Tasks: tasks here are inferred from the
-        conversation, not mirrored from TodoWrite."""
-        if self.list_text_view is None:
+        """Build the AI tab — Haiku-derived task synthesis.
+
+        Always a 3-column kanban (Pending | In Progress | Completed).
+        The `ai_group_mode` toggle controls WITHIN-column grouping:
+          - "status"  → tasks listed flat, sorted by recency
+          - "session" → tasks grouped under per-session sub-headers,
+                        sessions ordered by recency
+
+        The Haiku classifier infers status from conversation context;
+        the layout just visualizes the same decision two ways."""
+        ai_enabled = bool(os.environ.get("ANTHROPIC_API_KEY")) and (
+            os.environ.get("CLAUDE_SESSIONS_AI_TASKS", "").strip()
+            in ("1", "true", "yes", "on")
+        )
+
+        # Aggregate tasks across sessions.
+        flat_rows: list = []
+        for k in ("needs", "working", "ready", "dormant"):
+            flat_rows.extend(buckets.get(k) or [])
+        # Effective status buckets — Haiku-marked "completed" tasks land
+        # in the in_progress column UNTIL the user explicitly confirms
+        # them. The awaiting bucket sits inside in_progress visually.
+        aggregated: dict[str, list[dict]] = {
+            "in_progress": [], "pending": [], "completed": [],
+        }
+        any_classified = False
+        any_computing = False
+        confirms = _load_task_confirms()
+        merges = _load_task_merges()
+        for r in flat_rows:
+            ai = r.get("ai_tasks") or {}
+            status = ai.get("status") or ""
+            if status == "computing":
+                any_computing = True
+            if ai.get("classified_ts"):
+                any_classified = True
+            sid = (r.get("s") or {}).get("sessionId") or ""
+            # Pull this session's actively-running sub-agents up front so
+            # the in_progress task that "owns" them can render them
+            # nested. We only show RUNNING ones — done/interrupted are
+            # invisible here (mirrors the v0.3 design across surfaces).
+            running_subs_for_session = [
+                sa for sa in (r.get("subagents") or [])
+                if sa.get("state") == SUBAGENT_RUNNING
+            ]
+            for task in (ai.get("tasks") or []):
+                # Manually-merged tasks are fully hidden — the user has
+                # told us this is a duplicate of another card.
+                if _is_task_merged(merges, sid, task.get("title") or ""):
+                    continue
+                raw_status = task.get("status") or "pending"
+                override = _user_status_override(
+                    confirms, sid, task.get("title") or "",
+                )
+                eff_status = _effective_task_status(raw_status, override)
+                # Awaiting-confirm tasks go into the in_progress column
+                # but render with a different visual treatment.
+                column = (
+                    "in_progress" if eff_status == AI_TASK_AWAITING
+                    else eff_status
+                )
+                if column not in aggregated:
+                    continue
+                aggregated[column].append({
+                    **task,
+                    "_session_title": r.get("title") or "(untitled)",
+                    "_session_id": sid,
+                    "_session_bucket": r.get("bucket") or "",
+                    "_session_ago_s": r.get("ago_s") or 0,
+                    "_classified_ts": ai.get("classified_ts") or 0,
+                    "_effective_status": eff_status,
+                    # Running sub-agents are carried on every in_progress
+                    # task initially; we dedupe to one task per session
+                    # below so the same agents don't duplicate across
+                    # cards.
+                    "_running_subagents": (
+                        running_subs_for_session
+                        if eff_status == "in_progress" else []
+                    ),
+                })
+
+        # Empty-state fallback uses list_scroll instead of kanban —
+        # swap layouts before drawing.
+        is_empty = (
+            not ai_enabled
+            or (not any_classified and not any_computing)
+            or sum(len(v) for v in aggregated.values()) == 0
+        )
+        if is_empty:
+            self._swap_to_list_scroll_for_ai_empty_state(
+                ai_enabled, any_computing,
+            )
             return
-        mas = self._build_ai_tasks_attributed(buckets)
-        self.list_text_view.textStorage().setAttributedString_(mas)
+
+        # Make sure the kanban stack is in the host (the user might have
+        # been on a list-style empty state moments ago).
+        self._ensure_ai_kanban_in_host()
+
+        # Sort and render each column.
+        # In Progress: most-recently-active session first.
+        aggregated["in_progress"].sort(key=lambda t: t["_session_ago_s"])
+        # If a session has >1 in_progress task, only the FIRST (most
+        # recent, after the sort above) keeps its running sub-agents —
+        # otherwise the same agents would duplicate across cards. Done
+        # post-sort because "first" depends on display order.
+        _seen_sub_sessions: set = set()
+        for t in aggregated["in_progress"]:
+            sid = t.get("_session_id") or ""
+            if sid in _seen_sub_sessions:
+                t["_running_subagents"] = []
+            else:
+                _seen_sub_sessions.add(sid)
+        # Pending: same — surface tasks from sessions you're actively working in.
+        aggregated["pending"].sort(key=lambda t: t["_session_ago_s"])
+        # Completed: most-recently-classified first (so finishes show up
+        # at the top, drift down over time). Cap to avoid an unbounded
+        # accumulator. When grouping by session, ALSO secondary-sort by
+        # session recency so same-session tasks cluster — otherwise the
+        # session-header dividers would fire on every other card.
+        grouping = (self.ai_group_mode == "session")
+        if grouping:
+            aggregated["completed"].sort(
+                key=lambda t: (
+                    t.get("_session_ago_s") or 0,
+                    -(t.get("_classified_ts") or 0),
+                ),
+            )
+        else:
+            aggregated["completed"].sort(
+                key=lambda t: -(t["_classified_ts"] or 0),
+            )
+        COMPLETED_CAP = 15
+        completed_total = len(aggregated["completed"])
+        aggregated["completed"] = aggregated["completed"][:COMPLETED_CAP]
+
+        sync_text = self._ai_kanban_sync_text(flat_rows)
+
+        for col in (self.ai_kanban_columns or []):
+            status = col["status"]
+            tasks = aggregated.get(status) or []
+            extra_count = (
+                completed_total - len(tasks)
+                if status == "completed" else 0
+            )
+            mas = self._build_ai_kanban_column_attributed(
+                status, tasks, sync_text if status == "in_progress" else None,
+                any_computing if status == "in_progress" else False,
+                extra_count,
+                group_by_session=(self.ai_group_mode == "session"),
+            )
+            tv = col["tv"]
+            if tv is not None:
+                tv.textStorage().setAttributedString_(mas)
+
         self._update_mark_all_button()
 
     @objc.python_method
-    def _build_ai_tasks_attributed(self, buckets):
-        """Render the AI tab as an attributed string. The visual
-        differentiator from Tasks: a "✨ AI-detected" header chip, plus
-        a purple-tinted in_progress glyph and an optional "·NN%"
-        confidence suffix when confidence < 0.9. Status icons (○ ◐ ✓)
-        remain identical to Tasks so the user doesn't relearn a
-        vocabulary."""
-        title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
-        task_font = NSFont.systemFontOfSize_(12)
-        summary_font = NSFont.systemFontOfSize_(11)
-        meta_font = _rounded_tabular_font(11, NSFontWeightRegular)
+    def _ensure_ai_kanban_in_host(self):
+        """If the empty-state code path swapped in list_scroll, swap
+        the AI kanban back into the content host."""
+        if self.content_host is None or self.ai_kanban_stack is None:
+            return
+        current = list(self.content_host.subviews())
+        if self.ai_kanban_stack in current:
+            return
+        for sub in current:
+            sub.removeFromSuperview()
+        self.ai_kanban_stack.setFrame_(self.content_host.bounds())
+        self.content_host.addSubview_(self.ai_kanban_stack)
+
+    @objc.python_method
+    def _swap_to_list_scroll_for_ai_empty_state(self, ai_enabled, any_computing):
+        """Empty-state copy renders into the single list_scroll text
+        view — kanban with three empty columns would feel worse than
+        a centered call-to-action."""
+        if self.content_host is None or self.list_scroll is None:
+            return
+        current = list(self.content_host.subviews())
+        if self.list_scroll not in current:
+            for sub in current:
+                sub.removeFromSuperview()
+            self.list_scroll.setFrame_(self.content_host.bounds())
+            self.content_host.addSubview_(self.list_scroll)
+        if self.list_text_view is None:
+            return
+        mas = self._build_ai_tasks_empty_state(ai_enabled, any_computing)
+        self.list_text_view.textStorage().setAttributedString_(mas)
+
+    @objc.python_method
+    def _ai_kanban_sync_text(self, flat_rows) -> str:
+        """Compute the header string "synced Xs ago · triggered by: …".
+
+        The trigger prompt comes from the session whose classification
+        is the most recent — that session almost always drove the
+        most-recent visible change. Showing it makes "the list just
+        moved" feel explained instead of mysterious.
+        """
+        latest = 0.0
+        trigger = ""
+        for r in flat_rows:
+            ai = r.get("ai_tasks") or {}
+            ts = ai.get("classified_ts") or 0
+            if ts > latest:
+                latest = ts
+                trigger = (ai.get("trigger_prompt") or "").strip()
+        if not latest:
+            return ""
+        age = format_ago(max(0.0, time.time() - latest))
+        if trigger:
+            # Truncate aggressively — header should stay one line.
+            t = trigger if len(trigger) <= 60 else trigger[:59] + "…"
+            return f"synced {age} · triggered by: “{t}”"
+        return f"synced {age}"
+
+    @objc.python_method
+    def _build_ai_kanban_column_attributed(
+        self, status, tasks, sync_text, any_computing, extra_count,
+        group_by_session=False,
+    ):
+        """Build the attributed string for ONE kanban column.
+
+        When `group_by_session` is False (default): tasks render as flat
+        cards, each with its own session subtitle below the task title.
+
+        When True: tasks are grouped under per-session sub-headers in
+        the column. The session header (bold name + colored bucket pill)
+        appears once per group, and individual task cards drop their
+        session subtitle to avoid repetition. Sessions are ordered by
+        recency (newest activity first)."""
+        title_font = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
+        task_title_font = NSFont.systemFontOfSize_weight_(12, NSFontWeightSemibold)
+        task_body_font = NSFont.systemFontOfSize_(11)
+        meta_font = _rounded_tabular_font(10, NSFontWeightRegular)
         label = NSColor.labelColor()
         secondary = NSColor.secondaryLabelColor()
         tertiary = NSColor.tertiaryLabelColor()
-        # The "AI tint" — system purple at 0.85, falling back to label
-        # color on systems that don't expose systemPurpleColor.
+        purple = (
+            NSColor.systemPurpleColor()
+            if hasattr(NSColor, "systemPurpleColor") else NSColor.labelColor()
+        )
+
+        # Per-column visual tints.
+        col_meta = {
+            "in_progress": {"icon": "◐",  "label": "IN PROGRESS",  "color": purple},
+            "pending":     {"icon": "○",  "label": "PENDING",      "color": tertiary},
+            "completed":   {"icon": "✓",  "label": "COMPLETED",    "color": secondary},
+        }[status]
+
+        out = NSMutableAttributedString.alloc().init()
+        def add(text, attrs):
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+            )
+
+        # Header line: "◐ IN PROGRESS (3)"
+        header_count = len(tasks) + (extra_count or 0)
+        add(f"{col_meta['icon']}  {col_meta['label']} ({header_count})", {
+            NSFontAttributeName: title_font,
+            NSForegroundColorAttributeName: col_meta["color"],
+        })
+        if sync_text:
+            add(f"   {sync_text}", {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: tertiary,
+            })
+        if any_computing:
+            add("   classifying…", {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: purple,
+            })
+        add("\n", {NSFontAttributeName: title_font})
+
+        # Thin separator below header.
+        add("─" * 40, {
+            NSFontAttributeName: meta_font,
+            NSForegroundColorAttributeName: tertiary,
+        })
+        add("\n\n", {NSFontAttributeName: title_font})
+
+        if not tasks:
+            add("(no tasks)", {
+                NSFontAttributeName: task_body_font,
+                NSForegroundColorAttributeName: tertiary,
+            })
+            return out
+
+        # Fonts/colors used inside the card. Session header dominates
+        # the top of the card — bold session name + colored bucket pill —
+        # so users can scan "what session, what state" at a glance.
+        session_name_font = NSFont.systemFontOfSize_weight_(12, NSFontWeightSemibold)
+        status_pill_font = _rounded_tabular_font(10, NSFontWeightSemibold)
+
+        # When grouping by session, the session header is rendered ONCE
+        # per session-group instead of as a subtitle on each card. We
+        # track the previously-seen session_id and emit a header whenever
+        # it changes. Tasks must already be ordered so same-session
+        # entries are adjacent (caller does the sort).
+        last_session_id = None
+        # Track the previous task's title key so the "↑ merge above"
+        # link knows which target to merge into. Only valid when the
+        # previous task came from the same session.
+        prev_session_id = None
+        prev_task_key = None
+
+        for task in tasks:
+            title = (task.get("title") or "").strip()
+            summary = (task.get("summary") or "").strip()
+            evidence = (task.get("evidence") or "").strip()
+            confidence = task.get("confidence") or 1.0
+            session_title = (task.get("_session_title") or "").strip()
+            session_id = (task.get("_session_id") or "").strip()
+            session_bucket = (task.get("_session_bucket") or "").strip()
+            bucket_label_text = BUCKET_LABEL.get(session_bucket, "")
+            bucket_color = (
+                _bucket_tint(session_bucket)
+                if session_bucket in BUCKET_LABEL else tertiary
+            )
+            eff = task.get("_effective_status") or status
+            is_awaiting = (eff == AI_TASK_AWAITING)
+
+            # ---- Session group header (when grouping by session) ----
+            # Emitted once per session-group inside the column. Tasks
+            # from the same session must be contiguous (caller sorts).
+            if group_by_session and session_id != last_session_id:
+                if last_session_id is not None:
+                    # Visual gap before the next group.
+                    add("\n", {NSFontAttributeName: task_body_font})
+                add(session_title or "(untitled session)", {
+                    NSFontAttributeName: session_name_font,
+                    NSForegroundColorAttributeName: label,
+                })
+                if bucket_label_text:
+                    add("   ", {NSFontAttributeName: status_pill_font})
+                    add(bucket_label_text, {
+                        NSFontAttributeName: status_pill_font,
+                        NSForegroundColorAttributeName: bucket_color,
+                    })
+                add("\n", {NSFontAttributeName: task_body_font})
+                last_session_id = session_id
+
+            # ---- Target title (the lead line, strikethrough on completed) ----
+            # Reordered: target is the primary content, session is the
+            # subtitle. The title carries the bold/dark weight; the
+            # session below is smaller and dim-secondary so it informs
+            # without competing. Strikethrough is reserved for targets
+            # the USER has confirmed done — Haiku's "completed" vote
+            # alone doesn't strike anything.
+            #
+            # The whole title is wrapped in cssresume:// so a single
+            # click anywhere on the title jumps to the source session
+            # (same as Session-tab cards). We deliberately keep the
+            # label/secondary color even though NSLinkAttributeName is
+            # set, so the title doesn't get the default blue underline
+            # — the click affordance is implicit.
+            title_attrs = {
+                NSFontAttributeName: task_title_font,
+                NSForegroundColorAttributeName: (
+                    secondary if status == "completed" else label
+                ),
+            }
+            if status == "completed":
+                title_attrs[NSStrikethroughStyleAttributeName] = (
+                    NSUnderlineStyleSingle
+                )
+            if session_id:
+                title_attrs[NSLinkAttributeName] = NSURL.URLWithString_(
+                    f"cssresume://{session_id}",
+                )
+            add(title, title_attrs)
+            if confidence < 0.9:
+                pct = int(round(confidence * 100))
+                add(f"   ·{pct}%", {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: tertiary,
+                })
+            add("\n", {NSFontAttributeName: task_body_font})
+
+            # Compute this target's stable key for the action links below.
+            task_key = _task_confirm_key(title)
+
+            # ---- Action row: status-move links + merge + open session ----
+            # Show the two status options the target ISN'T currently in
+            # as click-to-move links. For awaiting-state targets we keep
+            # the "Claude marked this done · ✓ confirm" prefix language
+            # so the user knows the AI's vote is what placed the card.
+            # The current visual status (in_progress / pending /
+            # completed) drives which links appear.
+            visual_status = "in_progress" if is_awaiting else eff
+            all_statuses = ("pending", "in_progress", "completed")
+            move_labels = {
+                "pending": "→ pending",
+                "in_progress": "→ in progress",
+                "completed": "✓ done",
+            }
+            green = (
+                NSColor.systemGreenColor()
+                if hasattr(NSColor, "systemGreenColor") else label
+            )
+            purple_link = (
+                NSColor.systemPurpleColor()
+                if hasattr(NSColor, "systemPurpleColor") else label
+            )
+            move_link_color = {
+                "pending": tertiary,
+                "in_progress": purple_link,
+                "completed": green,
+            }
+            action_parts: list = []
+            # Awaiting prefix: explain why this card is here despite
+            # Haiku having voted "completed".
+            if is_awaiting:
+                add("Claude marked this done · ", {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: tertiary,
+                })
+            for s in all_statuses:
+                if s == visual_status:
+                    continue
+                if action_parts:
+                    add("   ·   ", {
+                        NSFontAttributeName: meta_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    })
+                move_url = NSURL.URLWithString_(
+                    f"cssmove://{session_id}/{task_key}/{s}",
+                )
+                add(move_labels[s], {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: move_link_color[s],
+                    NSLinkAttributeName: move_url,
+                })
+                action_parts.append(True)
+            # Merge-above is only meaningful when the previous card came
+            # from the same session.
+            if (
+                prev_task_key is not None
+                and prev_session_id == session_id
+                and prev_task_key != task_key
+            ):
+                if action_parts:
+                    add("   ·   ", {
+                        NSFontAttributeName: meta_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    })
+                merge_url = NSURL.URLWithString_(
+                    f"cssmerge://{session_id}/{task_key}/{prev_task_key}",
+                )
+                add("↑ merge above", {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: (
+                        NSColor.systemOrangeColor()
+                        if hasattr(NSColor, "systemOrangeColor") else label
+                    ),
+                    NSLinkAttributeName: merge_url,
+                })
+                action_parts.append(True)
+            # (Open-session link removed — clicking the target title
+            # itself already routes through cssresume:// via the title's
+            # NSLinkAttributeName, so a second affordance was redundant.)
+            if action_parts:
+                add("\n", {NSFontAttributeName: task_body_font})
+
+            # Update prev-task tracking for the next iteration's merge link.
+            prev_session_id = session_id
+            prev_task_key = task_key
+
+            # ---- Session subtitle (name + colored bucket pill) ----
+            # Only emit in flat mode; in grouped mode, the group header
+            # above already carries this info, so repeating it on every
+            # card just creates visual noise.
+            if session_title and not group_by_session:
+                add(session_title, {
+                    NSFontAttributeName: meta_font,
+                    NSForegroundColorAttributeName: secondary,
+                })
+                if bucket_label_text:
+                    add("   ", {NSFontAttributeName: status_pill_font})
+                    add(bucket_label_text, {
+                        NSFontAttributeName: status_pill_font,
+                        NSForegroundColorAttributeName: bucket_color,
+                    })
+                add("\n", {NSFontAttributeName: task_body_font})
+
+            # Body details only for in_progress (where the user is
+            # most likely scrutinizing).
+            if status == "in_progress":
+                if summary:
+                    add(f"{summary}\n", {
+                        NSFontAttributeName: task_body_font,
+                        NSForegroundColorAttributeName: secondary,
+                    })
+                if evidence:
+                    quoted = (
+                        evidence if len(evidence) < 90
+                        else evidence[:89] + "…"
+                    )
+                    add(f"“{quoted}”\n", {
+                        NSFontAttributeName: task_body_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    })
+                # Running sub-agents nested beneath the card. Tree
+                # connector glyphs (├ / └) mirror the Tasks tab. Teal
+                # tint differentiates "agent doing something on this
+                # task" from purple "task status".
+                subs = task.get("_running_subagents") or []
+                if subs:
+                    teal = (
+                        NSColor.systemTealColor()
+                        if hasattr(NSColor, "systemTealColor") else label
+                    )
+                    shown = subs[:SUBAGENT_MAX_DISPLAY]
+                    for i, sub in enumerate(shown):
+                        is_last = (
+                            i == len(shown) - 1
+                            and len(subs) <= SUBAGENT_MAX_DISPLAY
+                        )
+                        connector = "└" if is_last else "├"
+                        atype = (sub.get("agent_type") or "").strip()
+                        desc = (sub.get("name") or "agent").strip()
+                        if len(desc) > 60:
+                            desc = desc[:59] + "…"
+                        line = (
+                            f"{connector} ◐ {atype} · {desc}"
+                            if atype else f"{connector} ◐ {desc}"
+                        )
+                        add(f"{line}\n", {
+                            NSFontAttributeName: task_body_font,
+                            NSForegroundColorAttributeName: teal,
+                        })
+                    overflow = len(subs) - len(shown)
+                    if overflow > 0:
+                        add(f"└ + {overflow} more working\n", {
+                            NSFontAttributeName: meta_font,
+                            NSForegroundColorAttributeName: tertiary,
+                        })
+
+            # Card separator.
+            add("\n", {NSFontAttributeName: task_body_font})
+
+        # Completed-column overflow indicator.
+        if status == "completed" and extra_count > 0:
+            add(f"+ {extra_count} more completed (cached)\n", {
+                NSFontAttributeName: meta_font,
+                NSForegroundColorAttributeName: tertiary,
+            })
+
+        return out
+
+    @objc.python_method
+    def _build_ai_tasks_empty_state(self, ai_enabled, any_computing):
+        """The three empty states (disabled / classifying / nothing yet)
+        rendered in list_scroll. Same copy as the v0.5 single-view
+        renderer — we just isolate it so the kanban path can reuse it."""
+        title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        body_font = NSFont.systemFontOfSize_(12)
+        meta_font = _rounded_tabular_font(11, NSFontWeightRegular)
+        secondary = NSColor.secondaryLabelColor()
+        tertiary = NSColor.tertiaryLabelColor()
         purple = (
             NSColor.systemPurpleColor()
             if hasattr(NSColor, "systemPurpleColor") else NSColor.labelColor()
         )
 
         out = NSMutableAttributedString.alloc().init()
-
         def add(text, attrs):
             out.appendAttributedString_(
                 NSAttributedString.alloc().initWithString_attributes_(text, attrs)
             )
 
-        # Detect the "key missing" empty state by enabledness — this
-        # mirrors the dashboard.py gate. Renderer doesn't import the
-        # function directly to avoid a heavy cross-import.
-        ai_enabled = bool(os.environ.get("ANTHROPIC_API_KEY")) and (
-            os.environ.get("CLAUDE_SESSIONS_AI_TASKS", "").strip()
-            in ("1", "true", "yes", "on")
-        )
-
-        # ---- Header chip — "✨ AI-detected · <freshness>" ----
-        # Computed across all rows: youngest classified_ts wins.
-        flat_rows: list = []
-        for k in ("needs", "working", "ready", "dormant"):
-            flat_rows.extend(buckets.get(k) or [])
-        with_classification = [
-            r for r in flat_rows
-            if (r.get("ai_tasks") or {}).get("classified_ts")
-        ]
-        any_computing = any(
-            (r.get("ai_tasks") or {}).get("status") == "computing"
-            for r in flat_rows
-        )
-        if with_classification:
-            youngest = max(
-                (r.get("ai_tasks") or {}).get("classified_ts", 0)
-                for r in with_classification
-            )
-            ago_s = max(0.0, time.time() - youngest)
-            sync_text = f"synced {format_ago(ago_s)}"
-        else:
-            sync_text = "no sessions classified yet"
-
         chip_color = purple if ai_enabled else tertiary
         add("✨ AI-detected", {
             NSFontAttributeName: meta_font,
             NSForegroundColorAttributeName: chip_color,
-        })
-        add(f"  ·  {sync_text}", {
-            NSFontAttributeName: meta_font,
-            NSForegroundColorAttributeName: tertiary,
         })
         if any_computing:
             add("  ·  classifying…", {
@@ -2471,10 +3321,9 @@ class PopoverVC(NSViewController):
             })
         add("\n\n", {NSFontAttributeName: meta_font})
 
-        # ---- Three empty states, in priority order ----
         if not ai_enabled:
             add("\n", {NSFontAttributeName: title_font})
-            add("Enable AI Tasks\n", {
+            add("Enable Tasks\n", {
                 NSFontAttributeName: title_font,
                 NSForegroundColorAttributeName: secondary,
             })
@@ -2484,366 +3333,42 @@ class PopoverVC(NSViewController):
                 "  2.  Add   ANTHROPIC_API_KEY=sk-…\n"
                 "  3.  Add   CLAUDE_SESSIONS_AI_TASKS=1\n\n"
                 "Cost is throttled — typically a few cents/day. "
-                "The first classification appears within a minute.",
+                "The first tasks appear within a minute.",
                 {
-                    NSFontAttributeName: task_font,
+                    NSFontAttributeName: body_font,
                     NSForegroundColorAttributeName: tertiary,
                 },
             )
-            return out
-
-        # Filter to sessions that have any AI task data (either cached
-        # tasks OR are currently being classified). Sessions with status
-        # "disabled"/"empty" never appear.
-        sessions_with_ai: list = []
-        for r in flat_rows:
-            ai = r.get("ai_tasks") or {}
-            status = ai.get("status") or "empty"
-            if status in ("ok", "stale", "computing", "errored") and (
-                ai.get("tasks") or status == "computing"
-            ):
-                sessions_with_ai.append(r)
-
-        # Sort by recency.
-        sessions_with_ai.sort(key=lambda r: r.get("ago_s", 0))
-
-        if not sessions_with_ai:
-            if any_computing:
-                add("\n", {NSFontAttributeName: title_font})
-                add("Classifying your sessions…\n", {
-                    NSFontAttributeName: title_font,
-                    NSForegroundColorAttributeName: secondary,
-                })
-                add(
-                    "First results appear within a few seconds. "
-                    "If this persists for more than a minute, check ~/.claude-sessions-status.log.",
-                    {
-                        NSFontAttributeName: task_font,
-                        NSForegroundColorAttributeName: tertiary,
-                    },
-                )
-            else:
-                add("\n", {NSFontAttributeName: title_font})
-                add("No AI tasks yet\n", {
-                    NSFontAttributeName: title_font,
-                    NSForegroundColorAttributeName: secondary,
-                })
-                add(
-                    "Active sessions will appear here after their next\n"
-                    "user/assistant turn (classification is gated on\n"
-                    "real conversation activity, not refresh ticks).",
-                    {
-                        NSFontAttributeName: task_font,
-                        NSForegroundColorAttributeName: tertiary,
-                    },
-                )
-            return out
-
-        # Status icons (identical to Tasks tab so the vocabulary is shared).
-        STATUS_ICONS = {
-            "pending": "○",
-            "in_progress": "◐",
-            "completed": "✓",
-        }
-        STATUS_COLORS = {
-            "pending": tertiary,
-            "in_progress": purple,   # the AI-tab differentiator
-            "completed": secondary,
-        }
-
-        for r in sessions_with_ai:
-            ai = r.get("ai_tasks") or {}
-            tasks = ai.get("tasks") or []
-            session_intent = ai.get("session_intent") or ""
-            entry_status = ai.get("status") or "ok"
-            classified_ts = ai.get("classified_ts") or 0
-
-            # Session header — title + age + session_intent line (which
-            # is the AI's one-phrase summary of what this session is for).
-            title = (r.get("title") or "(untitled)").strip()
-            ago = format_ago(r.get("ago_s") or 0)
-
-            add("▾  ", {
-                NSFontAttributeName: title_font,
-                NSForegroundColorAttributeName: tertiary,
-            })
-            add(title, {
-                NSFontAttributeName: title_font,
-                NSForegroundColorAttributeName: label,
-            })
-            # Per-session freshness indicator next to the title.
-            if classified_ts:
-                age_s = max(0.0, time.time() - classified_ts)
-                add(f"     synced {format_ago(age_s)}     ", {
-                    NSFontAttributeName: meta_font,
-                    NSForegroundColorAttributeName: tertiary,
-                })
-            else:
-                add("     ", {NSFontAttributeName: meta_font})
-            add(f"{ago}\n", {
-                NSFontAttributeName: meta_font,
-                NSForegroundColorAttributeName: tertiary,
-            })
-
-            # Per-session error indicator (one-line, dim) — overrides the
-            # task list to be honest about the failure.
-            if entry_status == "errored":
-                fail_n = ai.get("failure_count", 0)
-                add(
-                    f"    ⚠︎ last classification failed "
-                    f"({fail_n} time{'s' if fail_n != 1 else ''}) — retrying after backoff\n",
-                    {
-                        NSFontAttributeName: summary_font,
-                        NSForegroundColorAttributeName: tertiary,
-                    },
-                )
-
-            # Session intent — italicized via secondary color since
-            # NSTextView attributed strings don't trivially do italics
-            # without a font descriptor variation.
-            if session_intent:
-                add(f"    {session_intent}\n", {
-                    NSFontAttributeName: summary_font,
-                    NSForegroundColorAttributeName: secondary,
-                })
-
-            # Tasks list.
-            for task in tasks:
-                status = task.get("status") or "pending"
-                icon = STATUS_ICONS.get(status, "·")
-                icon_color = STATUS_COLORS.get(status, label)
-                title_text = (task.get("title") or "").strip()
-                summary = (task.get("summary") or "").strip()
-                confidence = task.get("confidence") or 1.0
-                evidence = (task.get("evidence") or "").strip()
-
-                add(f"    {icon}  ", {
-                    NSFontAttributeName: task_font,
-                    NSForegroundColorAttributeName: icon_color,
-                })
-                # Strike-through completed task titles.
-                title_attrs = {
-                    NSFontAttributeName: task_font,
-                    NSForegroundColorAttributeName: (
-                        label if status == "in_progress" else
-                        secondary if status == "completed" else label
-                    ),
-                }
-                if status == "completed":
-                    title_attrs[NSStrikethroughStyleAttributeName] = (
-                        NSUnderlineStyleSingle
-                    )
-                add(title_text, title_attrs)
-
-                # Confidence suffix — only when uncertain (UX agent's call).
-                if confidence < 0.9:
-                    pct = int(round(confidence * 100))
-                    add(f"   ·{pct}%", {
-                        NSFontAttributeName: meta_font,
-                        NSForegroundColorAttributeName: tertiary,
-                    })
-                add("\n", {NSFontAttributeName: task_font})
-
-                # Summary on its own line (skip for completed to reduce noise).
-                if summary and status != "completed":
-                    add(f"       {summary}\n", {
-                        NSFontAttributeName: summary_font,
-                        NSForegroundColorAttributeName: tertiary,
-                    })
-                # Evidence on its own line, only on in_progress where
-                # the user is most likely scrutinizing.
-                if evidence and status == "in_progress":
-                    quoted = evidence if len(evidence) < 100 else evidence[:99] + "…"
-                    add(f"       “{quoted}”\n", {
-                        NSFontAttributeName: summary_font,
-                        NSForegroundColorAttributeName: tertiary,
-                    })
-
-            # Inter-session gap.
-            add("\n", {NSFontAttributeName: task_font})
-
-        return out
-
-    @objc.python_method
-    def _build_tasks_attributed(self, buckets):
-        """Render the Tasks view as an attributed string.
-
-        Layout per session (only sessions with ≥ 1 todo appear):
-
-            ▾ <title>                            2/5 ◐
-              ○  Pending todo content
-              ◐  In-progress todo content        [2 agents]
-                  ├ ◐ general-purpose · brief
-                  └ ◐ code-reviewer · brief
-              ✓  Completed todo content
-
-        Sub-agents nest as a 2-level indented tree under the in_progress
-        todo only. Completed sub-agents are not shown (consistent with
-        the v0.3 "right now" design)."""
-        title_font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
-        todo_font = NSFont.systemFontOfSize_(12)
-        sub_font = NSFont.systemFontOfSize_(11)
-        meta_font = _rounded_tabular_font(11, NSFontWeightRegular)
-        label = NSColor.labelColor()
-        secondary = NSColor.secondaryLabelColor()
-        tertiary = NSColor.tertiaryLabelColor()
-        teal = (
-            NSColor.systemTealColor()
-            if hasattr(NSColor, "systemTealColor") else NSColor.labelColor()
-        )
-
-        out = NSMutableAttributedString.alloc().init()
-
-        def add(text, attrs):
-            out.appendAttributedString_(
-                NSAttributedString.alloc().initWithString_attributes_(text, attrs)
-            )
-
-        # Flatten + sort sessions by recency. Filter to those with ≥ 1 todo.
-        flat_rows: list = []
-        for k in ("needs", "working", "ready", "dormant"):
-            flat_rows.extend(buckets.get(k) or [])
-        sessions_with_todos = [r for r in flat_rows if r.get("todos")]
-        sessions_with_todos.sort(key=lambda r: r.get("ago_s", 0))
-
-        if not sessions_with_todos:
-            # Empty state — short, two-line text. Centered visually via
-            # leading padding; we don't bother with real centering since
-            # the popover is narrow.
-            add("\n\n", {NSFontAttributeName: title_font})
-            add("    No tasks yet\n", {
+        elif any_computing:
+            add("\n", {NSFontAttributeName: title_font})
+            add("Detecting tasks…\n", {
                 NSFontAttributeName: title_font,
                 NSForegroundColorAttributeName: secondary,
             })
             add(
-                "    Claude writes todos when it plans multi-step work.\n"
-                "    Open a session to see them here.",
+                "First results appear within a few seconds.\n"
+                "If this persists for more than a minute, check\n"
+                "~/.claude-sessions-status.log.",
                 {
-                    NSFontAttributeName: todo_font,
+                    NSFontAttributeName: body_font,
                     NSForegroundColorAttributeName: tertiary,
                 },
             )
-            return out
-
-        # Status → glyph mapping. Reuses the v0.3 vocabulary so the user
-        # learns one symbol set across all tabs.
-        TODO_ICONS = {
-            TODO_PENDING: "○",
-            TODO_IN_PROGRESS: "◐",
-            TODO_COMPLETED: "✓",
-        }
-        TODO_COLORS = {
-            TODO_PENDING: tertiary,
-            TODO_IN_PROGRESS: teal,
-            TODO_COMPLETED: secondary,
-        }
-
-        for r in sessions_with_todos:
-            todos = r.get("todos") or []
-            summ = r.get("todo_summary") or {}
-            sub_list = r.get("subagents") or []
-            running_subs = [s for s in sub_list if s.get("state") == SUBAGENT_RUNNING]
-
-            # Header: title + progress + age.
-            title = (r.get("title") or "(untitled)").strip()
-            ago = format_ago(r.get("ago_s") or 0)
-            done_n = summ.get("completed", 0)
-            total_n = summ.get("total", 0) or 1
-            in_progress_n = summ.get("in_progress", 0)
-            progress_glyph = "◐" if in_progress_n else "○"
-
-            add("▾  ", {
+        else:
+            add("\n", {NSFontAttributeName: title_font})
+            add("No tasks yet\n", {
                 NSFontAttributeName: title_font,
-                NSForegroundColorAttributeName: tertiary,
+                NSForegroundColorAttributeName: secondary,
             })
-            add(title, {
-                NSFontAttributeName: title_font,
-                NSForegroundColorAttributeName: label,
-            })
-            add(f"     {done_n}/{total_n} {progress_glyph}     ", {
-                NSFontAttributeName: meta_font,
-                NSForegroundColorAttributeName: (
-                    teal if in_progress_n else tertiary
-                ),
-            })
-            add(f"{ago}\n", {
-                NSFontAttributeName: meta_font,
-                NSForegroundColorAttributeName: tertiary,
-            })
-
-            # Todos, in array order.
-            for todo in todos:
-                status = todo.get("status") or TODO_PENDING
-                icon = TODO_ICONS.get(status, "·")
-                color = TODO_COLORS.get(status, label)
-                # Use activeForm for in_progress (it's a verb phrase like
-                # "Restructuring project..."), content otherwise.
-                content_text = (
-                    todo.get("activeForm") if status == TODO_IN_PROGRESS
-                    else todo.get("content")
-                ) or todo.get("content") or ""
-                # Truncate long todos so they don't blow out the popover.
-                if len(content_text) > 90:
-                    content_text = content_text[:89] + "…"
-                add(f"    {icon}  ", {
-                    NSFontAttributeName: todo_font,
-                    NSForegroundColorAttributeName: color,
-                })
-                # Strike-through completed todos for at-a-glance scanning.
-                content_attrs = {
-                    NSFontAttributeName: todo_font,
-                    NSForegroundColorAttributeName: (
-                        label if status == TODO_IN_PROGRESS else color
-                    ),
-                }
-                if status == TODO_COMPLETED:
-                    content_attrs[NSStrikethroughStyleAttributeName] = (
-                        NSUnderlineStyleSingle
-                    )
-                add(content_text, content_attrs)
-                # Agent count badge on the in_progress todo.
-                if status == TODO_IN_PROGRESS and running_subs:
-                    add(
-                        f"     [{len(running_subs)} agent{'s' if len(running_subs) != 1 else ''}]",
-                        {
-                            NSFontAttributeName: meta_font,
-                            NSForegroundColorAttributeName: teal,
-                        },
-                    )
-                add("\n", {NSFontAttributeName: todo_font})
-
-                # Nest sub-agents under the in_progress todo only.
-                if status == TODO_IN_PROGRESS and running_subs:
-                    shown_subs = running_subs[:SUBAGENT_MAX_DISPLAY]
-                    for i, sub in enumerate(shown_subs):
-                        is_last = (
-                            i == len(shown_subs) - 1
-                            and len(running_subs) <= SUBAGENT_MAX_DISPLAY
-                        )
-                        connector = "└" if is_last else "├"
-                        atype = (sub.get("agent_type") or "").strip()
-                        desc = (sub.get("name") or "agent").strip()
-                        if len(desc) > 70:
-                            desc = desc[:69] + "…"
-                        line = (
-                            f"        {connector} ◐ {atype} · {desc}"
-                            if atype
-                            else f"        {connector} ◐ {desc}"
-                        )
-                        add(f"{line}\n", {
-                            NSFontAttributeName: sub_font,
-                            NSForegroundColorAttributeName: teal,
-                        })
-                    overflow = len(running_subs) - len(shown_subs)
-                    if overflow > 0:
-                        add(f"        └ + {overflow} more working\n", {
-                            NSFontAttributeName: meta_font,
-                            NSForegroundColorAttributeName: tertiary,
-                        })
-
-            # Inter-session gap.
-            add("\n", {NSFontAttributeName: todo_font})
-
+            add(
+                "Active sessions will appear here after their next\n"
+                "user/assistant turn (task detection is gated on real\n"
+                "conversation activity, not refresh ticks).",
+                {
+                    NSFontAttributeName: body_font,
+                    NSForegroundColorAttributeName: tertiary,
+                },
+            )
         return out
 
     @objc.python_method
@@ -2967,6 +3492,35 @@ class PopoverVC(NSViewController):
     def textView_clickedOnLink_atIndex_(self, _text_view, link, _char_index):
         try:
             url_str = str(link) if link is not None else ""
+            if url_str.startswith("cssconfirm://"):
+                # cssconfirm://<session_id>/<task_key>
+                # Back-compat shortcut for the "✓ confirm" link on
+                # awaiting-state cards. Equivalent to cssmove://…/completed.
+                rest = url_str[len("cssconfirm://"):]
+                if "/" in rest:
+                    sid, key = rest.split("/", 1)
+                    _save_task_confirm(sid, key)
+                    self.refresh()
+                return True
+            if url_str.startswith("cssmove://"):
+                # cssmove://<session_id>/<task_key>/<new_status>
+                # Status-move link from a target card.
+                rest = url_str[len("cssmove://"):]
+                parts = rest.split("/", 2)
+                if len(parts) == 3:
+                    sid, key, new_status = parts
+                    _save_task_status_override(sid, key, new_status)
+                    self.refresh()
+                return True
+            if url_str.startswith("cssmerge://"):
+                # cssmerge://<session_id>/<src_key>/<dst_key>
+                rest = url_str[len("cssmerge://"):]
+                parts = rest.split("/", 2)
+                if len(parts) == 3:
+                    sid, src_key, dst_key = parts
+                    _save_task_merge(sid, src_key, dst_key)
+                    self.refresh()
+                return True
             if url_str.startswith("cssread://"):
                 sid = url_str[len("cssread://"):]
                 # Find the corresponding row to learn its current epoch.

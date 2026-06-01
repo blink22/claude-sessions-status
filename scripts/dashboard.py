@@ -136,7 +136,7 @@ def _pad_w(s: str, width: int) -> str:
     return s + " " * (width - n)
 
 
-DASHBOARD_MODES = ("list", "kanban", "tasks", "ai")
+DASHBOARD_MODES = ("list", "kanban", "ai")
 
 
 def _read_dashboard_mode() -> str:
@@ -144,6 +144,9 @@ def _read_dashboard_mode() -> str:
         v = DASHBOARD_MODE_FILE.read_text(encoding="utf-8").strip()
         if v in DASHBOARD_MODES:
             return v
+        # Migration: "tasks" mode was removed; the AI tab now subsumes it.
+        if v == "tasks":
+            return "ai"
     except OSError:
         pass
     return "list"
@@ -875,13 +878,27 @@ def session_gist(session: dict, meta: dict, bucket: str | None = None) -> str | 
 # Cost: ~$0.004/call. Gated by (real-turn-occurred AND size-grew-≥2KB AND
 # ≥60s-since-last-call). Worker thread keeps the LLM out of the UI tick.
 AI_TASKS_CACHE_FILE = Path(os.path.expanduser("~/.claude-sessions-status-ai-tasks.json"))
-AI_TASK_MAX = 6
+# Cap on ACTIVE tasks (pending + in_progress) per session. Completed
+# tasks get a separate budget — they're useful as recent history but
+# shouldn't crowd the active list. Per-user request, active is 1-3:
+# anything more is over-fragmented work that should be merged.
+AI_TASK_ACTIVE_MAX = 3
+AI_TASK_COMPLETED_MAX = 5
+# Total cap (used to bound the JSON the model is allowed to emit).
+AI_TASK_MAX = AI_TASK_ACTIVE_MAX + AI_TASK_COMPLETED_MAX
 AI_TASK_RECLASSIFY_COOLDOWN_S = 60
 AI_TASK_SIZE_DELTA_BYTES = 2048
 AI_TASK_INPUT_USER_PROMPTS = 20
 AI_TASK_INPUT_ASSISTANT_SNIPPETS = 5
 AI_TASK_HTTP_TIMEOUT = 12
 AI_TASK_FAIL_BACKOFF_S = 300  # after a hard error, don't retry for 5 min
+# Title-similarity dedup threshold. Tasks whose normalized title tokens
+# overlap by >= this fraction are merged in _normalize_ai_task_response.
+AI_TASK_DEDUP_OVERLAP = 0.7
+# Number of previous-classification task titles to send back to Haiku
+# as continuity hints. Helps the model keep titles stable across calls
+# instead of re-fragmenting them every time.
+AI_TASK_PREV_HINT_COUNT = 6
 
 # Statuses — kept identical to TodoWrite (UX agent's call). Haiku returns
 # these strings; we validate on parse.
@@ -972,12 +989,21 @@ def _save_ai_tasks_cache_entry(session_id: str, entry: dict) -> None:
             _ai_tasks_log(f"cache write failed: {e!r}")
 
 
-def _build_ai_task_payload(jsonl_path: str, todos: list[dict]) -> dict:
+def _build_ai_task_payload(
+    jsonl_path: str,
+    todos: list[dict],
+    previous_tasks: list[dict] | None = None,
+) -> dict:
     """Construct the bounded input slice we send to Haiku.
 
     Returns: {first_prompt, user_prompts, assistant_snippets,
-              tool_histogram, todo_snapshot}. The slice size is bounded
-              regardless of transcript length — that's the whole point.
+              tool_histogram, todo_snapshot, previous_tasks}. The slice
+              size is bounded regardless of transcript length — that's
+              the whole point.
+
+    `previous_tasks` is the last classification's task list, used as a
+    continuity hint so the model keeps titles stable across calls
+    instead of re-fragmenting them on every refresh.
     """
     p = Path(jsonl_path)
     if not p.exists():
@@ -1041,12 +1067,24 @@ def _build_ai_task_payload(jsonl_path: str, todos: list[dict]) -> dict:
         for t in (todos or [])
     ][:30]
 
+    # Continuity hints: titles + statuses from the previous classification
+    # so Haiku can carry stable identities across calls (avoids the same
+    # work re-titling slightly and producing apparent "new" tasks).
+    prev_hints: list[dict] = []
+    for pt in (previous_tasks or [])[:AI_TASK_PREV_HINT_COUNT]:
+        if isinstance(pt, dict) and pt.get("title"):
+            prev_hints.append({
+                "title": pt.get("title", "")[:80],
+                "status": pt.get("status", ""),
+            })
+
     return {
         "first_prompt": first_prompt[:400],
         "user_prompts": user_prompts,
         "assistant_snippets": assistant_snippets,
         "tool_histogram": top_tools,
         "todo_snapshot": todo_snapshot,
+        "previous_tasks": prev_hints,
     }
 
 
@@ -1054,8 +1092,9 @@ _AI_TASKS_SYSTEM_PROMPT = (
     "You extract a current task list from a Claude Code session transcript "
     "for a developer dashboard. You will receive: the session's first user "
     "prompt, the last 20 user prompts, the last 5 assistant text snippets, "
-    "a tool-use histogram, and the session's most recent TodoWrite snapshot "
-    "(may be empty or stale).\n\n"
+    "a tool-use histogram, the most recent TodoWrite snapshot (may be "
+    "empty or stale), and OPTIONALLY a list of titles from the previous "
+    "classification of this session.\n\n"
     "Return STRICT JSON matching this schema:\n"
     "{\n"
     "  \"session_intent\": \"<one short phrase—what this session is fundamentally about>\",\n"
@@ -1063,9 +1102,28 @@ _AI_TASKS_SYSTEM_PROMPT = (
     "    {\"title\": str, \"status\": str, \"summary\": str, \"evidence\": str, \"confidence\": float}\n"
     "  ]\n"
     "}\n\n"
-    "Rules:\n"
-    "- 1–6 tasks max. Group related TodoWrite items into ONE task when they share intent—\n"
-    "  TodoWrite's granularity is often too fine; collapse aggressively.\n"
+    "OVERARCHING RULE — Aggregate aggressively. The dashboard breaks when "
+    "small fixes, edits, and tweaks become individual cards. ALWAYS prefer "
+    "1–3 broad thematic ACTIVE tasks over 4+ micro-tasks. When in doubt, MERGE.\n\n"
+    "How to merge:\n"
+    "  • Multiple TodoWrite items that share a feature, file, or goal → ONE task.\n"
+    "  • Iteration on the same thing (\"add X\", \"adjust X\", \"polish X\") → ONE task.\n"
+    "  • Bug fix + the verification that follows → ONE task, not two.\n"
+    "  • UI tweaks across siblings (font, color, spacing on same component) → ONE task.\n"
+    "  • Sub-tasks of a parent goal → roll up into the parent.\n\n"
+    "Counter-example — do NOT do this:\n"
+    "  BAD (over-fragmented): 4 cards titled\n"
+    "    \"Add density picker\", \"Wire density to list\", \"Wire density to kanban\",\n"
+    "    \"Persist density preference\"\n"
+    "  GOOD (merged): ONE card titled \"Add Glance/Focus/Detail density modes\".\n\n"
+    "Continuity:\n"
+    "  • If a previous-classification list is provided, REUSE those titles when\n"
+    "    the same work is still active. Don't rename or re-fragment a continuing\n"
+    "    task. Only add a new title for genuinely new work.\n\n"
+    "Other rules:\n"
+    "- HARD CAP on ACTIVE tasks: at most 3 with status pending or in_progress.\n"
+    "  Return FEWER if the session genuinely has fewer distinct active threads.\n"
+    "  Completed tasks are separately budgeted (up to 5) for recent history.\n"
     "- status ∈ {\"pending\",\"in_progress\",\"completed\"}.\n"
     "  \"in_progress\" = work clearly underway in the last few user/assistant turns.\n"
     "  \"completed\" = explicitly finished AND not contradicted later.\n"
@@ -1084,6 +1142,13 @@ def _ai_task_call_haiku(payload: dict) -> dict | None:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
+    prev_tasks_block = ""
+    if payload.get("previous_tasks"):
+        prev_tasks_block = (
+            "\n\nPrevious classification of THIS session (preserve titles "
+            "when work continues; only add new titles for genuinely new work):\n"
+            + json.dumps(payload["previous_tasks"], indent=0)
+        )
     user_content = (
         f"First user prompt:\n{payload.get('first_prompt') or '(empty)'}\n\n"
         f"Recent user prompts (most recent last):\n"
@@ -1095,6 +1160,7 @@ def _ai_task_call_haiku(payload: dict) -> dict | None:
         + "\n\n"
         + "Most recent TodoWrite snapshot (may be empty):\n"
         + json.dumps(payload.get("todo_snapshot") or [], indent=0)
+        + prev_tasks_block
     )
     body_obj = {
         "model": HAIKU_MODEL,
@@ -1140,15 +1206,59 @@ def _ai_task_call_haiku(payload: dict) -> dict | None:
     return parsed
 
 
+_STOPWORDS = frozenset({
+    "a", "an", "and", "the", "of", "to", "for", "in", "on", "with",
+    "by", "or", "this", "that", "is", "be", "are", "as", "at", "from",
+    "into", "via", "per", "its", "it",
+})
+
+
+def _title_tokens(title: str) -> set:
+    """Lower-case, alpha-stripped, stop-word-filtered, plural-stemmed
+    token set used for fuzzy similarity. Punctuation and case don't
+    matter; common English filler is ignored. Tokens longer than 3
+    chars have a trailing 's' stripped so 'tasks'/'task' and
+    'fixes'/'fix' collapse — catches singular/plural mismatches
+    without breaking short words like 'is'/'as'/'us'."""
+    import re
+    norm = re.sub(r"[^a-zA-Z0-9 ]", " ", (title or "").lower())
+    out: set = set()
+    for tok in norm.split():
+        if not tok or tok in _STOPWORDS:
+            continue
+        # Crude plural stemming. Doesn't handle 'ies' → 'y' or other
+        # irregular forms, but covers the 80% case for title comparison.
+        if len(tok) > 3 and tok.endswith("s") and not tok.endswith("ss"):
+            tok = tok[:-1]
+        out.add(tok)
+    return out
+
+
+def _titles_similar(a: str, b: str, threshold: float) -> bool:
+    """Jaccard similarity over the content-word token sets. Returns
+    True when |A ∩ B| / |A ∪ B| meets the threshold."""
+    ta = _title_tokens(a)
+    tb = _title_tokens(b)
+    if not ta or not tb:
+        return False
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return (inter / union) >= threshold if union else False
+
+
 def _normalize_ai_task_response(parsed: dict) -> dict:
     """Validate + clamp the LLM output. Drops malformed tasks, enforces
-    cap, normalizes statuses."""
+    cap, normalizes statuses, and dedups near-duplicate titles (the
+    LLM sometimes splits a single goal into 2-3 similar-titled cards
+    when it shouldn't)."""
     intent = parsed.get("session_intent") or ""
     if not isinstance(intent, str):
         intent = ""
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list):
         raw_tasks = []
+
+    # Pass 1 — validate and clamp each task.
     clean: list[dict] = []
     for t in raw_tasks:
         if not isinstance(t, dict):
@@ -1174,9 +1284,58 @@ def _normalize_ai_task_response(parsed: dict) -> dict:
             "evidence": evidence[:160],
             "confidence": round(confidence, 2),
         })
-        if len(clean) >= AI_TASK_MAX:
-            break
-    return {"session_intent": intent[:120], "tasks": clean}
+
+    # Pass 2 — title-similarity dedup. Pairwise: if two tasks share
+    # ≥ AI_TASK_DEDUP_OVERLAP of their content-word token set, merge
+    # them. Keep the higher-confidence card's title; absorb the other's
+    # evidence into the summary (so context isn't lost). Status: prefer
+    # in_progress > pending > completed when the votes disagree (better
+    # to overstate "still working" than to wrongly archive).
+    STATUS_RANK = {
+        AI_TASK_IN_PROGRESS: 0,
+        AI_TASK_PENDING: 1,
+        AI_TASK_COMPLETED: 2,
+    }
+    deduped: list[dict] = []
+    for cand in clean:
+        merged = False
+        for kept in deduped:
+            if _titles_similar(cand["title"], kept["title"], AI_TASK_DEDUP_OVERLAP):
+                # Resolve title: higher confidence wins.
+                if cand["confidence"] > kept["confidence"]:
+                    kept["title"] = cand["title"]
+                # Resolve status: pick the lower-ranked (more active) one.
+                if STATUS_RANK.get(cand["status"], 9) < STATUS_RANK.get(kept["status"], 9):
+                    kept["status"] = cand["status"]
+                # Concatenate evidence (deduped).
+                if cand["evidence"] and cand["evidence"] not in kept["evidence"]:
+                    extra = cand["evidence"]
+                    sep = " · " if kept["evidence"] else ""
+                    kept["evidence"] = (kept["evidence"] + sep + extra)[:160]
+                # Confidence: max of the two (a duplicate is corroboration).
+                kept["confidence"] = max(kept["confidence"], cand["confidence"])
+                merged = True
+                break
+        if not merged:
+            deduped.append(cand)
+
+    # Separate caps for active (pending + in_progress) vs completed.
+    # Active = the working list, capped tightly at AI_TASK_ACTIVE_MAX so
+    # it stays scannable; completed acts as recent-history with a higher
+    # ceiling. Within each bucket, highest confidence wins when over cap.
+    active = sorted(
+        [t for t in deduped if t["status"] != AI_TASK_COMPLETED],
+        key=lambda t: -t["confidence"],
+    )[:AI_TASK_ACTIVE_MAX]
+    completed = sorted(
+        [t for t in deduped if t["status"] == AI_TASK_COMPLETED],
+        key=lambda t: -t["confidence"],
+    )[:AI_TASK_COMPLETED_MAX]
+    # Preserve the original Haiku ordering within the kept set (so the
+    # model's intended sequence isn't lost), keyed by id() lookup.
+    kept_set = {id(t) for t in active} | {id(t) for t in completed}
+    final = [t for t in deduped if id(t) in kept_set]
+    return {"session_intent": intent[:120], "tasks": final}
 
 
 # Worker thread + queue. The refresh tick enqueues jobs; the worker pops
@@ -1238,7 +1397,11 @@ def _classify_session(job: dict) -> None:
     if not session_id or not jsonl_path:
         return
 
-    payload = _build_ai_task_payload(jsonl_path, todos)
+    # Continuity: read the previous classification from cache so we can
+    # send the prior task titles back to Haiku as stability hints.
+    prev_cache = _load_ai_tasks_cache().get(session_id) or {}
+    previous_tasks = prev_cache.get("tasks") or []
+    payload = _build_ai_task_payload(jsonl_path, todos, previous_tasks)
     if not payload or not payload.get("user_prompts"):
         # Nothing meaningful to classify yet — write an empty entry so
         # the gate logic doesn't keep retrying immediately.
@@ -1270,6 +1433,12 @@ def _classify_session(job: dict) -> None:
         return
 
     norm = _normalize_ai_task_response(parsed)
+    # The most recent substantive user prompt is what most plausibly
+    # caused Haiku to re-classify. Saving it here lets the UI surface
+    # "synced 5s ago, triggered by: '<your last prompt>'" — turning
+    # surprise updates into explained updates.
+    user_prompts = payload.get("user_prompts") or []
+    trigger_prompt = (user_prompts[-1] if user_prompts else "")[:200]
     _save_ai_tasks_cache_entry(session_id, {
         "tasks": norm["tasks"],
         "session_intent": norm["session_intent"],
@@ -1279,6 +1448,7 @@ def _classify_session(job: dict) -> None:
         "model": HAIKU_MODEL,
         "failure_count": 0,
         "last_failure_ts": 0,
+        "trigger_prompt": trigger_prompt,
     })
 
 
@@ -2054,108 +2224,6 @@ def _compute_numbered_sessions(
     return out
 
 
-def render_tasks(rows: list[dict], width: int) -> str:
-    """Per-session vertical list of TodoWrite todos with running sub-agents
-    nested under the in_progress todo. Sessions with no todos are skipped.
-
-    Layout — matches the popover Tasks tab vocabulary:
-
-      ▾ <title>                  3/5 ◐   2m ago
-        ✓ Completed todo content
-        ◐ In-progress todo               [2 agents]
-            ├ ◐ general-purpose · brief
-            └ ◐ code-reviewer · brief
-        ○ Pending todo content
-    """
-    sessions_with_todos = [r for r in rows if r.get("todos")]
-    if not sessions_with_todos:
-        return (
-            f"\n{DIM}No tasks yet. Claude writes todos when it plans "
-            f"multi-step work — open a session and watch them appear here.{RESET}\n"
-        )
-
-    icons = {
-        TODO_PENDING: "○",
-        TODO_IN_PROGRESS: "◐",
-        TODO_COMPLETED: "✓",
-    }
-    colors = {
-        TODO_PENDING: DIM,
-        TODO_IN_PROGRESS: CYAN,
-        TODO_COMPLETED: DIM,
-    }
-
-    parts: list[str] = []
-    for r in sessions_with_todos:
-        todos = r.get("todos") or []
-        summ = r.get("todo_summary") or {}
-        running_subs = [
-            s for s in (r.get("subagents") or [])
-            if s.get("state") == SUBAGENT_RUNNING
-        ]
-        title = truncate(r.get("title") or "(untitled)", max(20, width - 40))
-        done_n = summ.get("completed", 0)
-        total_n = summ.get("total", 0) or 1
-        in_progress_n = summ.get("in_progress", 0)
-        progress_glyph = "◐" if in_progress_n else "○"
-        progress_color = CYAN if in_progress_n else DIM
-        # Header — title + progress + age.
-        parts.append(
-            f"{BOLD}▸ {title}{RESET}   "
-            f"{progress_color}{done_n}/{total_n} {progress_glyph}{RESET}"
-            f"   {DIM}{r.get('ago', '')}{RESET}\n"
-        )
-        for todo in todos:
-            status = todo.get("status") or TODO_PENDING
-            icon = icons.get(status, "·")
-            color = colors.get(status, RESET)
-            # Pick the right verbalization for the status.
-            text = (
-                todo.get("activeForm") if status == TODO_IN_PROGRESS
-                else todo.get("content")
-            ) or todo.get("content") or ""
-            text = truncate(text, max(20, width - 12))
-            # Strikethrough on completed (ANSI 9) so finished todos visibly
-            # fall back — terminal-equivalent of the popover's strikethrough.
-            if status == TODO_COMPLETED:
-                line_body = f"\033[9m{text}\033[29m"
-            else:
-                line_body = text
-            badge = ""
-            if status == TODO_IN_PROGRESS and running_subs:
-                badge = (
-                    f"   {CYAN}[{len(running_subs)} agent"
-                    f"{'s' if len(running_subs) != 1 else ''}]{RESET}"
-                )
-            parts.append(f"  {color}{icon}{RESET}  {line_body}{badge}\n")
-
-            # Nest running sub-agents under the in_progress todo only.
-            if status == TODO_IN_PROGRESS and running_subs:
-                shown_subs = running_subs[:SUBAGENT_MAX_DISPLAY]
-                for i, sub in enumerate(shown_subs):
-                    is_last = (
-                        i == len(shown_subs) - 1
-                        and len(running_subs) <= SUBAGENT_MAX_DISPLAY
-                    )
-                    connector = "└" if is_last else "├"
-                    atype = (sub.get("agent_type") or "").strip()
-                    desc = (sub.get("name") or "agent").strip()
-                    line = (
-                        f"{connector} ◐ {atype} · {desc}"
-                        if atype else f"{connector} ◐ {desc}"
-                    )
-                    parts.append(
-                        f"      {CYAN}{truncate(line, max(20, width - 8))}{RESET}\n"
-                    )
-                overflow = len(running_subs) - len(shown_subs)
-                if overflow > 0:
-                    parts.append(
-                        f"      {DIM}└ + {overflow} more working{RESET}\n"
-                    )
-        parts.append("\n")
-    return "".join(parts)
-
-
 def render_ai_tasks(rows: list[dict], width: int) -> str:
     """Terminal companion for the AI tab — same data, plain-ANSI layout.
 
@@ -2311,9 +2379,6 @@ def render(
     if view == "ai":
         parts.append(render_ai_tasks(rows, width))
         effective_view = "ai"
-    elif view == "tasks":
-        parts.append(render_tasks(rows, width))
-        effective_view = "tasks"
     elif view == "kanban" and width >= KANBAN_MIN_WIDTH:
         body = render_kanban(rows, width, show_dormant)
         if not body:
@@ -2349,7 +2414,7 @@ def render(
     footer = (
         f"{DIM}refreshing every {REFRESH_SECS}s · "
         f"window {RECENT_HOURS:.0f}h · "
-        f"k=kanban  l=list  t=tasks  a=ai  d=±dormant  1-9=resume  q=quit{RESET}\n"
+        f"k=kanban  l=list  a=ai  d=±dormant  1-9=resume  q=quit{RESET}\n"
     )
     parts.append(footer)
     sys.stdout.write("".join(parts))
@@ -2444,8 +2509,6 @@ def main() -> int:
                         help="Start in kanban (3-column) view")
     parser.add_argument("--list", dest="list_view", action="store_true",
                         help="Start in list view (default if no flag and no saved pref)")
-    parser.add_argument("--tasks", action="store_true",
-                        help="Start in tasks view (TodoWrite-derived per-session todos)")
     parser.add_argument("--ai-tasks", dest="ai_tasks", action="store_true",
                         help="Start in AI tasks view (Haiku-derived per-session synthesis)")
     parser.add_argument("--show-dormant", action="store_true",
@@ -2458,8 +2521,6 @@ def main() -> int:
     # Resolve initial view: explicit flag > saved preference > default.
     if args.ai_tasks:
         view = "ai"
-    elif args.tasks:
-        view = "tasks"
     elif args.kanban:
         view = "kanban"
     elif args.list_view:
@@ -2499,10 +2560,6 @@ def main() -> int:
                     break  # re-render now
                 if ch == "l" and view != "list":
                     view = "list"
-                    _write_dashboard_mode(view)
-                    break
-                if ch == "t" and view != "tasks":
-                    view = "tasks"
                     _write_dashboard_mode(view)
                     break
                 if ch == "a" and view != "ai":
