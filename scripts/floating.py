@@ -2777,21 +2777,27 @@ class PopoverVC(NSViewController):
         else:
             append(f"\t{ago}\n", age_attrs)
 
-        # ---- Line 2: phase (colored tag) + gist (primary text) ----
-        # Hidden in glance mode (one-line-per-row).
+        # ---- Line 2: phase (quiet secondary) + gist (primary text) ----
+        # Hidden in glance mode (one-line-per-row). The phase used to
+        # be rendered in the bucket-tint color (red/amber/green) which
+        # made every row's line 2 a competing color cue alongside the
+        # left ▎ bar — too loud. The bar is now the only bucket-tinted
+        # element on a row; the phase reads in secondary-label color so
+        # the gist (primary label color) wins focus.
         if density != "glance" and (phase or gist):
             # Indent matching the title's leading inset.
             append("     ", {NSFontAttributeName: gist_emphasis_font})
             if phase:
                 append(phase, {
                     NSFontAttributeName: phase_tag_font,
-                    NSForegroundColorAttributeName: color,
+                    NSForegroundColorAttributeName: dim,
                 })
                 if gist:
-                    # Subtle separator dot, not a heavy bullet.
+                    # Subtle separator dot, slightly dimmer than the
+                    # phase label so the eye treats it as punctuation.
                     append("  ·  ", {
                         NSFontAttributeName: phase_tag_font,
-                        NSForegroundColorAttributeName: dim,
+                        NSForegroundColorAttributeName: very_dim,
                     })
             if gist:
                 append(gist, {
@@ -2859,11 +2865,14 @@ class PopoverVC(NSViewController):
         right-aligned via a tab stop, secondary phase/gist line, a
         quoted preview of Claude's actual recent text (the context you'd
         want for switching back into the session), and a tertiary path."""
-        header_font = NSFont.systemFontOfSize_weight_(10, NSFontWeightSemibold)
+        header_marker_font = NSFont.systemFontOfSize_(11)
+        header_font = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
+        header_count_font = _rounded_tabular_font(11.0, NSFontWeightRegular)
         title_font = NSFont.systemFontOfSize_weight_(14, NSFontWeightSemibold)
         gist_font = NSFont.systemFontOfSize_(12)
         meta_font = _rounded_tabular_font(11.0, NSFontWeightRegular)
         bar_font = NSFont.systemFontOfSize_(16)  # slightly taller for the ▎ glyph
+        section_spacer_font = NSFont.systemFontOfSize_(8)
 
         dim = NSColor.secondaryLabelColor()
         very_dim = NSColor.tertiaryLabelColor()
@@ -2874,6 +2883,7 @@ class PopoverVC(NSViewController):
 
         out = NSMutableAttributedString.alloc().init()
         any_rows = False
+        first_section = True
 
         section_pairs = [(k, _bucket_tint(k)) for k in ("needs", "working", "ready")]
         # Dormant only renders when the user has the toggle enabled.
@@ -2886,17 +2896,49 @@ class PopoverVC(NSViewController):
                 continue
             any_rows = True
 
-            # Bucket header — uppercase, tinted, generous tracking.
-            out.appendAttributedString_(
+            # Add a generous breathing-room spacer above every section
+            # except the first. Pure whitespace as the section divider —
+            # no horizontal lines, no headers competing with the title.
+            if not first_section:
+                out.appendAttributedString_(
+                    NSAttributedString.alloc().initWithString_attributes_(
+                        "\n",
+                        {NSFontAttributeName: section_spacer_font},
+                    )
+                )
+            first_section = False
+
+            # Bucket header — refined: small bucket-tinted dot + a
+            # sentence-case label in secondary color + tabular count in
+            # tertiary. The dot carries the status color; the label
+            # stays muted so the row titles below dominate visually.
+            label_text = LABELS[key].title()      # "NEEDS YOU" → "Needs You"
+            header_attr = NSMutableAttributedString.alloc().init()
+            header_attr.appendAttributedString_(
                 NSAttributedString.alloc().initWithString_attributes_(
-                    f"  {LABELS[key]}  ·  {len(rows)}\n",
-                    {
-                        NSFontAttributeName: header_font,
+                    "  ●  ", {
+                        NSFontAttributeName: header_marker_font,
                         NSForegroundColorAttributeName: color,
-                        NSKernAttributeName: 0.8,
                     },
                 )
             )
+            header_attr.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(
+                    label_text, {
+                        NSFontAttributeName: header_font,
+                        NSForegroundColorAttributeName: dim,
+                    },
+                )
+            )
+            header_attr.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(
+                    f"   {len(rows)}\n", {
+                        NSFontAttributeName: header_count_font,
+                        NSForegroundColorAttributeName: very_dim,
+                    },
+                )
+            )
+            out.appendAttributedString_(header_attr)
 
             for row in rows:
                 self._append_row(
