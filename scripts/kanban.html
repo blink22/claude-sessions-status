@@ -284,32 +284,33 @@
     font-size: 10px;
     line-height: 1.45;
     color: var(--text-2);
-    display: flex;
-    align-items: baseline;
-    gap: 5px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    /* Wrap the description across multiple lines when it's long
+     * instead of clipping with an ellipsis. We can't keep the flex
+     * row layout AND wrap text, so we drop flex and let the inline
+     * children (◐ glyph, type, ·, desc) flow as normal inline text
+     * — the desc continues onto a new line when it overflows, with
+     * a hanging indent that lines up with the desc start. */
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    /* Hanging indent: when the desc wraps, continuation lines sit
+     * indented under the desc start (past the ◐ + type prefix)
+     * instead of snapping back to the left edge. */
+    padding-left: 1.4em;
+    text-indent: -1.4em;
   }
   .card .agent-line .state-glyph {
     color: var(--teal);
-    flex-shrink: 0;
+    margin-right: 4px;
   }
   .card .agent-line .type {
     color: var(--text-3);
-    flex-shrink: 0;
   }
   .card .agent-line .sep {
     color: var(--text-4);
-    flex-shrink: 0;
+    margin: 0 4px;
   }
   .card .agent-line .desc {
     color: var(--text-1);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-    flex: 1 1 auto;
   }
   .card .agent-footer {
     font-family: var(--mono);
