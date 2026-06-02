@@ -18,3 +18,4 @@ dist/
 # Defensive — these files live in $HOME, never in the repo, but guard
 # against accidental commits if someone runs commands inside the repo.
 .claude-sessions-status*
+.claude/

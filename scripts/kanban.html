@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Kanban</title>
+<style>
+  :root {
+    --bg-popover:       #1c1c20;
+    --bg-popover-lift:  #232328;
+    --hairline:         rgba(255,255,255,0.06);
+    --hairline-strong:  rgba(255,255,255,0.10);
+    --border-card:      rgba(255,255,255,0.04);
+    --card-bg:          rgba(255,255,255,0.025);
+    --text-1:           rgba(255,255,255,0.92);
+    --text-2:           rgba(255,255,255,0.55);
+    --text-3:           rgba(255,255,255,0.36);
+    --text-4:           rgba(255,255,255,0.22);
+    --red:              #f06f6f;
+    --amber:            #e0b34a;
+    --green:            #4fc78a;
+    --teal:             #5dd0cf;
+    --blue:             #6aa6f8;
+    --mono:             "SF Mono", ui-monospace, Menlo, monospace;
+    --sans:             -apple-system, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  body {
+    font-family: var(--sans);
+    font-size: 13px;
+    background: var(--bg-popover);
+    color: var(--text-1);
+    /* Smoother text — matches native AppKit antialiasing better. */
+    -webkit-font-smoothing: antialiased;
+  }
+  #app {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    height: 100vh;
+    background: var(--bg-popover);
+  }
+  #app.with-dormant {
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+  }
+  .col {
+    /* Linear's layered surface — column body sits 3-4% brighter than
+     * the popover bg, so the eye reads the columns as distinct panes
+     * floating on the popover floor. */
+    background: var(--bg-popover-lift);
+    border-right: 1px solid var(--hairline);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-width: 0;
+  }
+  .col:last-child { border-right: 0; }
+
+  .col-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 12px 14px 10px;
+    border-bottom: 1px solid var(--hairline);
+    /* Sticky-style: the header is OUTSIDE the scrollable area so
+     * cards scroll under it. */
+    flex: 0 0 auto;
+    background: var(--bg-popover-lift);
+  }
+  .col-header .label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .col-header .count {
+    font-size: 11px;
+    color: var(--text-4);
+    font-variant-numeric: tabular-nums;
+    font-family: var(--mono);
+  }
+
+  .col-body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 8px 10px 12px;
+    /* Hide the default macOS scroller until the user is interacting —
+     * matches the overlay scroller behavior of native NSScrollView. */
+    scrollbar-width: thin;
+  }
+  .col-body::-webkit-scrollbar { width: 6px; }
+  .col-body::-webkit-scrollbar-track { background: transparent; }
+  .col-body::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.10);
+    border-radius: 3px;
+  }
+  .col-body::-webkit-scrollbar-thumb:hover {
+    background: rgba(255,255,255,0.18);
+  }
+
+  .empty {
+    color: var(--text-4);
+    font-size: 11px;
+    padding: 8px 4px;
+    text-align: center;
+    font-style: italic;
+  }
+
+  /* ---- Card ---- */
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border-card);
+    border-radius: 5px;
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    position: relative;
+    cursor: pointer;
+    /* The whole card is the click target for "resume in terminal".
+     * Small affordance on hover so the user knows it's clickable. */
+    transition: background 80ms ease, border-color 80ms ease;
+  }
+  .card:hover {
+    background: rgba(255,255,255,0.045);
+    border-color: var(--hairline-strong);
+  }
+  .card:active {
+    background: rgba(255,255,255,0.06);
+  }
+
+  .card .title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+  }
+  .card .dot {
+    flex-shrink: 0;
+    font-size: 12px;
+    width: 12px;
+    line-height: 1;
+    text-align: center;
+    margin-top: 1px;
+  }
+  .card.needs   .dot { color: var(--red); }
+  .card.working .dot { color: var(--amber); }
+  .card.ready   .dot { color: var(--green); }
+  .card.dormant .dot { color: var(--text-3); }
+
+  .card .title {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  /* Unread indicator — small blue dot, click to mark-as-read.
+   * Positioned at top-right, doesn't disturb title flow. */
+  .card .unread-dot {
+    position: absolute;
+    top: 9px;
+    right: 10px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--blue);
+    cursor: pointer;
+  }
+  .card .unread-dot:hover {
+    box-shadow: 0 0 0 3px rgba(106, 166, 248, 0.15);
+  }
+
+  .card .phase-gist {
+    font-size: 11px;
+    color: var(--text-2);
+    margin-top: 4px;
+    margin-left: 19px;
+    /* Wrap the description across multiple lines instead of
+     * truncating with an ellipsis — the user wants the full gist
+     * visible even if it spans 2-3 lines. */
+    line-height: 1.45;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+  }
+  .card .phase-gist .phase {
+    /* Phase label is a small pill/chip that visually separates from
+     * the gist body — gives it a clear "this is the phase tag"
+     * affordance the eye picks up before the description text. */
+    display: inline-block;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.06);
+    color: var(--text-1);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 9px;
+    letter-spacing: 0.05em;
+    padding: 1px 6px;
+    border-radius: 3px;
+    /* Slightly raised baseline so the chip aligns with the gist
+     * text's cap-height instead of dropping below it. */
+    vertical-align: 1px;
+  }
+  /* Per-bucket tint — the chip picks up the status color of the
+   * column the card lives in so it reinforces the signal without
+   * shouting. Background stays neutral; border + text pick up tint. */
+  .card.needs   .phase-gist .phase {
+    color: var(--red);
+    border-color: rgba(240,111,111,0.30);
+    background: rgba(240,111,111,0.10);
+  }
+  .card.working .phase-gist .phase {
+    color: var(--amber);
+    border-color: rgba(224,179,74,0.30);
+    background: rgba(224,179,74,0.10);
+  }
+  .card.ready .phase-gist .phase {
+    color: var(--green);
+    border-color: rgba(79,199,138,0.30);
+    background: rgba(79,199,138,0.10);
+  }
+  .card.dormant .phase-gist .phase {
+    color: var(--text-3);
+    border-color: rgba(255,255,255,0.06);
+    background: rgba(255,255,255,0.04);
+  }
+  .card .phase-gist .dotsep {
+    /* Sits between the phase chip and the gist text — quiet middot
+     * so the chip + dot + gist all read as a single tagline. */
+    color: var(--text-3);
+    margin: 0 6px;
+    font-weight: 600;
+  }
+  .card .phase-gist .gist {
+    color: var(--text-1);
+    font-weight: 400;
+  }
+
+  .card .meta {
+    font-size: 10px;
+    color: var(--text-3);
+    margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+    font-family: var(--mono);
+    margin-left: 19px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .card .meta .folder {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 70%;
+  }
+  .card .meta .sep {
+    color: var(--text-4);
+  }
+  .card .meta .age {
+    flex-shrink: 0;
+  }
+
+  /* Sub-agent block — one row per running agent, then an aggregate
+   * footer for completed/interrupted. Mirrors v0.3 behavior. */
+  .card .subagents {
+    margin-top: 6px;
+    margin-left: 19px;
+    border-top: 1px dashed rgba(255,255,255,0.06);
+    padding-top: 6px;
+  }
+  .card .agent-line {
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.45;
+    color: var(--text-2);
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .card .agent-line .state-glyph {
+    color: var(--teal);
+    flex-shrink: 0;
+  }
+  .card .agent-line .type {
+    color: var(--text-3);
+    flex-shrink: 0;
+  }
+  .card .agent-line .sep {
+    color: var(--text-4);
+    flex-shrink: 0;
+  }
+  .card .agent-line .desc {
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .card .agent-footer {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-4);
+    margin-top: 3px;
+  }
+
+  /* Dormant cards read in a single muted line — no phase, no gist,
+   * no sub-agents. They're history. */
+  .card.dormant .phase-gist,
+  .card.dormant .subagents { display: none; }
+  .card.dormant {
+    opacity: 0.7;
+  }
+  .card.dormant .title { color: var(--text-2); font-weight: 400; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+(function() {
+  'use strict';
+
+  // Column order is fixed so we always render the four buckets in the
+  // same left-to-right order regardless of object-key iteration order.
+  const COL_KEYS = ['needs', 'working', 'ready', 'dormant'];
+  const COL_LABELS = {
+    needs:   'Needs You',
+    working: 'Working',
+    ready:   'Finished',
+    dormant: 'Dormant',
+  };
+  // Status glyph per bucket. Circle states map to the v0.3.0 visual
+  // language (○ idle / ◐ in-progress / ● done).
+  const COL_GLYPH = {
+    needs:   '○',   // ○ — needs attention
+    working: '◐',   // ◐ — active
+    ready:   '●',   // ● — finished
+    dormant: '○',   // ○ — dormant
+  };
+
+  // ---- Bridge to Python (WKScriptMessageHandler) ----
+  // Sends a {action, payload} blob over the kanban message channel.
+  // The Python side handles dispatch — see userContentController:didReceiveScriptMessage:.
+  function send(action, payload) {
+    try {
+      window.webkit.messageHandlers.kanban.postMessage({
+        action: action,
+        payload: payload || {},
+      });
+    } catch (err) {
+      console.error('[kanban] bridge failure', err);
+    }
+  }
+
+  // Escape any HTML in user-supplied strings before inserting via
+  // innerHTML. We use textContent where possible but composite rows
+  // assemble template strings — this keeps the join cheap and safe.
+  function esc(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  // Build the inner HTML for one card. `row` is the slim JSON object
+  // sent from Python — see _serialize_row in floating.py for the
+  // exact field list.
+  function renderCard(row) {
+    const bucket = row.bucket || 'dormant';
+    const glyph = COL_GLYPH[bucket] || '○';
+    const titleSafe = esc(row.title || '(untitled)');
+    const folder = esc(row.folder || '');
+    const age = esc(row.age || '');
+    const unread = row.unread === true;
+
+    // Phase·gist line — phase in muted secondary, gist in primary.
+    let phaseGist = '';
+    const hasPhase = !!row.phase;
+    const hasGist = !!row.gist;
+    if (hasPhase || hasGist) {
+      let parts = [];
+      if (hasPhase) parts.push('<span class="phase">' + esc(row.phase) + '</span>');
+      if (hasPhase && hasGist) parts.push('<span class="dotsep">·</span>');
+      if (hasGist) parts.push('<span class="gist">' + esc(row.gist) + '</span>');
+      phaseGist = '<div class="phase-gist">' + parts.join('') + '</div>';
+    }
+
+    // Folder + age metadata line.
+    let metaLine = '';
+    if (folder || age) {
+      metaLine = '<div class="meta">'
+        + (folder ? '<span class="folder">' + folder + '</span>' : '')
+        + (folder && age ? '<span class="sep">·</span>' : '')
+        + (age ? '<span class="age">' + age + '</span>' : '')
+        + '</div>';
+    }
+
+    // Sub-agent block — running agents listed, then an aggregate
+    // footer for any overflow + done/interrupted counts.
+    let subBlock = '';
+    const subs = Array.isArray(row.subagents) ? row.subagents : [];
+    const running = subs.filter(function(s) { return s.state === 'running'; });
+    const doneCount = subs.filter(function(s) { return s.state === 'done'; }).length;
+    const interruptedCount = subs.filter(function(s) { return s.state === 'interrupted'; }).length;
+    const SHOW_MAX = 5;
+    const shown = running.slice(0, SHOW_MAX);
+    const overflow = running.length - shown.length;
+
+    if (shown.length > 0 || doneCount > 0 || interruptedCount > 0) {
+      let lines = shown.map(function(s) {
+        const type = esc(s.type || '');
+        const desc = esc(s.desc || '');
+        return '<div class="agent-line">'
+          + '<span class="state-glyph">◐</span>'   // ◐ for running
+          + (type ? '<span class="type">' + type + '</span>' : '')
+          + (type && desc ? '<span class="sep">·</span>' : '')
+          + '<span class="desc">' + desc + '</span>'
+          + '</div>';
+      });
+      // Aggregate footer
+      const footerParts = [];
+      if (overflow > 0) footerParts.push('+ ' + overflow + ' more working');
+      if (doneCount > 0) footerParts.push(doneCount + ' done');
+      if (interruptedCount > 0) footerParts.push(interruptedCount + ' interrupted');
+      let footer = '';
+      if (footerParts.length > 0) {
+        // Lead with "+" only if there's no overflow already prefixed.
+        const prefix = (overflow > 0) ? '' : '+ ';
+        footer = '<div class="agent-footer">' + prefix + footerParts.join(' · ') + '</div>';
+      }
+      subBlock = '<div class="subagents">' + lines.join('') + footer + '</div>';
+    }
+
+    // The clickable unread dot — only rendered when unread is true.
+    // We attach the click handler in the post-render wiring step so
+    // we can stop event propagation (don't trigger the card's
+    // resume-on-click when the user is just marking-as-read).
+    const unreadEl = unread
+      ? '<span class="unread-dot" data-action="mark-read"></span>'
+      : '';
+
+    return ''
+      + '<div class="title-row">'
+      +   '<span class="dot">' + esc(glyph) + '</span>'
+      +   '<span class="title">' + titleSafe + '</span>'
+      + '</div>'
+      + phaseGist
+      + metaLine
+      + subBlock
+      + unreadEl;
+  }
+
+  // Top-level render. Replaces the whole #app subtree on every refresh
+  // — cheap because there are O(20) cards total and we're not in a
+  // tight animation loop.
+  function renderApp(data) {
+    const app = document.getElementById('app');
+    if (!app) return;
+    app.classList.toggle('with-dormant', !!data.showDormant);
+
+    const buckets = data.buckets || {};
+    const cols = [];
+    COL_KEYS.forEach(function(key) {
+      if (key === 'dormant' && !data.showDormant) return;
+      const rows = buckets[key] || [];
+      const count = rows.length;
+      const label = COL_LABELS[key] || key;
+      const cards = rows.length
+        ? rows.map(function(r) {
+            return '<div class="card ' + esc(r.bucket)
+              + (r.unread ? ' is-unread' : '')
+              + '" data-session="' + esc(r.sessionId)
+              + '" data-cwd="' + esc(r.cwd || '')
+              + '">' + renderCard(r) + '</div>';
+          }).join('')
+        : '<div class="empty">—</div>';
+      cols.push(''
+        + '<div class="col" data-key="' + esc(key) + '">'
+        +   '<div class="col-header">'
+        +     '<span class="label">' + esc(label) + '</span>'
+        +     '<span class="count">' + count + '</span>'
+        +   '</div>'
+        +   '<div class="col-body">' + cards + '</div>'
+        + '</div>'
+      );
+    });
+    app.innerHTML = cols.join('');
+
+    // Wire click handlers AFTER the DOM is replaced.
+    wireClicks();
+  }
+
+  function wireClicks() {
+    document.querySelectorAll('.card').forEach(function(cardEl) {
+      // Card body → resume session in its host. Stop propagation on
+      // child controls (unread dot) so they don't also fire this.
+      cardEl.addEventListener('click', function(ev) {
+        const target = ev.target;
+        // If a control inside the card was clicked, let it handle.
+        if (target && target.closest('[data-action]')) return;
+        send('resume', {
+          sessionId: cardEl.dataset.session || '',
+          cwd: cardEl.dataset.cwd || '',
+        });
+      });
+    });
+    document.querySelectorAll('[data-action="mark-read"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const card = el.closest('.card');
+        if (!card) return;
+        send('markRead', {
+          sessionId: card.dataset.session || '',
+        });
+      });
+    });
+  }
+
+  // Expose for Python to call via evaluateJavaScript.
+  window.renderApp = renderApp;
+  // Empty initial state so the body isn't blank before the first
+  // refresh comes through.
+  renderApp({ buckets: {}, showDormant: false });
+
+  // Tell Python we're mounted and ready for renderApp() calls.
+  // PopoverVC buffers any refresh() that arrives before this fires
+  // and flushes it from the 'ready' handler.
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    send('ready');
+  } else {
+    document.addEventListener('DOMContentLoaded', function() { send('ready'); }, { once: true });
+  }
+})();
+</script>
+</body>
+</html>

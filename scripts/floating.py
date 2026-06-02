@@ -48,6 +48,7 @@ try:
         NSFont,
         NSFontAttributeName,
         NSForegroundColorAttributeName,
+        NSFontWeightMedium,
         NSFontWeightRegular,
         NSFontWeightSemibold,
         NSImage,
@@ -89,6 +90,14 @@ try:
         NSWindowStyleMaskTitled,
     )
     from Foundation import NSObject, NSTimer, NSURL
+    # WebKit is used by the kanban view to render the Linear-style
+    # design from a single HTML/CSS file — pixel-parity with the
+    # browser mockup without re-implementing CSS in CALayer.
+    from WebKit import (
+        WKWebView,
+        WKWebViewConfiguration,
+        WKUserContentController,
+    )
     import objc
 
     NSFloatingWindowLevel = 5  # AppKit constant — not always exported by PyObjC.
@@ -1507,15 +1516,19 @@ class KanbanCardView(NSView):
     # tweaks stay close to the drawing code.
     _PAD_TOP = 12.0
     _PAD_BOTTOM = 12.0
-    _PAD_LEFT_BAR = 8.0           # leading bar starts here
-    _PAD_LEFT_TEXT = 22.0         # text content starts here (after bar + gap)
-    _PAD_RIGHT = 14.0
-    _PAD_BUTTON_RIGHT = 32.0      # text right-padding when there's a ✓ button
+    # Linear-style: no leading bar — status is shown as a circle prefix
+    # on the title, drawn as part of the attributed string. Text starts
+    # close to the left edge (10pt) for tighter, more refined cards.
+    _PAD_LEFT_TEXT = 10.0
+    _PAD_RIGHT = 12.0
+    _PAD_BUTTON_RIGHT = 22.0      # text right-padding when there's an unread dot
+    _BUTTON_SIZE = 14.0           # unread indicator: small dot, was 22pt button
+    _CORNER_RADIUS = 5.0          # tighter (was 8) — Linear-style angular
+    _BUTTON_TOP_RIGHT_INSET = 8.0
+    # Kept around for back-compat (no callers should reference these now).
+    _PAD_LEFT_BAR = 8.0
     _BAR_WIDTH = 3.0
-    _BAR_VINSET = 8.0             # bar inset from top/bottom of card
-    _BUTTON_SIZE = 22.0
-    _CORNER_RADIUS = 8.0
-    _BUTTON_TOP_RIGHT_INSET = 6.0
+    _BAR_VINSET = 8.0
 
     def initWithRow_color_width_vc_density_(
         self, row, color, width: float, vc, density: str,
@@ -1551,7 +1564,9 @@ class KanbanCardView(NSView):
         self.attr_str = attr
         self.mark_button = None
 
-        # Card chrome: rounded background + thin border.
+        # Card chrome — Linear-style: tight 5pt radius, nearly-invisible
+        # hairline border (the column's lifted background does the
+        # delineation work), flat (no shadow).
         self.setWantsLayer_(True)
         layer = self.layer()
         if layer is not None:
@@ -1559,9 +1574,9 @@ class KanbanCardView(NSView):
             layer.setBackgroundColor_(
                 NSColor.controlBackgroundColor().CGColor()
             )
-            layer.setBorderWidth_(0.5)
+            layer.setBorderWidth_(1.0)
             layer.setBorderColor_(
-                NSColor.separatorColor().colorWithAlphaComponent_(0.7).CGColor()
+                NSColor.separatorColor().colorWithAlphaComponent_(0.20).CGColor()
             )
 
         if unread:
@@ -1636,9 +1651,26 @@ class KanbanCardView(NSView):
                 NSAttributedString.alloc().initWithString_attributes_(text, attrs)
             )
 
-        # Title — bold, primary (always shown).
+        # Status circle prefix + title — Linear-style. The circle glyph
+        # (○ ◐ ●) carries the bucket color; the title text is primary
+        # label color (weight 500 — refined, not heavy). Maps the row's
+        # bucket to the right circle shape:
+        #   needs/dormant → ○ (empty), working → ◐ (half), ready → ●
+        bucket = (row.get("bucket") or "").strip()
+        status_glyph = {
+            "needs":   "○",
+            "working": "◐",
+            "ready":   "●",
+            "dormant": "○",
+        }.get(bucket, "○")
+        add(status_glyph + "  ", {
+            NSFontAttributeName: NSFont.systemFontOfSize_(13),
+            NSForegroundColorAttributeName: (color or label),
+        })
         add(title, {
-            NSFontAttributeName: title_font,
+            NSFontAttributeName: NSFont.systemFontOfSize_weight_(
+                13, NSFontWeightMedium,
+            ),
             NSForegroundColorAttributeName: label,
         })
 
@@ -1655,9 +1687,14 @@ class KanbanCardView(NSView):
         if phase or gist:
             add("\n\n", {NSFontAttributeName: tiny_spacer})
             if phase:
+                # Linear-style polish: phase reads as a quiet metadata
+                # tag, not a colored shout. The status color already
+                # rides on the title prefix glyph (○ ◐ ●) — keeping
+                # phase in muted secondary stops the row competing
+                # with its own header.
                 add(phase, {
                     NSFontAttributeName: phase_font,
-                    NSForegroundColorAttributeName: color or label,
+                    NSForegroundColorAttributeName: secondary,
                 })
                 if gist:
                     add("  ·  ", {
@@ -1683,33 +1720,61 @@ class KanbanCardView(NSView):
                 })
 
         # Sub-agents — Focus + Detail. One line per actively-running
-        # child sub-agent: "◐ <agent_type> · <description>". Done /
-        # interrupted children are intentionally hidden so the section
-        # only ever conveys "what's happening right now" — not history.
-        # When zero running, this block emits nothing regardless of how
-        # many have already finished.
+        # child sub-agent: "◐ <agent_type> · <description>" with the
+        # ◐ glyph teal-tinted (the "this is alive" color) and the rest
+        # in muted typography. A separate aggregate footer summarizes
+        # any done/interrupted children in the same session so the user
+        # can see total session activity without each item bloating the
+        # card. Hidden in glance density.
         subs = row.get("subagents") or []
         running_subs = [s for s in subs if s.get("state") == SUBAGENT_RUNNING]
-        if running_subs and density != "glance":
+        done_count = sum(1 for s in subs if (s.get("state") or "") == "done")
+        interrupted_count = sum(
+            1 for s in subs if (s.get("state") or "") == "interrupted"
+        )
+        if (running_subs or done_count or interrupted_count) and density != "glance":
             teal = (
                 NSColor.systemTealColor()
                 if hasattr(NSColor, "systemTealColor") else color or label
             )
+            mono_font = _rounded_tabular_font(10.5, NSFontWeightRegular)
             shown = running_subs[:SUBAGENT_MAX_DISPLAY]
             remaining = len(running_subs) - len(shown)
             for sub in shown:
                 add("\n\n", {NSFontAttributeName: tiny_spacer})
                 atype = (sub.get("agent_type") or "").strip()
                 desc = _clip(sub.get("name") or "agent", 100)
-                line = f"◐ {atype} · {desc}" if atype else f"◐ {desc}"
-                add(line, {
-                    NSFontAttributeName: snippet_font,
+                # Tinted ◐ glyph
+                add("◐  ", {
+                    NSFontAttributeName: mono_font,
                     NSForegroundColorAttributeName: teal,
                 })
+                if atype:
+                    add(atype, {
+                        NSFontAttributeName: mono_font,
+                        NSForegroundColorAttributeName: tertiary,
+                    })
+                    add(" · ", {
+                        NSFontAttributeName: mono_font,
+                        NSForegroundColorAttributeName: NSColor.quaternaryLabelColor() if hasattr(NSColor, "quaternaryLabelColor") else tertiary,
+                    })
+                add(desc, {
+                    NSFontAttributeName: mono_font,
+                    NSForegroundColorAttributeName: label,
+                })
+            # Aggregate footer for any agents not shown individually
+            # (running overflow, plus completed/interrupted history).
+            footer_parts: list = []
             if remaining > 0:
+                footer_parts.append(f"+ {remaining} more working")
+            if done_count > 0:
+                footer_parts.append(f"{done_count} done")
+            if interrupted_count > 0:
+                footer_parts.append(f"{interrupted_count} interrupted")
+            if footer_parts:
                 add("\n\n", {NSFontAttributeName: tiny_spacer})
-                add(f"   + {remaining} more working", {
-                    NSFontAttributeName: meta_font,
+                add("+ " + " · ".join(footer_parts) if not remaining else " · ".join(footer_parts), {
+                    NSFontAttributeName: mono_font,
                     NSForegroundColorAttributeName: tertiary,
                 })
 
@@ -1755,10 +1820,15 @@ class KanbanCardView(NSView):
 
     @objc.python_method
     def _install_mark_read_button(self):
+        """Linear-style unread indicator: a small blue dot rendered as
+        the button's title ("●") in the top-right corner. Click still
+        works (calls markReadClicked:), but visually the affordance is
+        a status pip, not a checkmark button. Keeps the card chrome
+        minimal — no boxy buttons fighting the layout."""
         btn = _FirstMouseButton.alloc().init()
-        btn.setTitle_("✓")
+        btn.setTitle_("●")
         btn.setBordered_(False)
-        btn.setFont_(NSFont.systemFontOfSize_weight_(14, NSFontWeightSemibold))
+        btn.setFont_(NSFont.systemFontOfSize_(8))
         btn.setContentTintColor_(
             NSColor.controlAccentColor()
             if hasattr(NSColor, "controlAccentColor") else NSColor.labelColor()
@@ -1782,18 +1852,8 @@ class KanbanCardView(NSView):
 
     def drawRect_(self, _dirty):
         bounds = self.bounds()
-        # Colored leading bar (bucket tint).
-        if self.bucket_color is not None:
-            bar_x = KanbanCardView._PAD_LEFT_BAR
-            bar_y = KanbanCardView._BAR_VINSET
-            bar_w = KanbanCardView._BAR_WIDTH
-            bar_h = max(0.0, bounds.size.height - 2 * KanbanCardView._BAR_VINSET)
-            self.bucket_color.setFill()
-            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                NSMakeRect(bar_x, bar_y, bar_w, bar_h),
-                bar_w / 2.0, bar_w / 2.0,
-            ).fill()
-        # Text content
+        # No left bar — status circle is part of the title attributed
+        # string. The card chrome is intentionally minimal (border only).
         unread = bool(self.row_data.get("unread")) if self.row_data else False
         right_pad = (
             KanbanCardView._PAD_BUTTON_RIGHT if unread
@@ -1881,6 +1941,16 @@ class PopoverVC(NSViewController):
     # where "stack" holds the KanbanCardView subviews and "header" is
     # the NSTextField at the top of the column. Rebuilt on every refresh.
     kanban_columns = objc.ivar("kanban_columns")
+    # WKWebView that renders the kanban from scripts/kanban.html — the
+    # design-fidelity path. Refresh sends a JSON payload via
+    # evaluateJavaScript and JS calls back through WKScriptMessageHandler.
+    kanban_web = objc.ivar("kanban_web")
+    kanban_web_ready = objc.ivar("kanban_web_ready")
+    # Buckets buffered between "JS not loaded yet" and "JS now ready":
+    # the WKWebView loads asynchronously, so the first refresh that
+    # arrives before document-ready stashes its payload here and we
+    # flush it once the page signals it's mounted.
+    kanban_web_pending = objc.ivar("kanban_web_pending")
     popover_ref = objc.ivar("popover_ref")    # NSPopover, set by BadgeController
     last_rendered_rows = objc.ivar("last_rendered_rows")  # for mark-all-read
     show_dormant = objc.ivar("show_dormant")   # bool — toggle to hide dormant
@@ -2032,7 +2102,7 @@ class PopoverVC(NSViewController):
 
         # Build BOTH layouts upfront; only the current one is in the host.
         self._build_list_views()
-        self._build_kanban_views()
+        self._build_kanban_web()
         self._install_layout()
 
         self.setView_(container)
@@ -2091,45 +2161,113 @@ class PopoverVC(NSViewController):
         col_w0 = max(1.0, (host_bounds.size.width - 32) / 3.0)
         col_h0 = max(1.0, host_bounds.size.height - 8)
 
+        # Reserved space at the top of each column for the sticky
+        # header + hairline. Must match HEADER_H/HEADER_GAP in
+        # _render_kanban so the scroll view sits exactly below the
+        # header rule.
+        STICKY_H = 20.0
+        HAIRLINE_H = 1.0
+
         columns: list[dict] = []
         for key in ("needs", "working", "ready", "dormant"):
-            col_scroll = NSScrollView.alloc().initWithFrame_(
+            # Wrapper NSView per column: contains a fixed-position
+            # header + hairline at the top and the scroll view below.
+            # Lets the header stay put while cards inside the scroll
+            # view scroll under it — the macOS-idiomatic way to do
+            # sticky table-style headers without subclassing NSClipView.
+            # Standard (unflipped) coords: y=0 is at the BOTTOM of the
+            # wrapper, so the header + hairline live at the top via
+            # `y = wrapper_h - STICKY_H` and an autoresize mask that
+            # keeps them glued to the top edge.
+            col_wrap = NSView.alloc().initWithFrame_(
                 NSMakeRect(0, 0, col_w0, col_h0)
+            )
+            col_wrap.setAutoresizingMask_(
+                NSViewWidthSizable | NSViewHeightSizable
+            )
+
+            col_scroll = NSScrollView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, col_w0, col_h0 - STICKY_H - HAIRLINE_H)
             )
             col_scroll.setHasVerticalScroller_(True)
             col_scroll.setHasHorizontalScroller_(False)
             col_scroll.setBorderType_(0)
-            col_scroll.setDrawsBackground_(False)
+            # Linear-style "layered surface" — column body sits on a
+            # very subtle white wash (~3% alpha) so the dark popover
+            # bg shows through but the columns read as a distinct
+            # surface that cards float on. Works in both light/dark
+            # appearance via white-with-alpha.
+            col_scroll.setDrawsBackground_(True)
+            col_scroll.setBackgroundColor_(
+                NSColor.colorWithWhite_alpha_(1.0, 0.03)
+            )
+            # Stretch to fill wrapper width AND height (header reserves
+            # its slot via wrap_h - STICKY_H subtraction below).
             col_scroll.setAutoresizingMask_(
                 NSViewWidthSizable | NSViewHeightSizable
             )
 
             doc = KanbanColumnDocView.alloc().initWithFrame_(
-                NSMakeRect(0, 0, col_w0, col_h0)
+                NSMakeRect(0, 0, col_w0, col_h0 - STICKY_H - HAIRLINE_H)
             )
             doc.setAutoresizingMask_(NSViewWidthSizable)
-
-            # Column header — set per-refresh because the count changes.
-            header = NSTextField.labelWithString_("")
-            header.setFont_(
-                NSFont.systemFontOfSize_weight_(10.0, NSFontWeightSemibold)
-            )
-            header.setTextColor_(_bucket_tint(key))
-            header.setAutoresizingMask_(NSViewWidthSizable)
-            doc.addSubview_(header)
-
             col_scroll.setDocumentView_(doc)
+
+            # Header at the top of the wrapper. Frame y is set such
+            # that the header sits flush with the top edge; autoresize
+            # mask keeps it pinned there when the wrapper resizes
+            # (MinYMargin = the bottom margin grows, top stays fixed).
+            header = NSTextField.labelWithString_("")
+            header.setFrame_(NSMakeRect(
+                0, col_h0 - STICKY_H, col_w0, STICKY_H,
+            ))
+            header.setAutoresizingMask_(
+                NSViewWidthSizable | NSViewMinYMargin
+            )
+            # Layer-backed with the popover bg so cards scrolling
+            # behind don't show through the header's text.
+            header.setWantsLayer_(True)
+            if header.layer() is not None:
+                header.layer().setBackgroundColor_(
+                    NSColor.controlBackgroundColor().CGColor()
+                )
+
+            # Hairline beneath the header — 1pt rule that visually
+            # separates the column title from the cards.
+            hairline = NSView.alloc().initWithFrame_(NSMakeRect(
+                0, col_h0 - STICKY_H - HAIRLINE_H, col_w0, HAIRLINE_H,
+            ))
+            hairline.setAutoresizingMask_(
+                NSViewWidthSizable | NSViewMinYMargin
+            )
+            hairline.setWantsLayer_(True)
+            if hairline.layer() is not None:
+                hairline.layer().setBackgroundColor_(
+                    NSColor.separatorColor()
+                    .colorWithAlphaComponent_(0.3)
+                    .CGColor()
+                )
+
+            # Assemble: scroll fills the bottom area, header + hairline
+            # pin to the top.
+            col_wrap.addSubview_(col_scroll)
+            col_wrap.addSubview_(hairline)
+            col_wrap.addSubview_(header)
+
             # Only add active-bucket columns to the stack upfront; the
             # dormant column is added/removed by _render_kanban based on
-            # the Show-older toggle.
+            # the Show-older toggle. We add the WRAPPER (not the scroll
+            # view) so each column gets its sticky header along with it.
             if key != "dormant":
-                stack.addArrangedSubview_(col_scroll)
+                stack.addArrangedSubview_(col_wrap)
 
             columns.append({
                 "key": key,
+                "wrap": col_wrap,
                 "scroll": col_scroll,
                 "doc": doc,
                 "header": header,
+                "hairline": hairline,
             })
 
         self.kanban_stack = stack
@@ -2137,6 +2275,77 @@ class PopoverVC(NSViewController):
         # The Mark-all button now lives in the popover top bar (built
         # in _load_view_safely); these ivars stay for back-compat.
         self.kanban_footer = None
+
+    def dealloc(self):
+        """Break the retain cycle WKUserContentController → PopoverVC
+        on teardown. PopoverVC currently lives for the lifetime of the
+        app under BadgeController so this rarely fires — but on a
+        clean quit/restart it keeps the old VC from receiving stale
+        messages from a still-live web view in tear-down order."""
+        try:
+            if self.kanban_web is not None:
+                cfg = self.kanban_web.configuration()
+                if cfg is not None:
+                    cc = cfg.userContentController()
+                    if cc is not None:
+                        cc.removeScriptMessageHandlerForName_("kanban")
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[PopoverVC.dealloc] cleanup: {e!r}\n")
+        objc.super(PopoverVC, self).dealloc()
+
+    @objc.python_method
+    def _build_kanban_web(self):
+        """Build a single WKWebView that renders the kanban from
+        scripts/kanban.html. This replaces the native NSStackView +
+        scroll-view-per-column path. Refresh feeds the view a JSON
+        payload via evaluateJavaScript; clicks come back through a
+        WKScriptMessageHandler named 'kanban'."""
+        host_bounds = self.content_host.bounds()
+        if host_bounds.size.width < 10:
+            host_bounds = NSMakeRect(
+                0, 0, POPOVER_KANBAN_SIZE[0],
+                POPOVER_KANBAN_SIZE[1] - 32,
+            )
+
+        config = WKWebViewConfiguration.alloc().init()
+        content_ctrl = WKUserContentController.alloc().init()
+        # Bridge JS → Python. JS posts via window.webkit.messageHandlers.kanban.
+        content_ctrl.addScriptMessageHandler_name_(self, "kanban")
+        config.setUserContentController_(content_ctrl)
+
+        web = WKWebView.alloc().initWithFrame_configuration_(
+            host_bounds, config,
+        )
+        web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        # Transparent so the popover bg shows through during initial
+        # paint instead of a flash of white.
+        try:
+            web.setValue_forKey_(False, "drawsBackground")
+        except Exception:  # noqa: BLE001
+            pass
+        # Suppress the macOS "rubber band" elastic scroll outside the
+        # bounds — feels weird in a panel.
+        try:
+            web.setAllowsBackForwardNavigationGestures_(False)
+        except Exception:  # noqa: BLE001
+            pass
+        # Reload-on-script-change is nice in dev but we'll skip for
+        # now — change the HTML and restart the panel.
+
+        html_path = Path(__file__).resolve().parent / "kanban.html"
+        try:
+            html_str = html_path.read_text(encoding="utf-8")
+        except OSError as e:
+            sys.stderr.write(f"[kanban-web] failed to read {html_path}: {e}\n")
+            html_str = "<h1>kanban.html missing</h1>"
+        # baseURL points at the scripts/ dir so any future relative
+        # resources (fonts, images) resolve cleanly.
+        base_url = NSURL.fileURLWithPath_(str(html_path.parent) + "/")
+        web.loadHTMLString_baseURL_(html_str, base_url)
+
+        self.kanban_web = web
+        self.kanban_web_ready = False
+        self.kanban_web_pending = None
 
     @objc.python_method
     def _install_layout(self):
@@ -2146,8 +2355,8 @@ class PopoverVC(NSViewController):
         for sub in list(self.content_host.subviews()):
             sub.removeFromSuperview()
         if self.mode == "kanban":
-            self.kanban_stack.setFrame_(self.content_host.bounds())
-            self.content_host.addSubview_(self.kanban_stack)
+            self.kanban_web.setFrame_(self.content_host.bounds())
+            self.content_host.addSubview_(self.kanban_web)
         else:
             self.list_scroll.setFrame_(self.content_host.bounds())
             self.content_host.addSubview_(self.list_scroll)
@@ -2317,93 +2526,149 @@ class PopoverVC(NSViewController):
         self._update_mark_all_button()
 
     @objc.python_method
+    def _serialize_row(self, row: dict) -> dict:
+        """Slim a backend row dict down to what kanban.html actually
+        needs. Anything the JS doesn't read is dropped — keeps the
+        evaluateJavaScript payload small and avoids leaking transcript
+        meta blobs into the web context."""
+        s = row.get("s") or {}
+        meta = row.get("meta") or {}
+        cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) else ""
+        # Friendlier folder display: collapse $HOME → ~ so a path like
+        # /Users/moustafasamir/Documents/X reads as ~/Documents/X.
+        if cwd.startswith(str(HOME)):
+            cwd_display = "~" + cwd[len(str(HOME)):]
+        else:
+            cwd_display = cwd
+        # Sub-agents — only carry the three fields JS renders.
+        subs_out = []
+        for sub in (row.get("subagents") or []):
+            subs_out.append({
+                "type": (sub.get("agent_type") or "").strip(),
+                "desc": (sub.get("name") or "").strip()[:140],
+                "state": sub.get("state") or "",
+            })
+        return {
+            "sessionId": s.get("sessionId") or "",
+            "cwd": cwd,
+            "folder": cwd_display,
+            "title": (row.get("title") or "(untitled)").strip(),
+            "phase": row.get("phase_label") or "",
+            "gist": row.get("gist") or "",
+            "age": format_ago(row.get("ago_s") or 0),
+            "bucket": row.get("bucket") or "dormant",
+            "unread": bool(row.get("unread")),
+            "subagents": subs_out,
+        }
+
+    @objc.python_method
     def _render_kanban(self, buckets):
-        """Rebuild the per-column card lists. Active buckets always
-        render in the first three columns; the dormant column is added
-        to the kanban stack as a 4th column on the right when the
-        Show-older toggle is on, and removed otherwise."""
-        if self.kanban_columns is None:
+        """Push the bucket data into the WKWebView. JS does the actual
+        DOM build; we just serialize + evaluateJavaScript."""
+        if self.kanban_web is None:
             return
 
-        HEADER_H = 20.0
-        HEADER_GAP = 6.0
-        CARD_GAP = 8.0
-        DOC_LEFT_PAD = 4.0
-        DOC_RIGHT_PAD = 4.0
+        payload = {
+            "buckets": {
+                k: [self._serialize_row(r) for r in (buckets.get(k) or [])]
+                for k in ("needs", "working", "ready", "dormant")
+            },
+            "showDormant": bool(self.show_dormant),
+            "density": self.density or "focus",
+        }
 
-        # Sync the dormant column's membership in the outer stack with
-        # the show_dormant toggle. NSStackView.FILL_EQUALLY redistributes
-        # automatically once we add/remove the arranged subview.
-        dormant_col = next(
-            (c for c in self.kanban_columns if c["key"] == "dormant"), None,
-        )
-        if dormant_col is not None:
-            current = list(self.kanban_stack.arrangedSubviews())
-            in_stack = dormant_col["scroll"] in current
-            if self.show_dormant and not in_stack:
-                self.kanban_stack.addArrangedSubview_(dormant_col["scroll"])
-            elif (not self.show_dormant) and in_stack:
-                self.kanban_stack.removeArrangedSubview_(dormant_col["scroll"])
-                dormant_col["scroll"].removeFromSuperview()
-
-        col_count = 4 if self.show_dormant else 3
-
-        for col in self.kanban_columns:
-            key = col["key"]
-            # Skip drawing into the dormant column when it's hidden —
-            # not strictly necessary but cheaper.
-            if key == "dormant" and not self.show_dormant:
-                continue
-            doc = col["doc"]
-            header = col["header"]
-            scroll = col["scroll"]
-            rows = buckets.get(key) or []
-
-            # Tear down everything except the persistent header.
-            for sub in list(doc.subviews()):
-                if sub is not header:
-                    sub.removeFromSuperview()
-
-            # The scroll view's content width minus our doc padding.
-            col_bounds_w = scroll.contentSize().width
-            if col_bounds_w < 10:
-                # Scroll view hasn't laid out yet; fall back to a
-                # sensible default so cards still measure correctly.
-                target_w = (
-                    POPOVER_KANBAN_WITH_DORMANT_SIZE[0]
-                    if self.show_dormant else POPOVER_KANBAN_SIZE[0]
-                )
-                col_bounds_w = (target_w - 32) / col_count
-            card_w = max(50.0, col_bounds_w - DOC_LEFT_PAD - DOC_RIGHT_PAD)
-
-            # Update + place the header at the top of the doc view.
-            header.setStringValue_(f"  {LABELS[key]}  ·  {len(rows)}")
-            header.setTextColor_(_bucket_tint(key))
-            header.setFrame_(NSMakeRect(
-                DOC_LEFT_PAD, 0,
-                col_bounds_w - DOC_LEFT_PAD - DOC_RIGHT_PAD, HEADER_H,
-            ))
-
-            y = HEADER_H + HEADER_GAP
-            color = _bucket_tint(key)
-            for row in rows:
-                card = KanbanCardView.alloc().initWithRow_color_width_vc_density_(
-                    row, color, card_w, self, self.density or "focus",
-                )
-                if card is None:
-                    continue
-                ch = card.frame().size.height
-                card.setFrame_(NSMakeRect(DOC_LEFT_PAD, y, card_w, ch))
-                doc.addSubview_(card)
-                y += ch + CARD_GAP
-
-            # Resize the doc view to the total laid-out height so the
-            # scroll view knows it needs to scroll (or doesn't).
-            content_h = scroll.contentSize().height
-            doc_h = max(content_h, y + 8.0)
-            doc.setFrame_(NSMakeRect(0, 0, col_bounds_w, doc_h))
+        # If the JS isn't ready yet (initial loadHTMLString hasn't
+        # settled), buffer the payload — the navigation-finished JS
+        # handshake flushes it via _kanban_web_flush_pending.
+        if not self.kanban_web_ready:
+            self.kanban_web_pending = payload
+        else:
+            self._kanban_web_evaluate(payload)
 
         self._update_mark_all_button()
+
+    @objc.python_method
+    def _kanban_web_evaluate(self, payload: dict):
+        """Serialize + evaluateJavaScript window.renderApp(payload)."""
+        try:
+            # ensure_ascii=True is defense-in-depth: any non-ASCII
+            # character in a session title / gist / folder path gets
+            # rewritten as a \uXXXX escape, so we never need to worry
+            # about a transcript embedding `</script>`, U+2028, or any
+            # other JS-source-aware sequence smuggling into the JS
+            # string literal we're about to build below.
+            js_data = json.dumps(payload, ensure_ascii=True)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[kanban-web] payload serialize: {e!r}\n")
+            return
+        # Use JSON.parse on a string literal — embedding the JSON
+        # directly as a JS literal would force us to escape every
+        # interior backtick/quote. JSON.parse handles arbitrary
+        # content inside a single quoted string instead.
+        encoded = json.dumps(js_data)  # double-encode to a JS string literal
+        js = f"window.renderApp(JSON.parse({encoded}));"
+        self.kanban_web.evaluateJavaScript_completionHandler_(js, None)
+
+    # ---- WKScriptMessageHandler ----
+    # Called by WebKit when JS posts via
+    # window.webkit.messageHandlers.kanban.postMessage(...).
+    def userContentController_didReceiveScriptMessage_(self, ctrl, msg):
+        try:
+            body = msg.body()
+            # PyObjC may hand us an NSDictionary; coerce to plain dict.
+            if hasattr(body, "objectForKey_"):
+                action = str(body.objectForKey_("action") or "")
+                payload = body.objectForKey_("payload") or {}
+                # Coerce NSDictionary payload to a plain dict for .get()
+                if hasattr(payload, "objectForKey_"):
+                    sid = str(payload.objectForKey_("sessionId") or "")
+                    cwd = str(payload.objectForKey_("cwd") or "")
+                else:
+                    sid = str((payload or {}).get("sessionId") or "")
+                    cwd = str((payload or {}).get("cwd") or "")
+            else:
+                action = str((body or {}).get("action") or "")
+                pl = (body or {}).get("payload") or {}
+                sid = str(pl.get("sessionId") or "")
+                cwd = str(pl.get("cwd") or "")
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[kanban-web] msg decode: {e!r}\n")
+            return
+
+        if action == "resume":
+            if not sid:
+                return
+            # Mark-as-read on resume — engaging with the session.
+            for r in (self.last_rendered_rows or []):
+                if (r.get("s") or {}).get("sessionId") == sid:
+                    epoch = r.get("lastTurnEpoch")
+                    _mark_session_read(sid, epoch if epoch is not None else time.time())
+                    break
+            self._open_session_in_terminal(sid, cwd or os.path.expanduser("~"))
+            if self.popover_ref is not None:
+                try:
+                    self.popover_ref.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        elif action == "markRead":
+            if not sid:
+                return
+            epoch = None
+            for r in (self.last_rendered_rows or []):
+                if (r.get("s") or {}).get("sessionId") == sid:
+                    epoch = r.get("lastTurnEpoch")
+                    break
+            _mark_session_read(sid, epoch if epoch is not None else time.time())
+            self.refresh()
+        elif action == "ready":
+            # First time the JS finishes mounting — flush any buffered
+            # payload from refreshes that arrived before now.
+            self.kanban_web_ready = True
+            if self.kanban_web_pending is not None:
+                self._kanban_web_evaluate(self.kanban_web_pending)
+                self.kanban_web_pending = None
+        else:
+            sys.stderr.write(f"[kanban-web] unknown action: {action!r}\n")
 
     @objc.python_method
     def _row_paragraph_style(self, right_edge: float):
