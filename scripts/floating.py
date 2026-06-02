@@ -1951,6 +1951,11 @@ class PopoverVC(NSViewController):
     # arrives before document-ready stashes its payload here and we
     # flush it once the page signals it's mounted.
     kanban_web_pending = objc.ivar("kanban_web_pending")
+    # Last-seen mtime of scripts/kanban.html — dev convenience that
+    # auto-reloads the CSS/JS when the file changes on disk. Set on
+    # _build_kanban_web; checked once per refresh and re-loaded if
+    # the file has been edited since.
+    kanban_html_mtime = objc.ivar("kanban_html_mtime")
     popover_ref = objc.ivar("popover_ref")    # NSPopover, set by BadgeController
     last_rendered_rows = objc.ivar("last_rendered_rows")  # for mark-all-read
     show_dormant = objc.ivar("show_dormant")   # bool — toggle to hide dormant
@@ -2332,12 +2337,14 @@ class PopoverVC(NSViewController):
         # Reload-on-script-change is nice in dev but we'll skip for
         # now — change the HTML and restart the panel.
 
-        html_path = Path(__file__).resolve().parent / "kanban.html"
+        html_path = self._kanban_html_path()
         try:
             html_str = html_path.read_text(encoding="utf-8")
+            mtime = html_path.stat().st_mtime
         except OSError as e:
             sys.stderr.write(f"[kanban-web] failed to read {html_path}: {e}\n")
             html_str = "<h1>kanban.html missing</h1>"
+            mtime = 0.0
         # baseURL points at the scripts/ dir so any future relative
         # resources (fonts, images) resolve cleanly.
         base_url = NSURL.fileURLWithPath_(str(html_path.parent) + "/")
@@ -2346,6 +2353,41 @@ class PopoverVC(NSViewController):
         self.kanban_web = web
         self.kanban_web_ready = False
         self.kanban_web_pending = None
+        self.kanban_html_mtime = mtime
+
+    @objc.python_method
+    def _kanban_html_path(self) -> Path:
+        return Path(__file__).resolve().parent / "kanban.html"
+
+    @objc.python_method
+    def _maybe_reload_kanban_html(self):
+        """Dev convenience: if kanban.html has been edited on disk
+        since we last loaded it, re-read + reload into the WKWebView.
+        Called once per refresh; one stat() call per ~5s is cheap and
+        makes design iteration feel instant — no badge restart needed."""
+        if self.kanban_web is None:
+            return
+        path = self._kanban_html_path()
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if mtime <= (self.kanban_html_mtime or 0.0):
+            return
+        try:
+            html_str = path.read_text(encoding="utf-8")
+        except OSError as e:
+            sys.stderr.write(f"[kanban-web] reload read failed: {e}\n")
+            return
+        self.kanban_html_mtime = mtime
+        # Re-loading drops the JS context, so flip ready back to False
+        # and let the new page's "ready" handshake flush the next
+        # refresh's payload (already buffered into kanban_web_pending
+        # by _render_kanban before this method returns).
+        self.kanban_web_ready = False
+        base_url = NSURL.fileURLWithPath_(str(path.parent) + "/")
+        self.kanban_web.loadHTMLString_baseURL_(html_str, base_url)
+        sys.stderr.write(f"[kanban-web] reloaded {path.name} (mtime {mtime:.0f})\n")
 
     @objc.python_method
     def _install_layout(self):
@@ -2567,6 +2609,10 @@ class PopoverVC(NSViewController):
         DOM build; we just serialize + evaluateJavaScript."""
         if self.kanban_web is None:
             return
+
+        # Hot-reload kanban.html if it changed on disk. Cheap (one
+        # stat call); makes design iteration feel instant.
+        self._maybe_reload_kanban_html()
 
         payload = {
             "buckets": {
