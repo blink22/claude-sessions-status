@@ -869,29 +869,34 @@ def is_dormant(
     live: set[str],
     bucket: str,
 ) -> bool:
-    """A session is dormant — push to the bottom of the menu — if:
-      (a) it's been silent for DORMANT_AFTER_SECS regardless of bucket
-          (truly abandoned), OR
-      (b) it's in the 'finished' bucket and you haven't touched it for
-          STALE_FINISHED_SECS (probably moved past it), OR
-      (c) the Claude process isn't running anymore AND there hasn't
-          been recent transcript activity (RECENT_ACTIVITY_GRACE_SECS).
+    """A session is dormant — push to the bottom of the menu — when
+    any of these three conditions fire, checked in order:
 
-    The third condition is the subtle one: we don't trust "no live pid"
-    by itself, because Claude Desktop GUI sessions never write pid
-    files at all — only the Claude CLI does. Without the grace window,
-    every GUI-launched session would jump straight to DORMANT the moment
-    Claude finished a turn, hiding it before the user could see the
-    result in NEEDS YOU or FINISHED. With the grace window, a GUI
-    session that just updated its transcript stays in its natural
-    bucket for RECENT_ACTIVITY_GRACE_SECS; only AFTER it's been quiet
-    for that long AND has no live CLI process do we declare it dormant.
+      (a) Absolute ceiling: silent for DORMANT_AFTER_SECS regardless
+          of bucket. This is the hard cap on visibility — even a
+          session marked NEEDS YOU eventually drops off if you've
+          truly walked away.
+      (b) Finished + stale: a session in the 'ready' bucket you
+          haven't touched for STALE_FINISHED_SECS (probably moved on).
+      (c) No live process + past the grace window: the Claude CLI's
+          pid file isn't there AND the transcript hasn't moved in
+          RECENT_ACTIVITY_GRACE_SECS. This is the subtle case — we
+          don't trust "no live pid" by itself, because Claude Desktop
+          GUI sessions never write pid files (only the CLI does).
+          Without the grace window, every GUI-launched session would
+          jump straight to DORMANT the moment Claude finished a turn,
+          hiding the result before the user could see it in NEEDS YOU
+          or FINISHED. With the grace window, a GUI session that just
+          updated its transcript stays in its natural bucket for
+          RECENT_ACTIVITY_GRACE_SECS; only after it's been quiet for
+          that long AND has no live CLI process do we declare it
+          dormant.
 
     NEEDS YOU and WORKING are kept visible up to DORMANT_AFTER_SECS
     because they're inherently demanding attention."""
     if ago_seconds > DORMANT_AFTER_SECS:
         return True
-    if bucket == "ready" and ago_seconds > STALE_FINISHED_SECS:
+    if bucket == BUCKET_READY and ago_seconds > STALE_FINISHED_SECS:
         return True
     if (
         session_id
