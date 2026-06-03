@@ -4,6 +4,76 @@ All notable changes to this project are documented here. Format roughly
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.0 — 2026-06-03
+
+The popover gets a from-scratch redesign. Kanban and list views both
+now render through a single WKWebView from `scripts/kanban.html`, with
+a Linear-inspired dark theme: status circle on title, tinted phase
+chip, wrapping gist + sub-agent descriptions, sticky column headers,
+layered surfaces. List view finally matches the kanban's visual
+language — same cards, same dark theme, just stacked vertically.
+
+### Changed
+
+- **Popover content now renders via WKWebView.** One HTML/CSS/JS
+  template (`scripts/kanban.html`) drives both kanban and list
+  modes; CSS branches on `body.mode-{kanban,list}` for layout. Clicks
+  bridge back to Python via a `WKScriptMessageHandler` named `kanban`,
+  routing to the same resume / mark-as-read handlers as before.
+- **List view shares the kanban theme.** The old flat
+  attributed-string list is replaced with the same dark cards used
+  in kanban — status circle, phase chip, wrapping descriptions,
+  hover affordance, click-to-resume — laid out as a vertical stack
+  of sections with a single outer scroller.
+- **Status circle on every title** (○ Needs You / ◐ Working / ●
+  Finished / ○ Dormant). The bucket color rides on the circle, so
+  the rest of the card stays calm.
+- **Phase is a tinted pill chip** in the bucket color (red /
+  amber / green / gray), with a middot separator before the gist
+  text. Replaces the previous all-caps phase prefix.
+- **Descriptions wrap, no longer truncate.** The session gist and
+  per-sub-agent descriptions both flow onto multiple lines instead
+  of clipping with an ellipsis, so long entries are visible at a
+  glance.
+- **Sticky per-column headers in kanban mode.** Cards scroll under
+  the header; the header stays put with a hairline rule beneath.
+- **Unread indicator is a small blue dot** in the card's top-right
+  corner — click it to mark-as-read. Replaces the previous `✓` button.
+- **Column headers in sentence case** with tabular counts:
+  "Needs You 3", "Working 1", "Finished 12", "Dormant 4". Quieter
+  than the previous all-caps colored headers; the column color
+  signal moved to the cards.
+- **Layered surfaces** — columns sit on a 3-4% lighter wash than
+  the popover background so they read as distinct panes.
+
+### Added
+
+- New runtime dependency: `pyobjc-framework-WebKit`. The shell
+  installer and venv bootstrap pick it up automatically; existing
+  installs get it on the next launch.
+- **Hot-reload of `kanban.html`** while the badge is running. On
+  every refresh the badge stat()s the file and reloads if its mtime
+  advanced — edit the CSS, save, see the change in ~5 seconds, no
+  restart needed.
+
+### Removed
+
+- The native NSStackView + KanbanCardView + KanbanColumnDocView
+  rendering path used by the popover (~610 lines of layer-backed
+  AppKit drawing). The always-on-top panel (`floating.py` without
+  `--badge`) is unaffected — it still uses its own native
+  NSTextView-based rendering.
+
+### Notes
+
+- The popover top bar (segmented control, density picker, dormant
+  toggle, mark-all-read) stays native AppKit — only the content
+  area is the WebView.
+- The resume-existing-host flow (Claude.app focus or Terminal tab
+  focus by TTY match, falling back to spawning a new Terminal) is
+  unchanged — the WebView routes clicks back to the same Python
+  handler.
+
 ## 0.3.0 — 2026-05-31
 
 Sessions can now see one level deeper: the **sub-agents** a parent
