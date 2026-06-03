@@ -1814,17 +1814,18 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _install_layout(self):
-        """Swap whichever content view is in the host based on self.mode."""
+        """Install the WKWebView as the popover's content view. Both
+        list and kanban modes render through the same web view —
+        kanban.html branches its CSS on the payload.mode field, so we
+        never need to swap subviews when toggling between modes.
+        Only the popover *size* changes per mode (see _target_popover_size)."""
         if self.content_host is None:
             return
         for sub in list(self.content_host.subviews()):
             sub.removeFromSuperview()
-        if self.mode == "kanban":
+        if self.kanban_web is not None:
             self.kanban_web.setFrame_(self.content_host.bounds())
             self.content_host.addSubview_(self.kanban_web)
-        else:
-            self.list_scroll.setFrame_(self.content_host.bounds())
-            self.content_host.addSubview_(self.list_scroll)
 
     @objc.python_method
     def _target_popover_size(self) -> tuple:
@@ -1970,25 +1971,18 @@ class PopoverVC(NSViewController):
             flat.extend(buckets.get(k) or [])
         self.last_rendered_rows = flat
 
-        if self.mode == "kanban":
-            self._render_kanban(buckets)
-        else:
-            self._render_list(buckets)
-
-        # Make sure the list-mode text view forwards link clicks to us.
-        # (Kanban-mode cards now use their own mouseDown_ / NSButton
-        # actions instead of NSTextView link tracking — no delegate
-        # plumbing needed for that mode.)
-        if self.list_text_view is not None:
-            self.list_text_view.setDelegate_(self)
+        # Both modes route through the same WKWebView — kanban.html's
+        # CSS branches on body.mode-{list,kanban}. The web view is
+        # always the popover's content view; we just push a different
+        # payload + mode field per refresh.
+        self._render_popover(buckets)
 
     @objc.python_method
     def _render_list(self, buckets):
-        if self.list_text_view is None:
-            return
-        mas = self._build_attributed(buckets)
-        self.list_text_view.textStorage().setAttributedString_(mas)
-        self._update_mark_all_button()
+        """Back-compat shim — kept so any future caller that explicitly
+        asks for the list-mode render still works. Delegates to the
+        unified popover renderer below."""
+        self._render_popover(buckets)
 
     @objc.python_method
     def _serialize_row(self, row: dict) -> dict:
@@ -2028,8 +2022,16 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _render_kanban(self, buckets):
-        """Push the bucket data into the WKWebView. JS does the actual
-        DOM build; we just serialize + evaluateJavaScript."""
+        """Back-compat alias for the unified popover renderer."""
+        self._render_popover(buckets)
+
+    @objc.python_method
+    def _render_popover(self, buckets):
+        """Push the bucket data into the WKWebView. The same rendering
+        path serves both kanban (3-4 columns) and list (vertical stack)
+        modes — kanban.html branches on body.mode-{kanban,list} from
+        the payload.mode field. JS does the actual DOM build; we just
+        serialize + evaluateJavaScript."""
         if self.kanban_web is None:
             return
 
@@ -2044,6 +2046,8 @@ class PopoverVC(NSViewController):
             },
             "showDormant": bool(self.show_dormant),
             "density": self.density or "focus",
+            # "list" or "kanban" — controls the CSS layout branch.
+            "mode": "list" if self.mode == "list" else "kanban",
         }
 
         # If the JS isn't ready yet (initial loadHTMLString hasn't

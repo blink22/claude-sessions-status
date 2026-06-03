@@ -41,16 +41,19 @@
     /* Smoother text — matches native AppKit antialiasing better. */
     -webkit-font-smoothing: antialiased;
   }
-  #app {
+  /* ===========================================================
+   * Layout — KANBAN mode (3 or 4 columns side by side)
+   * =========================================================== */
+  body.mode-kanban #app {
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
     height: 100vh;
     background: var(--bg-popover);
   }
-  #app.with-dormant {
+  body.mode-kanban #app.with-dormant {
     grid-template-columns: 1fr 1fr 1fr 1fr;
   }
-  .col {
+  body.mode-kanban .col {
     /* Linear's layered surface — column body sits 3-4% brighter than
      * the popover bg, so the eye reads the columns as distinct panes
      * floating on the popover floor. */
@@ -61,7 +64,65 @@
     overflow: hidden;
     min-width: 0;
   }
-  .col:last-child { border-right: 0; }
+  body.mode-kanban .col:last-child { border-right: 0; }
+
+  /* ===========================================================
+   * Layout — LIST mode (vertical stack of sections, one card-wide)
+   * Reuses the same .col / .col-header / .col-body / .card markup
+   * as kanban — just changes how they're laid out.
+   * =========================================================== */
+  body.mode-list #app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    /* The popover is narrow in list mode (~360px) — one scrollable
+     * container holds the whole stack so the user scrolls once, not
+     * per-section. */
+    overflow-y: auto;
+    overflow-x: hidden;
+    background: var(--bg-popover);
+    scrollbar-width: thin;
+  }
+  body.mode-list #app::-webkit-scrollbar { width: 6px; }
+  body.mode-list #app::-webkit-scrollbar-track { background: transparent; }
+  body.mode-list #app::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.10);
+    border-radius: 3px;
+  }
+  body.mode-list #app::-webkit-scrollbar-thumb:hover {
+    background: rgba(255,255,255,0.18);
+  }
+  body.mode-list .col {
+    background: transparent;
+    border-bottom: 1px solid var(--hairline);
+    /* Sections flow vertically; no fixed height. */
+    display: block;
+    flex: 0 0 auto;
+  }
+  body.mode-list .col:last-child { border-bottom: 0; }
+  /* In list mode the section header doesn't need to stick — the
+   * outer scroll container handles all scrolling. Make it visually
+   * more prominent than the column-header variant since it's the
+   * only thing organizing the cards in a 1-up layout. */
+  body.mode-list .col-header {
+    background: var(--bg-popover);
+    padding: 14px 14px 8px;
+  }
+  body.mode-list .col-header .label {
+    font-size: 11px;
+  }
+  body.mode-list .col-body {
+    overflow: visible;
+    padding: 4px 12px 12px;
+  }
+  /* List-mode cards: slightly more breathing room since they're
+   * wider and there's no horizontal column boundary doing the
+   * spacing for us. */
+  body.mode-list .card { margin-bottom: 8px; }
+
+  .col {
+    min-width: 0;
+  }
 
   .col-header {
     display: flex;
@@ -474,6 +535,12 @@
   function renderApp(data) {
     const app = document.getElementById('app');
     if (!app) return;
+    // Apply the mode class to the body so all our mode-{kanban,list}
+    // CSS rules can target the right layout. Defaults to kanban when
+    // the payload omits it (back-compat with older Python builds).
+    const mode = (data.mode === 'list') ? 'list' : 'kanban';
+    document.body.classList.remove('mode-list', 'mode-kanban');
+    document.body.classList.add('mode-' + mode);
     app.classList.toggle('with-dormant', !!data.showDormant);
 
     const buckets = data.buckets || {};
