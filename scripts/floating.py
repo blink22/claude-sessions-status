@@ -123,6 +123,7 @@ except ImportError as e:
 # ---------- Reuse dashboard logic ----------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dashboard  # noqa: E402
+import tasks as tasks_module  # noqa: E402 — per-session user-curated tasks
 from dashboard import (  # noqa: E402
     classify,
     desktop_titles,
@@ -2007,8 +2008,22 @@ class PopoverVC(NSViewController):
                 "desc": (sub.get("name") or "").strip()[:140],
                 "state": sub.get("state") or "",
             })
+        # User-curated tasks for this session — render-ordered.
+        # The schema carries (id, content, status, source, approved)
+        # plus timestamps; the JS only needs the first five so we
+        # slim the payload here.
+        sid = s.get("sessionId") or ""
+        session_tasks = []
+        for t in tasks_module.tasks_for_session(sid):
+            session_tasks.append({
+                "id": t.get("id") or "",
+                "content": t.get("content") or "",
+                "status": t.get("status") or "open",
+                "source": t.get("source") or "user",
+                "approved": bool(t.get("approved", True)),
+            })
         return {
-            "sessionId": s.get("sessionId") or "",
+            "sessionId": sid,
             "cwd": cwd,
             "folder": cwd_display,
             "title": (row.get("title") or "(untitled)").strip(),
@@ -2018,6 +2033,7 @@ class PopoverVC(NSViewController):
             "bucket": row.get("bucket") or "dormant",
             "unread": bool(row.get("unread")),
             "subagents": subs_out,
+            "tasks": session_tasks,
         }
 
     @objc.python_method
@@ -2089,24 +2105,31 @@ class PopoverVC(NSViewController):
         try:
             body = msg.body()
             # PyObjC may hand us an NSDictionary; coerce to plain dict.
+            # We extract a generic action + payload dict here, then
+            # per-action handlers below pluck the fields they need.
             if hasattr(body, "objectForKey_"):
                 action = str(body.objectForKey_("action") or "")
-                payload = body.objectForKey_("payload") or {}
-                # Coerce NSDictionary payload to a plain dict for .get()
-                if hasattr(payload, "objectForKey_"):
-                    sid = str(payload.objectForKey_("sessionId") or "")
-                    cwd = str(payload.objectForKey_("cwd") or "")
+                payload_raw = body.objectForKey_("payload") or {}
+                if hasattr(payload_raw, "objectForKey_"):
+                    # NSDictionary → plain dict
+                    payload = {}
+                    for k in payload_raw.allKeys():
+                        payload[str(k)] = payload_raw.objectForKey_(k)
                 else:
-                    sid = str((payload or {}).get("sessionId") or "")
-                    cwd = str((payload or {}).get("cwd") or "")
+                    payload = dict(payload_raw or {})
             else:
                 action = str((body or {}).get("action") or "")
-                pl = (body or {}).get("payload") or {}
-                sid = str(pl.get("sessionId") or "")
-                cwd = str(pl.get("cwd") or "")
+                payload = dict((body or {}).get("payload") or {})
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[kanban-web] msg decode: {e!r}\n")
             return
+
+        def pstr(k: str) -> str:
+            v = payload.get(k)
+            return str(v) if v is not None else ""
+
+        sid = pstr("sessionId")
+        cwd = pstr("cwd")
 
         if action == "resume":
             if not sid:
@@ -2146,6 +2169,60 @@ class PopoverVC(NSViewController):
             if self.kanban_web_pending is not None:
                 self._kanban_web_evaluate(self.kanban_web_pending)
                 self.kanban_web_pending = None
+        elif action == "taskCreate":
+            # User typed a task into the + add input and hit Enter.
+            content = pstr("content")
+            if not sid or not content:
+                return
+            created = tasks_module.create_task(sid, content)
+            if created is None:
+                # Validation failed (empty, too long, or per-session
+                # cap hit). Don't refresh — JS keeps the input open so
+                # the user can edit and retry without losing context.
+                sys.stderr.write(
+                    f"[tasks] create rejected sid={sid[:8]} "
+                    f"content_len={len(content)}\n"
+                )
+                return
+            self.refresh()
+        elif action == "taskToggle":
+            # Click on the task glyph: open ↔ done.
+            tid = pstr("taskId")
+            if not sid or not tid:
+                return
+            new_status = tasks_module.toggle_task(sid, tid)
+            if new_status is None:
+                sys.stderr.write(f"[tasks] toggle miss sid={sid[:8]} tid={tid}\n")
+                return
+            self.refresh()
+        elif action == "taskDelete":
+            # Hover-revealed × on a user-authored task row.
+            tid = pstr("taskId")
+            if not sid or not tid:
+                return
+            if not tasks_module.delete_task(sid, tid):
+                sys.stderr.write(f"[tasks] delete miss sid={sid[:8]} tid={tid}\n")
+                return
+            self.refresh()
+        elif action == "taskApprove":
+            # ✓ on a Haiku-suggested row — ratify into a normal task.
+            tid = pstr("taskId")
+            if not sid or not tid:
+                return
+            if not tasks_module.approve_suggestion(sid, tid):
+                sys.stderr.write(f"[tasks] approve miss sid={sid[:8]} tid={tid}\n")
+                return
+            self.refresh()
+        elif action == "taskReject":
+            # ✗ on a Haiku-suggested row — dismiss + remember to not
+            # re-suggest the same content within this session.
+            tid = pstr("taskId")
+            if not sid or not tid:
+                return
+            if not tasks_module.reject_suggestion(sid, tid):
+                sys.stderr.write(f"[tasks] reject miss sid={sid[:8]} tid={tid}\n")
+                return
+            self.refresh()
         else:
             sys.stderr.write(f"[kanban-web] unknown action: {action!r}\n")
 

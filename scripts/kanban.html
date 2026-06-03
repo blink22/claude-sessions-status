@@ -332,6 +332,194 @@
     flex-shrink: 0;
   }
 
+  /* ===========================================================
+   * Tasks block — user-curated per-session list.
+   * Sits between phase-gist/meta and the sub-agent block.
+   * Hidden entirely when the session has zero tasks (and not
+   * already expanded for creation).
+   * =========================================================== */
+  .card .tasks {
+    margin-top: 8px;
+    margin-left: 19px;
+    border-top: 1px solid var(--hairline);
+    padding-top: 6px;
+  }
+  .card .tasks-label {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--text-3);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    margin-bottom: 5px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    /* Beefier hit-zone padding so the toggle is a reliable target
+     * even on the narrow 180px kanban column. */
+    padding: 2px 0;
+  }
+  .card .tasks-label .frac { color: var(--text-4); font-weight: normal; }
+  .card .tasks-label .chev {
+    color: var(--text-4);
+    font-size: 8px;
+    transition: transform 120ms ease;
+  }
+  /* Card-level expanded state: chevron rotates, card lifts a notch */
+  .card.expanded { background: rgba(255,255,255,0.04); border-color: var(--hairline-strong); }
+  .card.expanded .tasks-label .chev { transform: rotate(90deg); }
+
+  .card .task-row {
+    font-size: 10.5px;
+    line-height: 1.55;
+    color: var(--text-1);
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    overflow: hidden;
+    position: relative;
+    padding-right: 4px;
+  }
+  .card .task-row .tglyph {
+    flex-shrink: 0;
+    font-family: var(--mono);
+    font-size: 11px;
+    width: 12px;
+    text-align: center;
+    cursor: pointer;
+    /* Padded so the glyph is a generous tap target. */
+    padding: 0 2px;
+  }
+  .card .task-row .ttext {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  /* Expanded cards let task text wrap so long entries stay readable. */
+  .card.expanded .task-row .ttext { white-space: normal; }
+
+  /* User-authored, open: glyph picks up the bucket color */
+  .card .task-row.open .tglyph { color: var(--text-2); }
+  .card.working .task-row.open .tglyph { color: var(--amber); }
+  .card.needs   .task-row.open .tglyph { color: var(--red); }
+  .card.ready   .task-row.open .tglyph { color: var(--green); }
+  .card .task-row.open .ttext { color: var(--text-1); }
+  /* User-authored, done */
+  .card .task-row.done .tglyph { color: var(--text-4); }
+  .card .task-row.done .ttext  { color: var(--text-4); }
+  /* AI-suggested, pending approval */
+  .card .task-row.suggested .tglyph { color: var(--text-3); }
+  .card .task-row.suggested .ttext  { color: var(--text-2); font-style: italic; }
+
+  /* Hover-revealed delete affordance */
+  .card .task-row .tdelete {
+    margin-left: auto;
+    color: var(--text-4);
+    cursor: pointer;
+    opacity: 0;
+    font-size: 12px;
+    line-height: 1;
+    padding: 0 4px;
+    transition: opacity 120ms ease, color 120ms ease;
+  }
+  .card .task-row:hover .tdelete { opacity: 1; }
+  .card .task-row .tdelete:hover { color: var(--red); }
+
+  /* Approve / reject controls on suggested rows */
+  .card .task-row .ctrls {
+    margin-left: auto;
+    display: flex;
+    gap: 3px;
+    flex-shrink: 0;
+  }
+  .card .task-row .ctrl {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px; height: 16px;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.08);
+    font-size: 10px;
+    cursor: pointer;
+    line-height: 1;
+  }
+  .card .task-row .ctrl.approve { color: var(--green); }
+  .card .task-row .ctrl.reject  { color: var(--red); }
+  .card .task-row .ctrl:hover { background: rgba(255,255,255,0.10); }
+
+  /* "+N more" hint shown when the preview is truncated */
+  .card .tasks .more {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    color: var(--text-4);
+    margin-top: 4px;
+    cursor: pointer;
+  }
+  .card .tasks .more:hover { color: var(--text-3); }
+
+  /* Sub-divider above suggested tasks. */
+  .card .tasks .sugg-divider {
+    font-family: var(--mono);
+    font-size: 8.5px;
+    color: var(--text-4);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin: 8px 0 4px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card .tasks .sugg-divider::before,
+  .card .tasks .sugg-divider::after {
+    content: ''; flex: 1; height: 0;
+    border-top: 1px dashed rgba(255,255,255,0.08);
+  }
+
+  /* The "+ add task" input row */
+  .card .add-task {
+    margin-top: 6px;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 10.5px;
+  }
+  .card .add-task .plus { color: var(--text-3); width: 12px; text-align: center; }
+  .card .add-task input {
+    flex: 1; min-width: 0;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 3px;
+    color: var(--text-1);
+    padding: 3px 6px;
+    font-family: var(--sans);
+    font-size: 11px;
+    outline: none;
+  }
+  .card .add-task input::placeholder { color: var(--text-4); }
+  .card .add-task input:focus {
+    border-color: rgba(106,166,248,0.40);
+    background: rgba(106,166,248,0.06);
+  }
+
+  /* Dormant: fraction-only treatment (no preview rows, no expansion). */
+  .card.dormant .tasks .task-row,
+  .card.dormant .tasks .more,
+  .card.dormant .tasks .add-task,
+  .card.dormant .tasks .sugg-divider { display: none; }
+  .card.dormant .tasks { padding-top: 4px; margin-top: 6px; }
+  .card.dormant .tasks .tasks-label { margin-bottom: 0; cursor: default; }
+  .card.dormant .tasks .chev { display: none; }
+
+  /* List mode: tasks always show all rows + always-visible add input,
+   * no expand/collapse — width is generous enough. */
+  body.mode-list .card .tasks-label .chev { display: none; }
+  body.mode-list .card .tasks-label { cursor: default; }
+  body.mode-list .card .task-row .ttext { white-space: normal; }
+
   /* Sub-agent block — one row per running agent, then an aggregate
    * footer for completed/interrupted. Mirrors v0.3 behavior. */
   .card .subagents {
@@ -428,6 +616,20 @@
     }
   }
 
+  // ---- Per-card expansion state ----
+  // The kanban refresh cycle replaces #app.innerHTML wholesale on every
+  // 5s poll, so we must persist which cards are expanded outside the
+  // DOM. Keyed by sessionId. List mode ignores this — its cards always
+  // show everything.
+  const expandedCards = new Set();
+
+  // Sessions whose add-task input is currently open. Distinct from
+  // expandedCards: list mode always shows the add-input; kanban mode
+  // only shows it inside an expanded card; but we also let the user
+  // explicitly open an input on a collapsed card (e.g. by hitting the
+  // empty "+ add task" affordance in list mode — see wireClicks).
+  const draftFocus = new Map();  // sessionId -> draft text (in-flight)
+
   // Escape any HTML in user-supplied strings before inserting via
   // innerHTML. We use textContent where possible but composite rows
   // assemble template strings — this keeps the join cheap and safe.
@@ -510,6 +712,13 @@
       subBlock = '<div class="subagents">' + lines.join('') + footer + '</div>';
     }
 
+    // ---- Tasks block ----
+    // Renders between meta and subagents. Hidden entirely when the
+    // session has zero tasks AND we're not in list-mode (where we
+    // always show the + add affordance even on empty cards) AND the
+    // card isn't currently expanded for creation.
+    const tasksBlock = renderTasksBlock(row);
+
     // The clickable unread dot — only rendered when unread is true.
     // We attach the click handler in the post-render wiring step so
     // we can stop event propagation (don't trigger the card's
@@ -525,8 +734,137 @@
       + '</div>'
       + phaseGist
       + metaLine
+      + tasksBlock
       + subBlock
       + unreadEl;
+  }
+
+  // Render the per-card tasks block (between meta and subagents).
+  // Behavior:
+  //   - Dormant cards: fraction-only label, no rows, no expansion.
+  //   - List mode: always full list + + add input.
+  //   - Kanban mode, collapsed: label + up to 2 preview rows + "+N more".
+  //   - Kanban mode, expanded: full list + suggestion divider + add input.
+  //   - Cards with zero tasks: block hidden unless list-mode (always show
+  //     the + add affordance there so creation is one click away).
+  function renderTasksBlock(row) {
+    const tasks = Array.isArray(row.tasks) ? row.tasks : [];
+    const bucket = row.bucket || 'dormant';
+    const isDormant = bucket === 'dormant';
+    const isList = document.body.classList.contains('mode-list');
+    const sid = row.sessionId || '';
+    const expanded = expandedCards.has(sid);
+
+    const total = tasks.length;
+    const done = tasks.filter(function(t) { return t.status === 'done'; }).length;
+    const openTasks = tasks.filter(function(t) {
+      return t.status === 'open' && (t.source !== 'suggested' || t.approved);
+    });
+    const suggested = tasks.filter(function(t) {
+      return t.status === 'open' && t.source === 'suggested' && !t.approved;
+    });
+    const doneTasks = tasks.filter(function(t) { return t.status === 'done'; });
+
+    // Empty + not list mode + not expanded → hide entirely.
+    if (total === 0 && !isList && !expanded) return '';
+
+    // Dormant: just the fraction.
+    if (isDormant) {
+      if (total === 0) return '';
+      return '<div class="tasks">'
+        + '<div class="tasks-label" data-toggle="0">'
+        +   '<span>tasks</span>'
+        +   '<span class="frac">(' + done + '/' + total + ')</span>'
+        + '</div>'
+        + '</div>';
+    }
+
+    // Decide what subset of tasks to show.
+    // List mode + kanban-expanded: show all open + all suggested +
+    // recently-done (cap at 2). Kanban collapsed: 2 preview rows.
+    const showAll = isList || expanded;
+    const PREVIEW_MAX = 2;
+
+    let rowsHtml = '';
+    let hiddenCount = 0;
+    if (showAll) {
+      // Open user tasks
+      rowsHtml += openTasks.map(taskRowHtml).join('');
+      // Suggested (with divider if there are any)
+      if (suggested.length > 0) {
+        rowsHtml += '<div class="sugg-divider"><span>suggested by Haiku</span></div>';
+        rowsHtml += suggested.map(taskRowHtml).join('');
+      }
+      // Recently-done (cap at 2 for noise control)
+      const recentDone = doneTasks.slice(0, 2);
+      rowsHtml += recentDone.map(taskRowHtml).join('');
+    } else {
+      // Collapsed: prioritize open user tasks first, then suggestions
+      // if we have room. Done tasks never appear in preview.
+      const previewOpen = openTasks.slice(0, PREVIEW_MAX);
+      rowsHtml += previewOpen.map(taskRowHtml).join('');
+      // If we have room, show 1 suggestion preview as a teaser.
+      const remainingSlots = PREVIEW_MAX - previewOpen.length;
+      if (remainingSlots > 0 && suggested.length > 0) {
+        rowsHtml += suggested.slice(0, remainingSlots).map(taskRowHtml).join('');
+      }
+      const previewCount = previewOpen.length
+        + Math.min(remainingSlots, suggested.length);
+      hiddenCount = (openTasks.length + suggested.length + doneTasks.length)
+        - previewCount;
+    }
+
+    const moreEl = (hiddenCount > 0)
+      ? '<div class="more" data-toggle="1">+ ' + hiddenCount + ' more</div>'
+      : '';
+
+    // The + add input: visible in list mode always, in kanban only
+    // when the card is expanded.
+    const addEl = (isList || expanded)
+      ? renderAddTaskInput(sid)
+      : '';
+
+    return '<div class="tasks">'
+      + '<div class="tasks-label" data-toggle="1">'
+      +   '<span class="chev">▸</span>'
+      +   '<span>tasks</span>'
+      +   '<span class="frac">(' + done + '/' + total + ')</span>'
+      + '</div>'
+      + rowsHtml
+      + moreEl
+      + addEl
+      + '</div>';
+  }
+
+  function taskRowHtml(t) {
+    const status = t.status || 'open';
+    const isSuggested = t.source === 'suggested' && !t.approved;
+    const cls = isSuggested ? 'suggested' : status;  // 'open' | 'done' | 'suggested'
+    const glyph =
+      isSuggested ? '⋄' :
+      status === 'done' ? '●' : '○';
+    const tid = esc(t.id || '');
+    const tail = isSuggested
+      ? '<span class="ctrls">'
+        + '<span class="ctrl approve" data-action="task-approve" data-task-id="' + tid + '" title="Approve">✓</span>'
+        + '<span class="ctrl reject"  data-action="task-reject"  data-task-id="' + tid + '" title="Reject">✗</span>'
+        + '</span>'
+      : '<span class="tdelete" data-action="task-delete" data-task-id="' + tid + '" title="Delete">×</span>';
+    return '<div class="task-row ' + cls + '" data-task-id="' + tid + '">'
+      + '<span class="tglyph" data-action="task-toggle" data-task-id="' + tid + '">' + glyph + '</span>'
+      + '<span class="ttext">' + esc(t.content || '') + '</span>'
+      + tail
+      + '</div>';
+  }
+
+  function renderAddTaskInput(sid) {
+    const draft = esc(draftFocus.get(sid) || '');
+    return '<div class="add-task" data-action="add-task-row">'
+      + '<span class="plus">+</span>'
+      + '<input type="text" data-action="add-task-input" data-session="' + esc(sid) + '"'
+      + ' value="' + draft + '"'
+      + ' placeholder="Add a task — Enter to save" />'
+      + '</div>';
   }
 
   // Top-level render. Replaces the whole #app subtree on every refresh
@@ -543,6 +881,21 @@
     document.body.classList.add('mode-' + mode);
     app.classList.toggle('with-dormant', !!data.showDormant);
 
+    // Remember which input had focus + cursor position so we can
+    // restore it after the innerHTML replacement. Without this, a 5s
+    // background refresh would yank focus out of the user's typing.
+    const activeEl = document.activeElement;
+    let focusSession = null;
+    let focusCaret = 0;
+    if (activeEl && activeEl.matches('input[data-action="add-task-input"]')) {
+      focusSession = activeEl.dataset.session || null;
+      focusCaret = activeEl.selectionStart || 0;
+    }
+
+    // Populate row cache so rerenderOneCard() (used by expand/collapse)
+    // can rebuild a single card without a fresh Python push.
+    lastRows.clear();
+
     const buckets = data.buckets || {};
     const cols = [];
     COL_KEYS.forEach(function(key) {
@@ -550,10 +903,14 @@
       const rows = buckets[key] || [];
       const count = rows.length;
       const label = COL_LABELS[key] || key;
+      // Cache rows by sessionId for per-card rerender
+      rows.forEach(function(r) { if (r.sessionId) lastRows.set(r.sessionId, r); });
       const cards = rows.length
         ? rows.map(function(r) {
+            const isExpanded = expandedCards.has(r.sessionId);
             return '<div class="card ' + esc(r.bucket)
               + (r.unread ? ' is-unread' : '')
+              + (isExpanded ? ' expanded' : '')
               + '" data-session="' + esc(r.sessionId)
               + '" data-cwd="' + esc(r.cwd || '')
               + '">' + renderCard(r) + '</div>';
@@ -573,33 +930,181 @@
 
     // Wire click handlers AFTER the DOM is replaced.
     wireClicks();
+
+    // Restore focus + caret if the user was typing into an add-task
+    // input when the refresh fired.
+    if (focusSession) {
+      const inp = document.querySelector(
+        'input[data-action="add-task-input"][data-session="' + focusSession + '"]'
+      );
+      if (inp) {
+        inp.focus();
+        try { inp.setSelectionRange(focusCaret, focusCaret); }
+        catch (e) { /* selection unavailable on some input types — fine */ }
+      }
+    }
   }
 
   function wireClicks() {
     document.querySelectorAll('.card').forEach(function(cardEl) {
       // Card body → resume session in its host. Stop propagation on
-      // child controls (unread dot) so they don't also fire this.
+      // child controls (unread dot, tasks block) so they don't also
+      // fire this. The .tasks subtree is exempt entirely so clicking
+      // anywhere inside tasks (label, row text, input) never resumes.
       cardEl.addEventListener('click', function(ev) {
         const target = ev.target;
-        // If a control inside the card was clicked, let it handle.
-        if (target && target.closest('[data-action]')) return;
+        if (!target) return;
+        // Tasks block intercepts all its own clicks.
+        if (target.closest('.tasks')) return;
+        // Anything with data-action handles itself.
+        if (target.closest('[data-action]')) return;
+        // Any input/textarea swallowed via focus/blur.
+        if (target.closest('input,textarea')) return;
         send('resume', {
           sessionId: cardEl.dataset.session || '',
           cwd: cardEl.dataset.cwd || '',
         });
       });
     });
+
+    // Unread dot → mark-read.
     document.querySelectorAll('[data-action="mark-read"]').forEach(function(el) {
       el.addEventListener('click', function(ev) {
         ev.stopPropagation();
         const card = el.closest('.card');
         if (!card) return;
-        send('markRead', {
+        send('markRead', { sessionId: card.dataset.session || '' });
+      });
+    });
+
+    // Tasks-label or "+N more" → toggle card expansion. Kanban only —
+    // list mode always shows the full list.
+    document.querySelectorAll('[data-toggle="1"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        if (document.body.classList.contains('mode-list')) return;
+        const card = el.closest('.card');
+        if (!card) return;
+        const sid = card.dataset.session || '';
+        if (!sid) return;
+        if (expandedCards.has(sid)) expandedCards.delete(sid);
+        else expandedCards.add(sid);
+        // Re-render only this card to avoid a full popover repaint
+        // (the next refresh tick will rebuild everything anyway).
+        rerenderOneCard(card);
+      });
+    });
+
+    // Task glyph → toggle open/done.
+    document.querySelectorAll('[data-action="task-toggle"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const card = el.closest('.card');
+        const tid = el.dataset.taskId;
+        if (!card || !tid) return;
+        send('taskToggle', {
           sessionId: card.dataset.session || '',
+          taskId: tid,
         });
       });
     });
+
+    // Hover × → delete user-authored task.
+    document.querySelectorAll('[data-action="task-delete"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const card = el.closest('.card');
+        const tid = el.dataset.taskId;
+        if (!card || !tid) return;
+        send('taskDelete', {
+          sessionId: card.dataset.session || '',
+          taskId: tid,
+        });
+      });
+    });
+
+    // ✓ approve suggestion.
+    document.querySelectorAll('[data-action="task-approve"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const card = el.closest('.card');
+        const tid = el.dataset.taskId;
+        if (!card || !tid) return;
+        send('taskApprove', {
+          sessionId: card.dataset.session || '',
+          taskId: tid,
+        });
+      });
+    });
+
+    // ✗ reject suggestion.
+    document.querySelectorAll('[data-action="task-reject"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const card = el.closest('.card');
+        const tid = el.dataset.taskId;
+        if (!card || !tid) return;
+        send('taskReject', {
+          sessionId: card.dataset.session || '',
+          taskId: tid,
+        });
+      });
+    });
+
+    // + add task input — Enter saves, Esc cancels, blur clears draft.
+    document.querySelectorAll('[data-action="add-task-input"]').forEach(function(inp) {
+      const sid = inp.dataset.session || '';
+      // Restore draft if present
+      if (draftFocus.has(sid) && inp.value === '') {
+        inp.value = draftFocus.get(sid) || '';
+      }
+      inp.addEventListener('input', function() {
+        draftFocus.set(sid, inp.value);
+      });
+      inp.addEventListener('keydown', function(ev) {
+        ev.stopPropagation();
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          const text = (inp.value || '').trim();
+          if (!text) return;
+          send('taskCreate', { sessionId: sid, content: text });
+          // Optimistic clear — next refresh will materialize the row.
+          draftFocus.delete(sid);
+          inp.value = '';
+          // Keep focus so the user can type the next task immediately.
+          inp.focus();
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          draftFocus.delete(sid);
+          inp.value = '';
+          inp.blur();
+        }
+      });
+      // Prevent card-click resume when the input is interacted with.
+      inp.addEventListener('click', function(ev) { ev.stopPropagation(); });
+    });
   }
+
+  // Re-render a single card's innerHTML from the last-known payload.
+  // Used by the expand/collapse toggle so we don't trigger a full
+  // popover repaint just to flip a chevron. The next refresh tick
+  // will rebuild from fresh data anyway.
+  function rerenderOneCard(cardEl) {
+    if (!cardEl) return;
+    const sid = cardEl.dataset.session || '';
+    const row = lastRows.get(sid);
+    if (!row) return;
+    // Reflect expansion in the class so .expanded CSS rules apply.
+    if (expandedCards.has(sid)) cardEl.classList.add('expanded');
+    else cardEl.classList.remove('expanded');
+    cardEl.innerHTML = renderCard(row);
+    wireClicks();
+  }
+
+  // Row cache keyed by sessionId — lets rerenderOneCard rebuild a
+  // single card without a fresh Python payload. Populated by renderApp
+  // on every full refresh.
+  const lastRows = new Map();
 
   // Expose for Python to call via evaluateJavaScript.
   window.renderApp = renderApp;
