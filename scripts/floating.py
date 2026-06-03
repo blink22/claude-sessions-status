@@ -2125,8 +2125,27 @@ class PopoverVC(NSViewController):
             return
 
         def pstr(k: str) -> str:
+            """Extract payload[k] as a plain Python string. Rejects
+            anything that isn't a string-like type — a malformed JS
+            message that sent a dict or a number for `content` would
+            otherwise stringify to garbage like ``str({"foo":1})`` and
+            pollute the tasks file. NSString is bridged as a str
+            subclass by PyObjC, so the isinstance check accepts it
+            naturally."""
             v = payload.get(k)
-            return str(v) if v is not None else ""
+            if isinstance(v, str):
+                return v
+            # NSString that didn't inherit from str (older PyObjC):
+            # try to coerce only if the value implements the
+            # NSString-y selector. Anything else (dict, list, number,
+            # None) returns the empty string and the per-action
+            # validation in tasks.py rejects it cleanly.
+            if v is not None and hasattr(v, "UTF8String"):
+                try:
+                    return str(v)
+                except Exception:  # noqa: BLE001
+                    return ""
+            return ""
 
         sid = pstr("sessionId")
         cwd = pstr("cwd")

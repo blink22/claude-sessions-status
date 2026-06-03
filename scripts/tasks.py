@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 from pathlib import Path
@@ -75,13 +76,22 @@ _LOCK = threading.Lock()
 # the JSON on every 5s poll when nothing has changed.
 _cache: Optional[tuple] = None  # (mtime, data)
 
+# One-shot orphan-tmp sweep: runs on the first load_state() call per
+# process so we don't sweep on every refresh tick.
+_swept = False
+
 
 # ---------------- IO helpers ----------------
 
-def _atomic_write_json(path: Path, data: dict) -> None:
+def _atomic_write_json(path: Path, data: dict) -> bool:
     """Same shape as floating.py's ``_atomic_write_text`` — tempfile +
-    os.replace. POSIX-atomic on the same filesystem. The temp suffix
-    matches the helper in floating.py for consistency on disk.
+    os.replace. POSIX-atomic on the same filesystem.
+
+    Returns True if the write hit disk, False on failure (disk full,
+    permission denied, etc.). Callers MUST honor the return value:
+    a False return means in-memory state is now ahead of disk, and
+    the mtime-keyed cache must be invalidated so the next load
+    re-reads the (older) on-disk truth.
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
@@ -90,11 +100,30 @@ def _atomic_write_json(path: Path, data: dict) -> None:
             encoding="utf-8",
         )
         os.replace(tmp, path)
-    except OSError:
+        return True
+    except OSError as e:
+        sys.stderr.write(f"[tasks] write failed: {e!r}\n")
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+        return False
+
+
+def _sweep_orphan_tmps() -> None:
+    """Clean up ``.tasks.json.tmp`` files that survived a SIGKILL mid-
+    write. POSIX-atomic os.replace guarantees the real file is never
+    half-written, but the .tmp source can be orphaned. We sweep on
+    load_state() the first time a session boots, which is cheap and
+    keeps the user's $HOME tidy."""
+    try:
+        for stale in TASKS_FILE.parent.glob(TASKS_FILE.name + ".tmp"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _empty_state() -> dict:
@@ -161,8 +190,20 @@ def load_state() -> dict:
 
     On corrupt JSON (rare — can happen after a crash mid-write that
     somehow defeated the atomic replace), back the corrupt file up to
-    ``.corrupt-<ts>`` and start fresh rather than wedging the badge."""
-    global _cache
+    ``.corrupt-<ms-ts>`` and start fresh rather than wedging the
+    badge. Millisecond-resolution timestamp so two corruptions in the
+    same wall-clock second don't clobber each other.
+
+    First call per process also sweeps orphaned ``.tmp`` files from a
+    previous mid-write SIGKILL. Cheap and self-healing.
+
+    NOTE: ``_prune`` runs under ``_LOCK`` to keep the read path safe
+    against a concurrent mutating call that's holding the lock — both
+    would mutate ``data`` in place otherwise."""
+    global _cache, _swept
+    if not _swept:
+        _sweep_orphan_tmps()
+        _swept = True
     if not TASKS_FILE.exists():
         _cache = None
         return _empty_state()
@@ -172,36 +213,57 @@ def load_state() -> dict:
         return _cache[1] if _cache else _empty_state()
     if _cache is not None and _cache[0] == mtime:
         return _cache[1]
-    try:
-        raw = TASKS_FILE.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if not isinstance(data, dict) or "sessions" not in data:
-            raise ValueError("schema mismatch")
-    except (OSError, json.JSONDecodeError, ValueError):
-        # Back up the corrupt file. Don't fail the whole badge over it.
+    with _LOCK:
+        # Re-check the cache under the lock — another thread may have
+        # populated it while we were waiting.
+        if _cache is not None and _cache[0] == mtime:
+            return _cache[1]
         try:
-            backup = TASKS_FILE.with_suffix(
-                TASKS_FILE.suffix + f".corrupt-{int(time.time())}",
-            )
-            if TASKS_FILE.exists():
-                os.replace(TASKS_FILE, backup)
-        except OSError:
-            pass
-        data = _empty_state()
-    _prune(data)
-    _cache = (mtime, data)
-    return data
+            raw = TASKS_FILE.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, dict) or "sessions" not in data:
+                raise ValueError("schema mismatch")
+        except (OSError, json.JSONDecodeError, ValueError):
+            # Back up the corrupt file. Millisecond resolution avoids
+            # clobbering an earlier backup if corruption happens twice
+            # in the same wall-clock second.
+            try:
+                backup = TASKS_FILE.with_suffix(
+                    TASKS_FILE.suffix
+                    + f".corrupt-{int(time.time() * 1000)}",
+                )
+                if TASKS_FILE.exists():
+                    os.replace(TASKS_FILE, backup)
+            except OSError:
+                pass
+            data = _empty_state()
+        _prune(data)
+        _cache = (mtime, data)
+        return data
 
 
-def _save_state(state: dict) -> None:
+def _save_state(state: dict) -> bool:
     """Persist + refresh the mtime-keyed in-memory cache. Caller must
-    already hold _LOCK."""
+    already hold _LOCK.
+
+    Returns True on successful disk write, False if the write failed
+    (rare — disk full, permission denied). On failure the in-memory
+    cache is invalidated so the next load re-reads on-disk truth
+    rather than serving a phantom "saved" value the user could later
+    discover was never persisted."""
     global _cache
-    _atomic_write_json(TASKS_FILE, state)
+    ok = _atomic_write_json(TASKS_FILE, state)
+    if not ok:
+        # In-memory state is now ahead of disk — invalidate so the
+        # next load_state() goes back to disk and serves consistent
+        # data, even if that means "losing" the failed mutation.
+        _cache = None
+        return False
     try:
         _cache = (TASKS_FILE.stat().st_mtime, state)
     except OSError:
         _cache = None
+    return True
 
 
 # ---------------- Public read API ----------------

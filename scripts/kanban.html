@@ -505,6 +505,26 @@
     background: rgba(106,166,248,0.06);
   }
 
+  /* Empty-card "+ add task" affordance — quieter than the regular
+   * tasks-label so it doesn't shout on every card without tasks.
+   * The "+" replaces the chevron (no fraction to show). Hover lifts
+   * the color a notch to signal interactivity. */
+  .card .tasks.empty-tasks { border-top: 0; padding-top: 4px; margin-top: 6px; }
+  .card .tasks-label.add-affordance {
+    color: var(--text-4);
+    margin-bottom: 0;
+  }
+  .card .tasks-label.add-affordance .chev {
+    transform: none !important;  /* "+" should never rotate */
+    font-size: 11px;
+    color: var(--text-4);
+  }
+  .card .tasks-label.add-affordance:hover { color: var(--text-2); }
+  .card .tasks-label.add-affordance:hover .chev { color: var(--text-2); }
+  /* When the card is expanded, the add-affordance is replaced by the
+   * normal tasks-label (with the chevron + fraction) by the JS — so
+   * the rotated-chevron rule still applies as expected. */
+
   /* Dormant: fraction-only treatment (no preview rows, no expansion). */
   .card.dormant .tasks .task-row,
   .card.dormant .tasks .more,
@@ -765,16 +785,29 @@
     });
     const doneTasks = tasks.filter(function(t) { return t.status === 'done'; });
 
-    // Empty + not list mode + not expanded → hide entirely.
-    if (total === 0 && !isList && !expanded) return '';
-
-    // Dormant: just the fraction.
+    // Dormant cards never get a tasks block, full stop — matches the
+    // "dormant is quiet, no input affordances" rule. Existing tasks
+    // still show as a fraction label.
     if (isDormant) {
       if (total === 0) return '';
       return '<div class="tasks">'
         + '<div class="tasks-label" data-toggle="0">'
         +   '<span>tasks</span>'
         +   '<span class="frac">(' + done + '/' + total + ')</span>'
+        + '</div>'
+        + '</div>';
+    }
+
+    // Empty active card — surface a "+ add task" affordance so the
+    // user can create the FIRST task without needing an expand target
+    // that doesn't exist yet. Click expands the card and reveals the
+    // input. List mode falls through to the regular render below
+    // which always shows the input row anyway.
+    if (total === 0 && !isList && !expanded) {
+      return '<div class="tasks empty-tasks">'
+        + '<div class="tasks-label add-affordance" data-toggle="1">'
+        +   '<span class="chev">+</span>'
+        +   '<span>add task</span>'
         + '</div>'
         + '</div>';
     }
@@ -837,6 +870,9 @@
   }
 
   function taskRowHtml(t) {
+    // Defensive: a malformed payload could push a non-object into
+    // tasks[]. Render nothing rather than throwing on t.status.
+    if (!t || typeof t !== 'object') return '';
     const status = t.status || 'open';
     const isSuggested = t.source === 'suggested' && !t.approved;
     const cls = isSuggested ? 'suggested' : status;  // 'open' | 'done' | 'suggested'
@@ -884,10 +920,13 @@
     // Remember which input had focus + cursor position so we can
     // restore it after the innerHTML replacement. Without this, a 5s
     // background refresh would yank focus out of the user's typing.
+    // `activeElement` is normally non-null (defaults to <body>) but
+    // be defensive — and `.matches` isn't on every element type.
     const activeEl = document.activeElement;
     let focusSession = null;
     let focusCaret = 0;
-    if (activeEl && activeEl.matches('input[data-action="add-task-input"]')) {
+    if (activeEl && typeof activeEl.matches === 'function'
+        && activeEl.matches('input[data-action="add-task-input"]')) {
       focusSession = activeEl.dataset.session || null;
       focusCaret = activeEl.selectionStart || 0;
     }
@@ -931,6 +970,17 @@
     // Wire click handlers AFTER the DOM is replaced.
     wireClicks();
 
+    // Garbage-collect stale per-card state: any session that's no
+    // longer in the current payload (dormant promoted out of view,
+    // session deleted on disk, etc.) shouldn't keep accumulating
+    // expansion / draft entries over the badge's lifetime.
+    expandedCards.forEach(function(sid) {
+      if (!lastRows.has(sid)) expandedCards.delete(sid);
+    });
+    draftFocus.forEach(function(_v, sid) {
+      if (!lastRows.has(sid)) draftFocus.delete(sid);
+    });
+
     // Restore focus + caret if the user was typing into an add-task
     // input when the refresh fired.
     if (focusSession) {
@@ -945,116 +995,119 @@
     }
   }
 
+  // Top-level wiring after a full renderApp() — walks every card and
+  // delegates to wireCardClicks for each. Used only on the full
+  // refresh path; partial rerenders (expand/collapse) call
+  // wireCardClicks on a single element to avoid attaching duplicate
+  // listeners to every OTHER card on every interaction.
   function wireClicks() {
-    document.querySelectorAll('.card').forEach(function(cardEl) {
-      // Card body → resume session in its host. Stop propagation on
-      // child controls (unread dot, tasks block) so they don't also
-      // fire this. The .tasks subtree is exempt entirely so clicking
-      // anywhere inside tasks (label, row text, input) never resumes.
-      cardEl.addEventListener('click', function(ev) {
-        const target = ev.target;
-        if (!target) return;
-        // Tasks block intercepts all its own clicks.
-        if (target.closest('.tasks')) return;
-        // Anything with data-action handles itself.
-        if (target.closest('[data-action]')) return;
-        // Any input/textarea swallowed via focus/blur.
-        if (target.closest('input,textarea')) return;
-        send('resume', {
-          sessionId: cardEl.dataset.session || '',
-          cwd: cardEl.dataset.cwd || '',
-        });
+    document.querySelectorAll('.card').forEach(wireCardClicks);
+  }
+
+  // Wire every interactive handler within a single card's subtree.
+  // Safe to call on a freshly-rendered card: there are no listeners
+  // attached to children yet (innerHTML was just replaced), so this
+  // attaches exactly one of each per element.
+  function wireCardClicks(cardEl) {
+    if (!cardEl) return;
+
+    // Card body → resume session in its host. The handler is on
+    // cardEl itself (not bubbled from children), so partial rerenders
+    // that only rewrite cardEl.innerHTML don't strip this listener.
+    // But because rerenderOneCard uses innerHTML (not outerHTML) the
+    // card-level listener survives; we still need to (re)attach when
+    // building the card fresh from renderApp. Idempotency: the only
+    // call site for cardEl-level binding is right after a fresh
+    // innerHTML, so there's never a duplicate.
+    cardEl.addEventListener('click', function(ev) {
+      const target = ev.target;
+      if (!target) return;
+      if (target.closest('.tasks')) return;
+      if (target.closest('[data-action]')) return;
+      if (target.closest('input,textarea')) return;
+      send('resume', {
+        sessionId: cardEl.dataset.session || '',
+        cwd: cardEl.dataset.cwd || '',
       });
     });
 
     // Unread dot → mark-read.
-    document.querySelectorAll('[data-action="mark-read"]').forEach(function(el) {
+    cardEl.querySelectorAll('[data-action="mark-read"]').forEach(function(el) {
       el.addEventListener('click', function(ev) {
         ev.stopPropagation();
-        const card = el.closest('.card');
-        if (!card) return;
-        send('markRead', { sessionId: card.dataset.session || '' });
+        send('markRead', { sessionId: cardEl.dataset.session || '' });
       });
     });
 
     // Tasks-label or "+N more" → toggle card expansion. Kanban only —
     // list mode always shows the full list.
-    document.querySelectorAll('[data-toggle="1"]').forEach(function(el) {
+    cardEl.querySelectorAll('[data-toggle="1"]').forEach(function(el) {
       el.addEventListener('click', function(ev) {
         ev.stopPropagation();
         if (document.body.classList.contains('mode-list')) return;
-        const card = el.closest('.card');
-        if (!card) return;
-        const sid = card.dataset.session || '';
+        const sid = cardEl.dataset.session || '';
         if (!sid) return;
         if (expandedCards.has(sid)) expandedCards.delete(sid);
         else expandedCards.add(sid);
-        // Re-render only this card to avoid a full popover repaint
-        // (the next refresh tick will rebuild everything anyway).
-        rerenderOneCard(card);
+        rerenderOneCard(cardEl);
       });
     });
 
     // Task glyph → toggle open/done.
-    document.querySelectorAll('[data-action="task-toggle"]').forEach(function(el) {
+    cardEl.querySelectorAll('[data-action="task-toggle"]').forEach(function(el) {
       el.addEventListener('click', function(ev) {
         ev.stopPropagation();
-        const card = el.closest('.card');
         const tid = el.dataset.taskId;
-        if (!card || !tid) return;
+        if (!tid) return;
         send('taskToggle', {
-          sessionId: card.dataset.session || '',
+          sessionId: cardEl.dataset.session || '',
           taskId: tid,
         });
       });
     });
 
     // Hover × → delete user-authored task.
-    document.querySelectorAll('[data-action="task-delete"]').forEach(function(el) {
+    cardEl.querySelectorAll('[data-action="task-delete"]').forEach(function(el) {
       el.addEventListener('click', function(ev) {
         ev.stopPropagation();
-        const card = el.closest('.card');
         const tid = el.dataset.taskId;
-        if (!card || !tid) return;
+        if (!tid) return;
         send('taskDelete', {
-          sessionId: card.dataset.session || '',
+          sessionId: cardEl.dataset.session || '',
           taskId: tid,
         });
       });
     });
 
     // ✓ approve suggestion.
-    document.querySelectorAll('[data-action="task-approve"]').forEach(function(el) {
+    cardEl.querySelectorAll('[data-action="task-approve"]').forEach(function(el) {
       el.addEventListener('click', function(ev) {
         ev.stopPropagation();
-        const card = el.closest('.card');
         const tid = el.dataset.taskId;
-        if (!card || !tid) return;
+        if (!tid) return;
         send('taskApprove', {
-          sessionId: card.dataset.session || '',
+          sessionId: cardEl.dataset.session || '',
           taskId: tid,
         });
       });
     });
 
     // ✗ reject suggestion.
-    document.querySelectorAll('[data-action="task-reject"]').forEach(function(el) {
+    cardEl.querySelectorAll('[data-action="task-reject"]').forEach(function(el) {
       el.addEventListener('click', function(ev) {
         ev.stopPropagation();
-        const card = el.closest('.card');
         const tid = el.dataset.taskId;
-        if (!card || !tid) return;
+        if (!tid) return;
         send('taskReject', {
-          sessionId: card.dataset.session || '',
+          sessionId: cardEl.dataset.session || '',
           taskId: tid,
         });
       });
     });
 
     // + add task input — Enter saves, Esc cancels, blur clears draft.
-    document.querySelectorAll('[data-action="add-task-input"]').forEach(function(inp) {
+    cardEl.querySelectorAll('[data-action="add-task-input"]').forEach(function(inp) {
       const sid = inp.dataset.session || '';
-      // Restore draft if present
       if (draftFocus.has(sid) && inp.value === '') {
         inp.value = draftFocus.get(sid) || '';
       }
@@ -1068,10 +1121,8 @@
           const text = (inp.value || '').trim();
           if (!text) return;
           send('taskCreate', { sessionId: sid, content: text });
-          // Optimistic clear — next refresh will materialize the row.
           draftFocus.delete(sid);
           inp.value = '';
-          // Keep focus so the user can type the next task immediately.
           inp.focus();
         } else if (ev.key === 'Escape') {
           ev.preventDefault();
@@ -1080,7 +1131,6 @@
           inp.blur();
         }
       });
-      // Prevent card-click resume when the input is interacted with.
       inp.addEventListener('click', function(ev) { ev.stopPropagation(); });
     });
   }
@@ -1095,10 +1145,24 @@
     const row = lastRows.get(sid);
     if (!row) return;
     // Reflect expansion in the class so .expanded CSS rules apply.
-    if (expandedCards.has(sid)) cardEl.classList.add('expanded');
+    const wasExpanded = expandedCards.has(sid);
+    if (wasExpanded) cardEl.classList.add('expanded');
     else cardEl.classList.remove('expanded');
     cardEl.innerHTML = renderCard(row);
-    wireClicks();
+    // Scope handler re-wiring to THIS card — calling the global
+    // wireClicks() would attach extra listeners to every other card
+    // in the popover on every expand/collapse, which compounds across
+    // interactions until the next 5s refresh resets the DOM. Per-card
+    // scoping keeps the listener count tidy.
+    wireCardClicks(cardEl);
+    // If the user just expanded a card that was previously empty,
+    // auto-focus the + add input so the next keystroke types into
+    // it without an extra click. Matches the user's expectation that
+    // "clicking + add task immediately lets me type."
+    if (wasExpanded) {
+      const input = cardEl.querySelector('input[data-action="add-task-input"]');
+      if (input && !input.value) input.focus();
+    }
   }
 
   // Row cache keyed by sessionId — lets rerenderOneCard rebuild a
