@@ -2106,6 +2106,7 @@ class PopoverVC(NSViewController):
 
         if action == "resume":
             if not sid:
+                sys.stderr.write("[kanban-web] resume: empty sessionId\n")
                 return
             # Mark-as-read on resume — engaging with the session.
             for r in (self.last_rendered_rows or []):
@@ -2113,6 +2114,11 @@ class PopoverVC(NSViewController):
                     epoch = r.get("lastTurnEpoch")
                     _mark_session_read(sid, epoch if epoch is not None else time.time())
                     break
+            host = _find_live_session_host(sid)
+            sys.stderr.write(
+                f"[kanban-web] resume sid={sid!r} cwd={cwd!r} "
+                f"host={host!r}\n"
+            )
             self._open_session_in_terminal(sid, cwd or os.path.expanduser("~"))
             if self.popover_ref is not None:
                 try:
