@@ -2221,6 +2221,21 @@ class PopoverVC(NSViewController):
                 sys.stderr.write(f"[tasks] toggle miss sid={sid[:8]} tid={tid}\n")
                 return
             self.refresh()
+        elif action == "taskEdit":
+            # User finished editing a task's text (Enter or blur on a
+            # changed value). Only user-authored tasks are editable;
+            # tasks.update_task enforces that rule.
+            tid = pstr("taskId")
+            content = pstr("content")
+            if not sid or not tid or not content:
+                return
+            if tasks_module.update_task(sid, tid, content) is None:
+                sys.stderr.write(
+                    f"[tasks] edit rejected sid={sid[:8]} tid={tid} "
+                    f"content_len={len(content)}\n"
+                )
+                return
+            self.refresh()
         elif action == "taskDelete":
             # Hover-revealed × on a user-authored task row.
             tid = pstr("taskId")

@@ -445,6 +445,43 @@ def toggle_task(session_id: str, task_id: str) -> Optional[str]:
         return t["status"]
 
 
+def update_task(session_id: str, task_id: str, content: str) -> Optional[dict]:
+    """Edit the content of an existing user-authored task. Returns the
+    updated task dict on success, or None if:
+      - the task wasn't found,
+      - the new content fails validation (empty / too long),
+      - the task is a Haiku-suggested row (suggestions are immutable
+        until approved/rejected — editing them would muddy the
+        provenance trail in the file).
+
+    The task's id, source, status, createdAt, and approved fields are
+    preserved — we touch only ``content`` plus a fresh ``updatedAt``
+    timestamp for forensics."""
+    if not session_id or not task_id:
+        return None
+    if not _content_is_valid(content):
+        return None
+    stripped = content.strip()
+    with _LOCK:
+        state = load_state()
+        t = _find_task(state, session_id, task_id)
+        if t is None:
+            return None
+        if t.get("source") == "suggested" and not t.get("approved"):
+            # Don't allow editing a suggestion before the user has
+            # ratified it. If they want to keep the idea but rewrite
+            # the text, the flow is: approve → then edit.
+            return None
+        # No-op if nothing actually changed — avoids a write for a
+        # phantom "edit" the user opened then re-confirmed unchanged.
+        if t.get("content") == stripped:
+            return t
+        t["content"] = stripped
+        t["updatedAt"] = time.time()
+        _save_state(state)
+        return t
+
+
 def delete_task(session_id: str, task_id: str) -> bool:
     """Hard-remove a user-authored task. Suggested tasks should use
     ``reject_suggestion`` instead so Haiku knows not to re-suggest."""

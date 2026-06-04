@@ -140,6 +140,40 @@ def main() -> int:
         assert ordered[2]["status"] == "done"
     t("render order: open user → suggested → done", _render_order)
 
+    # Edit task content
+    def _edit():
+        s = "edit-test"
+        t1 = tasks.create_task(s, "Original content")
+        assert t1 is not None
+        updated = tasks.update_task(s, t1["id"], "New content")
+        assert updated is not None
+        assert updated["content"] == "New content"
+        assert updated["id"] == t1["id"]
+        assert updated["createdAt"] == t1["createdAt"]
+        assert "updatedAt" in updated
+        # Empty / whitespace / overlong rejected
+        assert tasks.update_task(s, t1["id"], "") is None
+        assert tasks.update_task(s, t1["id"], "   ") is None
+        assert tasks.update_task(s, t1["id"], "x" * 281) is None
+        # Missing task
+        assert tasks.update_task(s, "nope", "x") is None
+        # Suggestions are immutable until approved
+        state = tasks.load_state()
+        state["sessions"][s]["tasks"].append({
+            "id": "sug-edit", "content": "Suggested",
+            "status": "open", "source": "suggested", "approved": False,
+            "createdAt": time.time(), "completedAt": None,
+        })
+        tasks._save_state(state)
+        assert tasks.update_task(s, "sug-edit", "Hijack") is None
+        # Once approved, editable
+        tasks.approve_suggestion(s, "sug-edit")
+        assert tasks.update_task(s, "sug-edit", "Rewritten") is not None
+        # No-op when content unchanged still returns the task
+        latest = tasks.update_task(s, t1["id"], "New content")
+        assert latest is not None
+    t("update_task — edit content + reject empty/long/suggestion", _edit)
+
     # Corrupt file recovery
     def _corrupt():
         TEST_FILE.write_text("not json {{", encoding="utf-8")

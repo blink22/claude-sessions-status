@@ -155,6 +155,32 @@ def main() -> int:
         assert before == after, f"malformed inputs polluted file: {before}→{after}"
     case("T7 10 malformed inputs rejected cleanly", _t7)
 
+    # --- taskEdit ---
+    def _t_edit():
+        s = "edit-bridge"
+        # Create a fresh task
+        handle(vc, "taskCreate", {"sessionId": s, "content": "original"})
+        state = tasks.load_state()
+        tid = state["sessions"][s]["tasks"][-1]["id"]
+        # Edit via the bridge
+        handle(vc, "taskEdit", {"sessionId": s, "taskId": tid, "content": "edited"})
+        state = tasks.load_state()
+        tt = next(x for x in state["sessions"][s]["tasks"] if x["id"] == tid)
+        assert tt["content"] == "edited", f"content not updated: {tt['content']}"
+        # Empty content → reject, no crash
+        handle(vc, "taskEdit", {"sessionId": s, "taskId": tid, "content": ""})
+        state = tasks.load_state()
+        tt = next(x for x in state["sessions"][s]["tasks"] if x["id"] == tid)
+        assert tt["content"] == "edited", "empty edit should have been rejected"
+        # Missing task ID → reject, no crash
+        handle(vc, "taskEdit", {"sessionId": s, "content": "stray"})
+        # Dict-as-content → rejected by pstr's type check
+        handle(vc, "taskEdit", {"sessionId": s, "taskId": tid, "content": {"x": 1}})
+        state = tasks.load_state()
+        tt = next(x for x in state["sessions"][s]["tasks"] if x["id"] == tid)
+        assert tt["content"] == "edited"
+    case("T7b taskEdit happy path + malformed rejection", _t_edit)
+
     # --- Unknown action ---
     def _t8():
         handle(vc, "taskUnknown", {"sessionId": SID})  # must not crash

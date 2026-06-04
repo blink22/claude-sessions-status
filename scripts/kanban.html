@@ -413,6 +413,45 @@
   .card .task-row.suggested .tglyph { color: var(--text-3); }
   .card .task-row.suggested .ttext  { color: var(--text-2); font-style: italic; }
 
+  /* Editable task text — hover hint that the row is clickable for
+   * editing. Subtle: just a barely-perceptible underline so the
+   * static look isn't noisy. */
+  .card .task-row .ttext.editable {
+    cursor: text;
+    border-bottom: 1px dotted transparent;
+    transition: border-color 120ms ease;
+  }
+  .card .task-row .ttext.editable:hover {
+    border-bottom-color: rgba(255,255,255,0.15);
+  }
+
+  /* Inline edit input — replaces .ttext when the row enters edit
+   * mode. Sized to fill the row width minus the glyph; styled to
+   * blend with the surrounding row, with a focus state matching the
+   * + add-task input for consistency. */
+  .card .task-row .ttext-edit {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 3px;
+    color: var(--text-1);
+    padding: 1px 5px;
+    font-family: var(--sans);
+    font-size: 10.5px;
+    line-height: 1.4;
+    outline: none;
+  }
+  .card .task-row .ttext-edit:focus {
+    border-color: rgba(106,166,248,0.40);
+    background: rgba(106,166,248,0.06);
+  }
+  /* Suppress hover affordances on a row that's currently editing —
+   * the row IS the edit affordance. */
+  .card .task-row.editing { background: transparent; }
+  .card .task-row.editing .tdelete,
+  .card .task-row.editing .ctrls { display: none; }
+
   /* Hover-revealed delete affordance */
   .card .task-row .tdelete {
     margin-left: auto;
@@ -677,6 +716,16 @@
   // empty "+ add task" affordance in list mode — see wireClicks).
   const draftFocus = new Map();  // sessionId -> draft text (in-flight)
 
+  // In-flight task edits. Keyed by taskId so the editing state can be
+  // looked up regardless of which card it lives on. The Map stores
+  // the draft text the user is typing; if a refresh fires mid-edit
+  // we re-enter edit mode for the same row and restore the draft.
+  // A null/undefined entry means "not editing" — only present keys
+  // are in edit mode.
+  //   editingTasks.get(taskId) === undefined  →  view mode
+  //   editingTasks.get(taskId) === "..."      →  edit mode, draft text
+  const editingTasks = new Map();
+
   // Escape any HTML in user-supplied strings before inserting via
   // innerHTML. We use textContent where possible but composite rows
   // assemble template strings — this keeps the join cheap and safe.
@@ -909,16 +958,37 @@
       isSuggested ? '⋄' :
       status === 'done' ? '●' : '○';
     const tid = esc(t.id || '');
-    const tail = isSuggested
+
+    // Editable iff this is a user-authored task (suggested rows stay
+    // read-only until approved). Surface a hint via title attribute
+    // + a class the CSS can latch onto for hover feedback.
+    const isEditable = !isSuggested;
+    const inEdit = isEditable && editingTasks.has(t.id);
+    const draftValue = inEdit ? (editingTasks.get(t.id) || '') : null;
+
+    // Text element: a span in view mode, an <input> in edit mode.
+    // The input reuses the same data-task-id so handlers can route
+    // to the right task regardless of which row was clicked.
+    const textEl = inEdit
+      ? '<input class="ttext-edit" type="text"'
+        + ' data-action="task-edit-input" data-task-id="' + tid + '"'
+        + ' value="' + esc(draftValue !== null ? draftValue : (t.content || '')) + '" />'
+      : '<span class="ttext' + (isEditable ? ' editable' : '') + '"'
+        + (isEditable ? ' data-action="task-edit-begin" data-task-id="' + tid + '"' : '')
+        + (isEditable ? ' title="Click to edit"' : '')
+        + '>' + esc(t.content || '') + '</span>';
+
+    // Trailing controls: suggestions get ✓/✗; user tasks get ×.
+    // Hide them while editing so the input has the full row width.
+    const tail = inEdit ? '' : (isSuggested
       ? '<span class="ctrls">'
         + '<span class="ctrl approve" data-action="task-approve" data-task-id="' + tid + '" title="Approve">✓</span>'
         + '<span class="ctrl reject"  data-action="task-reject"  data-task-id="' + tid + '" title="Reject">✗</span>'
         + '</span>'
-      : '<span class="tdelete" data-action="task-delete" data-task-id="' + tid + '" title="Delete">×</span>';
-    return '<div class="task-row ' + cls + '" data-task-id="' + tid + '">'
+      : '<span class="tdelete" data-action="task-delete" data-task-id="' + tid + '" title="Delete">×</span>');
+    return '<div class="task-row ' + cls + (inEdit ? ' editing' : '') + '" data-task-id="' + tid + '">'
       + '<span class="tglyph" data-action="task-toggle" data-task-id="' + tid + '">' + glyph + '</span>'
-      + '<span class="ttext">' + esc(t.content || '') + '</span>'
-      + tail
+      + textEl
       + '</div>';
   }
 
@@ -998,16 +1068,24 @@
 
     // Remember which input had focus + cursor position so we can
     // restore it after the innerHTML replacement. Without this, a 5s
-    // background refresh would yank focus out of the user's typing.
+    // background refresh would yank focus out of the user's typing —
+    // both the + add-task input and the inline task-edit input.
     // `activeElement` is normally non-null (defaults to <body>) but
     // be defensive — and `.matches` isn't on every element type.
     const activeEl = document.activeElement;
-    let focusSession = null;
+    let focusKind = null;     // 'add' | 'edit' | null
+    let focusKey = null;      // sessionId for 'add', taskId for 'edit'
     let focusCaret = 0;
-    if (activeEl && typeof activeEl.matches === 'function'
-        && activeEl.matches('input[data-action="add-task-input"]')) {
-      focusSession = activeEl.dataset.session || null;
-      focusCaret = activeEl.selectionStart || 0;
+    if (activeEl && typeof activeEl.matches === 'function') {
+      if (activeEl.matches('input[data-action="add-task-input"]')) {
+        focusKind = 'add';
+        focusKey = activeEl.dataset.session || null;
+        focusCaret = activeEl.selectionStart || 0;
+      } else if (activeEl.matches('input[data-action="task-edit-input"]')) {
+        focusKind = 'edit';
+        focusKey = activeEl.dataset.taskId || null;
+        focusCaret = activeEl.selectionStart || 0;
+      }
     }
 
     // Populate row cache so rerenderOneCard() (used by expand/collapse)
@@ -1112,12 +1190,14 @@
       if (!lastRows.has(sid)) draftFocus.delete(sid);
     });
 
-    // Restore focus + caret if the user was typing into an add-task
-    // input when the refresh fired.
-    if (focusSession) {
-      const inp = document.querySelector(
-        'input[data-action="add-task-input"][data-session="' + focusSession + '"]'
-      );
+    // Restore focus + caret if the user was typing into either of
+    // the two input kinds (+ add-task or inline task edit) when the
+    // refresh fired. Find by the input's keying attribute.
+    if (focusKind && focusKey) {
+      const selector = focusKind === 'add'
+        ? 'input[data-action="add-task-input"][data-session="' + cssEscape(focusKey) + '"]'
+        : 'input[data-action="task-edit-input"][data-task-id="' + cssEscape(focusKey) + '"]';
+      const inp = document.querySelector(selector);
       if (inp) {
         inp.focus();
         try { inp.setSelectionRange(focusCaret, focusCaret); }
@@ -1199,6 +1279,93 @@
           taskId: tid,
         });
       });
+    });
+
+    // Click task text → enter edit mode. The current row is swapped
+    // to render an <input> via rerenderOneCard; the input gets focus
+    // + caret-at-end on the new render. Only user-authored rows
+    // expose this affordance (suggestions get the ✓/✗ controls).
+    cardEl.querySelectorAll('[data-action="task-edit-begin"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const tid = el.dataset.taskId;
+        if (!tid) return;
+        // Seed the editing-state Map with the current content so the
+        // input renders pre-filled. The Map's mere presence signals
+        // edit mode to taskRowHtml.
+        const row = lastRows.get(cardEl.dataset.session || '');
+        const t = row && (row.tasks || []).find(function(x) { return x.id === tid; });
+        editingTasks.set(tid, (t && t.content) || '');
+        rerenderOneCard(cardEl);
+        // Move focus to the newly-rendered input.
+        const inp = cardEl.querySelector(
+          'input[data-action="task-edit-input"][data-task-id="' + tid + '"]'
+        );
+        if (inp) {
+          inp.focus();
+          const len = (inp.value || '').length;
+          try { inp.setSelectionRange(len, len); } catch (e) { /* ok */ }
+        }
+      });
+    });
+
+    // Inline task-edit input — Enter saves, Esc cancels, blur saves
+    // when changed / cancels when unchanged. Mirrors the behavior of
+    // the + add-task input but routes to taskEdit instead of
+    // taskCreate.
+    cardEl.querySelectorAll('input[data-action="task-edit-input"]').forEach(function(inp) {
+      const tid = inp.dataset.taskId;
+      if (!tid) return;
+      const row = lastRows.get(cardEl.dataset.session || '');
+      const original = (row && (row.tasks || []).find(function(x) { return x.id === tid; }) || {}).content || '';
+
+      const commit = function() {
+        const text = (inp.value || '').trim();
+        if (!text) {
+          // Empty content — refuse the edit and revert to view. We
+          // could treat empty-on-Enter as a delete, but that's a
+          // bigger destructive action and deserves the explicit ×.
+          editingTasks.delete(tid);
+          rerenderOneCard(cardEl);
+          return;
+        }
+        if (text === original) {
+          // Unchanged — just exit edit mode, no Python round-trip.
+          editingTasks.delete(tid);
+          rerenderOneCard(cardEl);
+          return;
+        }
+        send('taskEdit', {
+          sessionId: cardEl.dataset.session || '',
+          taskId: tid,
+          content: text,
+        });
+        // Clear local edit state; the refresh from Python will
+        // render the new content. Don't rerender locally — that
+        // would briefly flash the old content before the refresh
+        // lands and override.
+        editingTasks.delete(tid);
+      };
+
+      // Track draft so a refresh mid-edit can restore the in-flight
+      // value rather than dropping the user's typing.
+      inp.addEventListener('input', function() {
+        editingTasks.set(tid, inp.value);
+      });
+      inp.addEventListener('keydown', function(ev) {
+        ev.stopPropagation();
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          commit();
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          editingTasks.delete(tid);
+          rerenderOneCard(cardEl);
+        }
+      });
+      inp.addEventListener('blur', commit);
+      // Don't let the inner click bubble up to the card-resume handler.
+      inp.addEventListener('click', function(ev) { ev.stopPropagation(); });
     });
 
     // Hover × → delete user-authored task.
