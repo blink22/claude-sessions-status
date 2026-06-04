@@ -450,6 +450,36 @@
   .card .task-row .ctrl.reject  { color: var(--red); }
   .card .task-row .ctrl:hover { background: rgba(255,255,255,0.10); }
 
+  /* "+ add task" link on collapsed kanban cards that already have
+   * tasks. Hidden in list mode (the input is always visible there)
+   * and on the expanded state (the input renders directly).
+   *
+   * Differentiated from the "+ N more" hint above it:
+   *   - Sans serif (not mono) — pulls it out of the metadata family
+   *   - Bumped a half-step in size (10.5 vs 9.5)
+   *   - Subtle top hairline so it reads as a separate affordance
+   *     section, not stacked with "+N more"
+   *   - Hover lifts color two notches (text-4 → text-2) so the
+   *     affordance is obviously interactive
+   */
+  .card .add-task-link {
+    font-family: var(--sans);
+    font-size: 10.5px;
+    color: var(--text-3);
+    margin-top: 5px;
+    padding-top: 5px;
+    cursor: pointer;
+    /* Stretch the hit zone to the full card width so clicking
+     * anywhere along the line expands — easier to hit than the
+     * 8-character text. */
+    display: block;
+    border-top: 1px dashed rgba(255,255,255,0.05);
+  }
+  .card .add-task-link:hover { color: var(--text-1); }
+  /* In list mode the input is always shown above this; suppress
+   * any stray link rendering just in case. */
+  body.mode-list .card .add-task-link { display: none; }
+
   /* "+N more" hint shown when the preview is truncated */
   .card .tasks .more {
     font-family: var(--mono);
@@ -840,11 +870,21 @@
       ? '<div class="more" data-toggle="1">+ ' + hiddenCount + ' more</div>'
       : '';
 
-    // The + add input: visible in list mode always, in kanban only
-    // when the card is expanded.
-    const addEl = (isList || expanded)
-      ? renderAddTaskInput(sid)
-      : '';
+    // The + add input or its affordance:
+    //   - List mode: always show the input (room to spare).
+    //   - Kanban + expanded: show the input.
+    //   - Kanban + collapsed + non-empty: show a quiet "+ add task"
+    //     link that expands the card on click (auto-focus handled by
+    //     rerenderOneCard). Without this, users with one existing
+    //     task on a collapsed card see no obvious way to add another.
+    //   - Kanban + collapsed + zero tasks: handled above by the
+    //     empty-state add-affordance branch — never reaches here.
+    let addEl;
+    if (isList || expanded) {
+      addEl = renderAddTaskInput(sid);
+    } else {
+      addEl = '<div class="add-task-link" data-toggle="1">+ add task</div>';
+    }
 
     return '<div class="tasks">'
       + '<div class="tasks-label" data-toggle="1">'
@@ -892,12 +932,62 @@
       + '</div>';
   }
 
+  // Last-rendered payload JSON. Used to dedupe identical refreshes —
+  // when Python's 5s tick pushes data that's byte-identical to what
+  // we already painted, we skip the full innerHTML rebuild that would
+  // otherwise shuffle every card's DOM identity (and visually flicker
+  // / shift heights as the browser re-lays everything out).
+  let _lastPayloadJson = null;
+
+  // Last-rendered "shape" — the columns and the ordered sessionIds
+  // in each. When the new payload's shape matches, we do per-card
+  // content updates (cardEl divs stay put, only innerHTML changes)
+  // so cards don't visually jump on every age-tick refresh. Shape
+  // changes (new/removed session, bucket transition, dormant toggle)
+  // fall back to a full DOM rebuild.
+  let _lastShape = null;
+
+  function sameShape(a, b) {
+    if (!a || !b) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i].key !== b[i].key) return false;
+      const xs = a[i].sids, ys = b[i].sids;
+      if (xs.length !== ys.length) return false;
+      for (let j = 0; j < xs.length; j++) if (xs[j] !== ys[j]) return false;
+    }
+    return true;
+  }
+
+  // Escape a value for safe use inside a CSS attribute selector.
+  // Session IDs in production are UUIDs (safe), but the in-test
+  // values and any future schema change shouldn't trip the selector.
+  function cssEscape(s) {
+    if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(s);
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, function(c) {
+      return '\\' + c.charCodeAt(0).toString(16) + ' ';
+    });
+  }
+
   // Top-level render. Replaces the whole #app subtree on every refresh
   // — cheap because there are O(20) cards total and we're not in a
-  // tight animation loop.
+  // tight animation loop. But idle refreshes still cause visible
+  // micro-jumps from the rebuild, so dedupe via JSON-string compare
+  // first; in steady state most refreshes are no-ops.
   function renderApp(data) {
     const app = document.getElementById('app');
     if (!app) return;
+
+    // Dedupe identical payloads — skip the whole rebuild so cards
+    // don't visually jump on quiet refresh ticks. Comparison cost is
+    // O(payload size, ~5KB) which is dwarfed by the innerHTML +
+    // wireClicks work it avoids. Stringify failures (circular refs,
+    // unlikely from Python) fall through to render as before.
+    let payloadJson = null;
+    try { payloadJson = JSON.stringify(data); } catch (_) {}
+    if (payloadJson !== null && payloadJson === _lastPayloadJson) return;
+    _lastPayloadJson = payloadJson;
+
     // Apply the mode class to the body so all our mode-{kanban,list}
     // CSS rules can target the right layout. Defaults to kanban when
     // the payload omits it (back-compat with older Python builds).
@@ -925,39 +1015,91 @@
     lastRows.clear();
 
     const buckets = data.buckets || {};
-    const cols = [];
+
+    // Compute the new card layout (which sessions in which columns).
+    // If this matches what's currently in the DOM, we can do a per-
+    // card content update — cards stay in place, only their inner
+    // HTML changes — which preserves hover state and avoids the
+    // visible "jump" that happens when the whole #app subtree is
+    // replaced and the browser re-lays everything out.
+    const newShape = [];  // array of {key, sids: [sessionId, ...]}
     COL_KEYS.forEach(function(key) {
       if (key === 'dormant' && !data.showDormant) return;
       const rows = buckets[key] || [];
-      const count = rows.length;
-      const label = COL_LABELS[key] || key;
-      // Cache rows by sessionId for per-card rerender
+      newShape.push({ key: key, sids: rows.map(function(r){ return r.sessionId || ''; }) });
       rows.forEach(function(r) { if (r.sessionId) lastRows.set(r.sessionId, r); });
-      const cards = rows.length
-        ? rows.map(function(r) {
-            const isExpanded = expandedCards.has(r.sessionId);
-            return '<div class="card ' + esc(r.bucket)
-              + (r.unread ? ' is-unread' : '')
-              + (isExpanded ? ' expanded' : '')
-              + '" data-session="' + esc(r.sessionId)
-              + '" data-cwd="' + esc(r.cwd || '')
-              + '">' + renderCard(r) + '</div>';
-          }).join('')
-        : '<div class="empty">—</div>';
-      cols.push(''
-        + '<div class="col" data-key="' + esc(key) + '">'
-        +   '<div class="col-header">'
-        +     '<span class="label">' + esc(label) + '</span>'
-        +     '<span class="count">' + count + '</span>'
-        +   '</div>'
-        +   '<div class="col-body">' + cards + '</div>'
-        + '</div>'
-      );
     });
-    app.innerHTML = cols.join('');
 
-    // Wire click handlers AFTER the DOM is replaced.
-    wireClicks();
+    const shapeSame = sameShape(newShape, _lastShape) && app.children.length > 0;
+
+    if (shapeSame) {
+      // ---- Per-card update path ----
+      // Same sessions in the same columns. Walk the existing cardEls
+      // in place and replace ONLY their innerHTML. CardEl divs (and
+      // their position in the column) are not touched, so cards do
+      // not jump. Listeners on cardEl (resume click) persist because
+      // wireCardClicks gates that on a dataset flag.
+      newShape.forEach(function(colSpec) {
+        const colEl = app.querySelector('.col[data-key="' + colSpec.key + '"]');
+        if (!colEl) return;
+        // Update header count
+        const countEl = colEl.querySelector('.col-header .count');
+        if (countEl) countEl.textContent = String(colSpec.sids.length);
+        // Per-card content update
+        const rows = buckets[colSpec.key] || [];
+        rows.forEach(function(r) {
+          const cardEl = colEl.querySelector(
+            '.card[data-session="' + cssEscape(r.sessionId) + '"]'
+          );
+          if (!cardEl) return;
+          // Reflect possibly-changed bucket / unread / expanded class
+          cardEl.className = 'card ' + (r.bucket || 'dormant')
+            + (r.unread ? ' is-unread' : '')
+            + (expandedCards.has(r.sessionId) ? ' expanded' : '');
+          cardEl.dataset.cwd = r.cwd || '';
+          cardEl.innerHTML = renderCard(r);
+          // Re-wire the (new) inner children. cardEl-level click
+          // listener was attached on initial wire and survives via
+          // the data-body-wired flag.
+          wireCardClicks(cardEl);
+        });
+      });
+    } else {
+      // ---- Full rebuild path ----
+      // Shape changed (card moved buckets, new session, gone session,
+      // dormant toggled). Repaint the whole #app subtree.
+      const cols = [];
+      COL_KEYS.forEach(function(key) {
+        if (key === 'dormant' && !data.showDormant) return;
+        const rows = buckets[key] || [];
+        const count = rows.length;
+        const label = COL_LABELS[key] || key;
+        const cards = rows.length
+          ? rows.map(function(r) {
+              const isExpanded = expandedCards.has(r.sessionId);
+              return '<div class="card ' + esc(r.bucket)
+                + (r.unread ? ' is-unread' : '')
+                + (isExpanded ? ' expanded' : '')
+                + '" data-session="' + esc(r.sessionId)
+                + '" data-cwd="' + esc(r.cwd || '')
+                + '">' + renderCard(r) + '</div>';
+            }).join('')
+          : '<div class="empty">—</div>';
+        cols.push(''
+          + '<div class="col" data-key="' + esc(key) + '">'
+          +   '<div class="col-header">'
+          +     '<span class="label">' + esc(label) + '</span>'
+          +     '<span class="count">' + count + '</span>'
+          +   '</div>'
+          +   '<div class="col-body">' + cards + '</div>'
+          + '</div>'
+        );
+      });
+      app.innerHTML = cols.join('');
+      // Wire click handlers AFTER the DOM is replaced.
+      wireClicks();
+    }
+    _lastShape = newShape;
 
     // Garbage-collect stale per-card state: any session that's no
     // longer in the current payload (dormant promoted out of view,
@@ -1148,13 +1290,20 @@
     // interactions until the next 5s refresh resets the DOM. Per-card
     // scoping keeps the listener count tidy.
     wireCardClicks(cardEl);
-    // If the user just expanded a card that was previously empty,
-    // auto-focus the + add input so the next keystroke types into
-    // it without an extra click. Matches the user's expectation that
-    // "clicking + add task immediately lets me type."
+    // If the user just expanded the card, auto-focus the + add input
+    // so the next keystroke goes into it without an extra click. We
+    // ALWAYS focus (not only on empty input) — a stale draftFocus
+    // entry can pre-fill the value, and the user still expects
+    // typing to extend that draft, not require a manual click into
+    // the input. Park caret at end so the prefill isn't selected
+    // and overwritten by the first keystroke.
     if (wasExpanded) {
       const input = cardEl.querySelector('input[data-action="add-task-input"]');
-      if (input && !input.value) input.focus();
+      if (input) {
+        input.focus();
+        const len = (input.value || '').length;
+        try { input.setSelectionRange(len, len); } catch (e) { /* ok */ }
+      }
     }
   }
 
