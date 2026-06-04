@@ -2262,6 +2262,42 @@ class PopoverVC(NSViewController):
                 sys.stderr.write(f"[tasks] delete miss sid={sid[:8]} tid={tid}\n")
                 return
             self.refresh()
+        elif action == "taskReorder":
+            # User drag-dropped a task to reorder. JS sends the full
+            # new order as a list of task IDs (open user-authored
+            # bucket only). Other buckets are not touched.
+            if not sid:
+                return
+            ordered_raw = payload.get("orderedIds")
+            # Coerce NSArray → list[str] if needed.
+            if hasattr(ordered_raw, "objectAtIndex_"):
+                ordered: list = []
+                try:
+                    for i in range(ordered_raw.count()):
+                        v = ordered_raw.objectAtIndex_(i)
+                        if isinstance(v, str):
+                            ordered.append(v)
+                        elif hasattr(v, "UTF8String"):
+                            try:
+                                ordered.append(str(v))
+                            except Exception:  # noqa: BLE001
+                                pass
+                except Exception as e:  # noqa: BLE001
+                    sys.stderr.write(f"[tasks] reorder decode: {e!r}\n")
+                    return
+            elif isinstance(ordered_raw, (list, tuple)):
+                ordered = [str(x) for x in ordered_raw if isinstance(x, str)]
+            else:
+                ordered = []
+            if not ordered:
+                return
+            if not tasks_module.reorder_tasks(sid, ordered):
+                sys.stderr.write(
+                    f"[tasks] reorder failed sid={sid[:8]} "
+                    f"count={len(ordered)}\n"
+                )
+                return
+            self.refresh()
         elif action == "taskApprove":
             # ✓ on a Haiku-suggested row — ratify into a normal task.
             tid = pstr("taskId")

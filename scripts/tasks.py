@@ -290,13 +290,15 @@ def _render_sort(tasks: list[dict]) -> list[dict]:
     """Order tasks for rendering on a card.
 
     Bucket order:
-      0. Open user-approved tasks (createdAt ascending — oldest first)
+      0. Open user-approved tasks (by ``position`` if present, else
+         createdAt ascending — backward-compat with pre-reorder data)
       1. Pending suggestions (createdAt ascending)
       2. Done user tasks (completedAt descending — most-recently-done first)
 
-    The first two buckets together represent "things to look at"; bucket
-    2 is recency-ordered history. Suggestions go after open user tasks
-    so the user's own list dominates the visual weight.
+    Open user tasks support drag-to-reorder via the ``position`` field
+    (integer). When missing, the createdAt timestamp doubles as the
+    position, so historical data sorts identically to its
+    pre-reorder behavior.
     """
     def bucket(t: dict) -> int:
         status = t.get("status") or "open"
@@ -311,7 +313,12 @@ def _render_sort(tasks: list[dict]) -> list[dict]:
         if b == 2:
             # Most recently done first — negate epoch
             return (b, -(t.get("completedAt") or 0))
-        return (b, t.get("createdAt") or 0)
+        # Open user / suggested bucket — explicit position wins, with
+        # createdAt as fallback for pre-reorder rows.
+        pos = t.get("position")
+        if not isinstance(pos, (int, float)):
+            pos = t.get("createdAt") or 0
+        return (b, pos)
 
     return sorted(tasks, key=key)
 
@@ -480,6 +487,72 @@ def update_task(session_id: str, task_id: str, content: str) -> Optional[dict]:
         t["updatedAt"] = time.time()
         _save_state(state)
         return t
+
+
+def reorder_tasks(session_id: str, ordered_ids: list[str]) -> bool:
+    """Apply a new ordering to a session's tasks. ``ordered_ids`` is the
+    list of task IDs in their new desired display order — only the
+    open user-authored bucket is expected to be reordered (the UI
+    doesn't surface drag handles on done / suggested rows).
+
+    Tasks whose ID is in ``ordered_ids`` receive a ``position`` field
+    equal to their index in the list (0-based). Tasks NOT in the list
+    keep their existing position relative to each other, appended
+    after the explicit ones — so done / suggested rows stay sorted by
+    their bucket-specific rules.
+
+    Returns True on a successful write, False if the session is
+    unknown or no tasks were updated."""
+    if not session_id or not isinstance(ordered_ids, (list, tuple)):
+        return False
+    # Validate + dedupe the input. Anything non-string is dropped.
+    seen: set = set()
+    clean_ids: list = []
+    for raw in ordered_ids:
+        if not isinstance(raw, str) or not raw or raw in seen:
+            continue
+        seen.add(raw)
+        clean_ids.append(raw)
+    if not clean_ids:
+        return False
+    with _LOCK:
+        state = load_state()
+        entry = (state.get("sessions") or {}).get(session_id)
+        if not isinstance(entry, dict):
+            return False
+        tasks = entry.get("tasks") or []
+        if not tasks:
+            return False
+        # Build the position map from the user's ordering.
+        pos_map = {tid: i for i, tid in enumerate(clean_ids)}
+        # Defensive: if NONE of the IDs in ordered_ids match a task
+        # in this session, the request is stale (e.g., the user
+        # dragged a row that was just deleted in a different
+        # process, then the UI sent stale IDs). Bail rather than
+        # mutating unrelated tasks' positions to "next_pos"-style
+        # high integers that would scramble the existing order.
+        if not any(t.get("id") in pos_map for t in tasks):
+            return False
+        # Tasks not mentioned in ordered_ids keep their relative
+        # order — assign positions starting just past the explicit
+        # block. Iteration order over `tasks` is the on-disk array
+        # order, which is the order they were appended in.
+        next_pos = len(clean_ids)
+        any_changed = False
+        for t in tasks:
+            tid = t.get("id")
+            if tid in pos_map:
+                new_pos = pos_map[tid]
+            else:
+                new_pos = next_pos
+                next_pos += 1
+            if t.get("position") != new_pos:
+                t["position"] = new_pos
+                any_changed = True
+        if not any_changed:
+            return True  # idempotent — caller asked for current order
+        _save_state(state)
+        return True
 
 
 def delete_task(session_id: str, task_id: str) -> bool:

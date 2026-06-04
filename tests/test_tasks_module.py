@@ -174,6 +174,67 @@ def main() -> int:
         assert latest is not None
     t("update_task — edit content + reject empty/long/suggestion", _edit)
 
+    # Reorder
+    def _reorder():
+        s = "reorder-test"
+        a = tasks.create_task(s, "alpha")
+        b = tasks.create_task(s, "beta")
+        c = tasks.create_task(s, "gamma")
+        # Default order matches creation
+        ordered = tasks.tasks_for_session(s)
+        assert [t["content"] for t in ordered] == ["alpha", "beta", "gamma"]
+        # Reorder: gamma → alpha → beta
+        ok = tasks.reorder_tasks(s, [c["id"], a["id"], b["id"]])
+        assert ok is True
+        ordered = tasks.tasks_for_session(s)
+        assert [t["content"] for t in ordered] == ["gamma", "alpha", "beta"]
+        # Positions are 0/1/2
+        positions = {t["content"]: t["position"] for t in ordered if "position" in t}
+        assert positions == {"gamma": 0, "alpha": 1, "beta": 2}
+        # Reorder with partial list — unmentioned tasks keep relative order
+        # at the end. Reorder only [beta, gamma] → alpha should follow.
+        tasks.reorder_tasks(s, [b["id"], c["id"]])
+        ordered = tasks.tasks_for_session(s)
+        # beta(0) + gamma(1) explicit; alpha gets next pos = 2 since
+        # it's the only unmentioned task
+        assert ordered[0]["content"] == "beta"
+        assert ordered[1]["content"] == "gamma"
+        assert ordered[2]["content"] == "alpha"
+        # Empty / invalid input rejected
+        assert tasks.reorder_tasks(s, []) is False
+        assert tasks.reorder_tasks(s, [123, None]) is False  # type: ignore
+        assert tasks.reorder_tasks("unknown-sid", [a["id"]]) is False
+        # Idempotent — submitting same order doesn't crash
+        same = [t["id"] for t in tasks.tasks_for_session(s) if t.get("status") == "open"]
+        assert tasks.reorder_tasks(s, same) is True
+        # Stale IDs (none match any task in this session) — bail
+        # without scrambling unrelated positions.
+        before = {t["content"]: t.get("position") for t in tasks.tasks_for_session(s)}
+        assert tasks.reorder_tasks(s, ["t_doesnt_exist", "t_also_gone"]) is False
+        after = {t["content"]: t.get("position") for t in tasks.tasks_for_session(s)}
+        assert before == after, "stale-IDs reorder mutated positions"
+        # Approved suggestion participates in reorder (regression test
+        # for schema-migration of suggested→user-approved promotion).
+        state = tasks.load_state()
+        state["sessions"][s]["tasks"].append({
+            "id": "sug-reorder", "content": "Suggested",
+            "status": "open", "source": "suggested", "approved": False,
+            "createdAt": time.time(), "completedAt": None,
+        })
+        tasks._save_state(state)
+        tasks.approve_suggestion(s, "sug-reorder")
+        # Now reorder so the approved suggestion is first
+        all_open = [t["id"] for t in tasks.tasks_for_session(s) if t.get("status") == "open"]
+        # Move sug-reorder to the front
+        all_open.remove("sug-reorder")
+        all_open.insert(0, "sug-reorder")
+        assert tasks.reorder_tasks(s, all_open) is True
+        ordered = tasks.tasks_for_session(s)
+        first_open = next(t for t in ordered if t.get("status") == "open")
+        assert first_open["id"] == "sug-reorder", \
+            f"approved suggestion didn't move to front: {[t['id'] for t in ordered]}"
+    t("reorder_tasks — update positions + idempotent + stale + approved sug", _reorder)
+
     # Corrupt file recovery
     def _corrupt():
         TEST_FILE.write_text("not json {{", encoding="utf-8")

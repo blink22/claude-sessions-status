@@ -413,6 +413,29 @@
   .card .task-row.suggested .tglyph { color: var(--text-3); }
   .card .task-row.suggested .ttext  { color: var(--text-2); font-style: italic; }
 
+  /* Drag-to-reorder states for open user-authored rows.
+   * The .reorderable class signals draggability without changing
+   * the cursor on inner controls (text gets text-cursor for edit,
+   * glyph gets pointer for toggle). When a row is being dragged,
+   * fade it; when another row hovers over a target slot, show a
+   * thin colored insertion line on the top or bottom edge so the
+   * user can predict where it will land. */
+  .card .task-row.dragging {
+    opacity: 0.35;
+  }
+  .card .task-row.drag-over-before {
+    box-shadow: inset 0 2px 0 0 var(--blue);
+  }
+  .card .task-row.drag-over-after {
+    box-shadow: inset 0 -2px 0 0 var(--blue);
+  }
+  /* While ANY row is being dragged in the popover, soften body-level
+   * affordances that would otherwise distract (e.g., title hover
+   * underline on .ttext.editable). */
+  body.dragging-task .task-row .ttext.editable {
+    border-bottom-color: transparent !important;
+  }
+
   /* Floating tooltip shown on hover over truncated task text.
    * Single element appended to body, positioned in fixed coords near
    * the cursor by JS. pointer-events: none so it never intercepts
@@ -1019,7 +1042,17 @@
         + '<span class="ctrl reject"  data-action="task-reject"  data-task-id="' + tid + '" title="Reject">✗</span>'
         + '</span>'
       : '<span class="tdelete" data-action="task-delete" data-task-id="' + tid + '" title="Delete">×</span>');
-    return '<div class="task-row ' + cls + (inEdit ? ' editing' : '') + '" data-task-id="' + tid + '">'
+    // Drag-to-reorder: only OPEN user-authored rows are draggable.
+    // Done rows are sort-locked by completedAt; suggestions are
+    // sort-locked by bucket. The draggable attribute is itself only
+    // set when not in edit mode (a draggable input is confusing —
+    // the browser would intercept text-selection drag for reorder).
+    const isReorderable = isEditable && status === 'open' && !inEdit;
+    return '<div class="task-row ' + cls + (inEdit ? ' editing' : '')
+      + (isReorderable ? ' reorderable' : '') + '"'
+      + ' data-task-id="' + tid + '"'
+      + (isReorderable ? ' draggable="true"' : '')
+      + '>'
       + '<span class="tglyph" data-action="task-toggle" data-task-id="' + tid + '">' + glyph + '</span>'
       + textEl
       + tail
@@ -1492,6 +1525,91 @@
       });
       inp.addEventListener('blur', function() { commit('blur'); });
       inp.addEventListener('click', function(ev) { ev.stopPropagation(); });
+    });
+
+    // Drag-to-reorder. Only .reorderable rows (open user-authored,
+    // non-editing) get dragstart/dragover/drop handlers. The
+    // insertion point is computed from the cursor's Y position
+    // relative to the target row's vertical midpoint — above the
+    // midpoint = insert before, below = insert after. On drop, we
+    // collect the new order of task-id attributes within the
+    // .tasks container and post taskReorder. Python rewrites
+    // positions + refreshes the popover.
+    cardEl.querySelectorAll('.task-row.reorderable').forEach(function(rowEl) {
+      rowEl.addEventListener('dragstart', function(ev) {
+        if (!ev.dataTransfer) return;
+        ev.dataTransfer.effectAllowed = 'move';
+        // Some browsers require something in dataTransfer for the
+        // drag to "stick"; the task-id doubles as a small payload.
+        try { ev.dataTransfer.setData('text/plain', rowEl.dataset.taskId || ''); }
+        catch (e) { /* some browsers throw on setData here */ }
+        rowEl.classList.add('dragging');
+        document.body.classList.add('dragging-task');
+        // Hide hover tooltip during drag — otherwise it lingers
+        // mid-air over a node that's been visually faded.
+        _hideTaskTooltip();
+      });
+      rowEl.addEventListener('dragend', function() {
+        // Defensive global cleanup. If a Python refresh fired during
+        // the drag (5s tick), the original rowEl is now detached and
+        // a brand-new DOM has the .dragging class on a different
+        // element — clearing on `rowEl` alone would leak the visual
+        // state. Sweep the whole document so no zombie classes
+        // survive regardless of refresh timing.
+        document.querySelectorAll(
+          '.task-row.dragging, .task-row.drag-over-before, .task-row.drag-over-after'
+        ).forEach(function(el) {
+          el.classList.remove('dragging', 'drag-over-before', 'drag-over-after');
+        });
+        document.body.classList.remove('dragging-task');
+      });
+    });
+
+    // Dragover/drop handlers attach to ALL reorderable rows as drop
+    // targets (a dragged row can land before OR after any other
+    // reorderable row).
+    cardEl.querySelectorAll('.task-row.reorderable').forEach(function(target) {
+      target.addEventListener('dragover', function(ev) {
+        const dragging = cardEl.querySelector('.task-row.dragging');
+        if (!dragging || dragging === target) return;
+        ev.preventDefault();  // allow drop
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
+        // Decide insertion point based on cursor Y vs target midpoint.
+        const rect = target.getBoundingClientRect();
+        const isBefore = (ev.clientY - rect.top) < (rect.height / 2);
+        target.classList.toggle('drag-over-before', isBefore);
+        target.classList.toggle('drag-over-after', !isBefore);
+      });
+      target.addEventListener('dragleave', function() {
+        target.classList.remove('drag-over-before', 'drag-over-after');
+      });
+      target.addEventListener('drop', function(ev) {
+        const dragging = cardEl.querySelector('.task-row.dragging');
+        if (!dragging || dragging === target) return;
+        ev.preventDefault();
+        const rect = target.getBoundingClientRect();
+        const isBefore = (ev.clientY - rect.top) < (rect.height / 2);
+        // Move the dragged row in the DOM so the insertion is
+        // immediate (optimistic UI). The Python refresh that arrives
+        // ~100ms later will confirm the order.
+        if (isBefore) {
+          target.parentNode.insertBefore(dragging, target);
+        } else {
+          target.parentNode.insertBefore(dragging, target.nextSibling);
+        }
+        target.classList.remove('drag-over-before', 'drag-over-after');
+        // Collect the new order of ALL reorderable rows in this card.
+        // Only IDs of open user-authored rows; done / suggestions
+        // keep their bucket-based sort and don't need to be sent.
+        const orderedIds = Array.from(
+          cardEl.querySelectorAll('.task-row.reorderable')
+        ).map(function(el) { return el.dataset.taskId; }).filter(Boolean);
+        if (orderedIds.length < 2) return;
+        send('taskReorder', {
+          sessionId: cardEl.dataset.session || '',
+          orderedIds: orderedIds,
+        });
+      });
     });
 
     // Hover on task text → show the full content in a floating

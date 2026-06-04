@@ -181,6 +181,27 @@ def main() -> int:
         assert tt["content"] == "edited"
     case("T7b taskEdit happy path + malformed rejection", _t_edit)
 
+    # --- taskReorder ---
+    def _t_reorder():
+        s = "reorder-bridge"
+        handle(vc, "taskCreate", {"sessionId": s, "content": "first"})
+        handle(vc, "taskCreate", {"sessionId": s, "content": "second"})
+        handle(vc, "taskCreate", {"sessionId": s, "content": "third"})
+        st = tasks.load_state()
+        ids = [t["id"] for t in st["sessions"][s]["tasks"]]
+        # Reverse the order via the bridge
+        handle(vc, "taskReorder", {"sessionId": s, "orderedIds": list(reversed(ids))})
+        ordered = tasks.tasks_for_session(s)
+        assert [t["content"] for t in ordered] == ["third", "second", "first"]
+        # Missing orderedIds: no-op, no crash
+        handle(vc, "taskReorder", {"sessionId": s})
+        # orderedIds with non-strings: filtered, but if all are filtered out, no-op
+        handle(vc, "taskReorder", {"sessionId": s, "orderedIds": [1, 2, 3]})
+        # Confirm ordering didn't change
+        ordered = tasks.tasks_for_session(s)
+        assert [t["content"] for t in ordered] == ["third", "second", "first"]
+    case("T7c taskReorder happy path + malformed rejection", _t_reorder)
+
     # --- Unknown action ---
     def _t8():
         handle(vc, "taskUnknown", {"sessionId": SID})  # must not crash
