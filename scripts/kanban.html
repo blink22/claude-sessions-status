@@ -525,14 +525,11 @@
    * normal tasks-label (with the chevron + fraction) by the JS — so
    * the rotated-chevron rule still applies as expected. */
 
-  /* Dormant: fraction-only treatment (no preview rows, no expansion). */
-  .card.dormant .tasks .task-row,
-  .card.dormant .tasks .more,
-  .card.dormant .tasks .add-task,
-  .card.dormant .tasks .sugg-divider { display: none; }
-  .card.dormant .tasks { padding-top: 4px; margin-top: 6px; }
-  .card.dormant .tasks .tasks-label { margin-bottom: 0; cursor: default; }
-  .card.dormant .tasks .chev { display: none; }
+  /* Dormant cards used to collapse the tasks block to just the
+   * fraction. The user overrode that — tasks in dormant sessions
+   * stay fully visible (rows, "+ N more" expansion, "+ add task"
+   * affordance) so they read like any other card. Only the title
+   * dimming (declared further up) keeps dormant visually distinct. */
 
   /* List mode: tasks always show all rows + always-visible add input,
    * no expand/collapse — width is generous enough. */
@@ -785,22 +782,14 @@
     });
     const doneTasks = tasks.filter(function(t) { return t.status === 'done'; });
 
-    // Dormant cards never get a tasks block, full stop — matches the
-    // "dormant is quiet, no input affordances" rule. Existing tasks
-    // still show as a fraction label.
-    if (isDormant) {
-      if (total === 0) return '';
-      return '<div class="tasks">'
-        + '<div class="tasks-label" data-toggle="0">'
-        +   '<span>tasks</span>'
-        +   '<span class="frac">(' + done + '/' + total + ')</span>'
-        + '</div>'
-        + '</div>';
-    }
+    // Dormant cards used to collapse to just the fraction — the user
+    // overrode that: tasks in dormant sessions stay visible. So dormant
+    // now falls through to the normal render path; only the card title
+    // dimming (handled in CSS) still distinguishes dormant visually.
 
-    // Empty active card — surface a "+ add task" affordance so the
-    // user can create the FIRST task without needing an expand target
-    // that doesn't exist yet. Click expands the card and reveals the
+    // Empty card — surface a "+ add task" affordance so the user can
+    // create the FIRST task without needing an expand target that
+    // doesn't exist yet. Click expands the card and reveals the
     // input. List mode falls through to the regular render below
     // which always shows the input row anyway.
     if (total === 0 && !isList && !expanded) {
@@ -1005,31 +994,35 @@
   }
 
   // Wire every interactive handler within a single card's subtree.
-  // Safe to call on a freshly-rendered card: there are no listeners
-  // attached to children yet (innerHTML was just replaced), so this
-  // attaches exactly one of each per element.
+  // Safe to call on a freshly-rendered card AND on a partially-rerendered
+  // card (where cardEl itself persists across the innerHTML swap): the
+  // card-body resume listener is gated by a dataset flag so it's
+  // attached at most once per cardEl lifetime, and the inner per-element
+  // listeners are always against freshly-replaced children so there's
+  // no duplication risk.
   function wireCardClicks(cardEl) {
     if (!cardEl) return;
 
-    // Card body → resume session in its host. The handler is on
-    // cardEl itself (not bubbled from children), so partial rerenders
-    // that only rewrite cardEl.innerHTML don't strip this listener.
-    // But because rerenderOneCard uses innerHTML (not outerHTML) the
-    // card-level listener survives; we still need to (re)attach when
-    // building the card fresh from renderApp. Idempotency: the only
-    // call site for cardEl-level binding is right after a fresh
-    // innerHTML, so there's never a duplicate.
-    cardEl.addEventListener('click', function(ev) {
-      const target = ev.target;
-      if (!target) return;
-      if (target.closest('.tasks')) return;
-      if (target.closest('[data-action]')) return;
-      if (target.closest('input,textarea')) return;
-      send('resume', {
-        sessionId: cardEl.dataset.session || '',
-        cwd: cardEl.dataset.cwd || '',
+    // Card body → resume session in its host. ONLY attach if not
+    // already wired — a partial rerender (expand/collapse) keeps
+    // cardEl alive and re-running this would stack listeners,
+    // causing every resume click to fire 2+ times. The dataset flag
+    // is cleared automatically when cardEl is replaced wholesale
+    // by the next full renderApp() tick.
+    if (!cardEl.dataset.bodyWired) {
+      cardEl.addEventListener('click', function(ev) {
+        const target = ev.target;
+        if (!target) return;
+        if (target.closest('.tasks')) return;
+        if (target.closest('[data-action]')) return;
+        if (target.closest('input,textarea')) return;
+        send('resume', {
+          sessionId: cardEl.dataset.session || '',
+          cwd: cardEl.dataset.cwd || '',
+        });
       });
-    });
+      cardEl.dataset.bodyWired = '1';
+    }
 
     // Unread dot → mark-read.
     cardEl.querySelectorAll('[data-action="mark-read"]').forEach(function(el) {

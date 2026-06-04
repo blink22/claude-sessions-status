@@ -2100,18 +2100,18 @@ class PopoverVC(NSViewController):
 
     # ---- WKScriptMessageHandler ----
     # Called by WebKit when JS posts via
-    # window.webkit.messageHandlers.kanban.postMessage(...).
+    # window.webkit.messageHandlers.kanban.postMessage(...). This is
+    # a thin ObjC method that decodes the NSDictionary body into a
+    # plain Python dict, then delegates to _handle_script_message —
+    # which is testable directly (no ObjC self check) so the action
+    # dispatch can be exercised without instantiating an AppKit view.
     def userContentController_didReceiveScriptMessage_(self, ctrl, msg):
         try:
             body = msg.body()
-            # PyObjC may hand us an NSDictionary; coerce to plain dict.
-            # We extract a generic action + payload dict here, then
-            # per-action handlers below pluck the fields they need.
             if hasattr(body, "objectForKey_"):
                 action = str(body.objectForKey_("action") or "")
                 payload_raw = body.objectForKey_("payload") or {}
                 if hasattr(payload_raw, "objectForKey_"):
-                    # NSDictionary → plain dict
                     payload = {}
                     for k in payload_raw.allKeys():
                         payload[str(k)] = payload_raw.objectForKey_(k)
@@ -2123,7 +2123,14 @@ class PopoverVC(NSViewController):
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[kanban-web] msg decode: {e!r}\n")
             return
+        self._handle_script_message(action, payload)
 
+    @objc.python_method
+    def _handle_script_message(self, action: str, payload: dict):
+        """Pure-Python dispatch for bridge actions. Separated from the
+        ObjC entry point so unit tests can call this directly with a
+        plain dict, avoiding the ObjC ``isKindOfClass`` self-check
+        that prevents duck-typed test doubles."""
         def pstr(k: str) -> str:
             """Extract payload[k] as a plain Python string. Rejects
             anything that isn't a string-like type — a malformed JS
