@@ -4,6 +4,72 @@ All notable changes to this project are documented here. Format roughly
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased — additions on top of 0.5.0
+
+These changes are on `main` but not yet tagged with a new version.
+Existing 0.5.0 installs pick them up on the next `git pull` (via
+`install.sh` or manually); no schema migration is required.
+
+### Added — task management
+
+- **Inline edit.** Click any user-authored task's text and the row
+  swaps to an `<input>` with the caret at the end of the existing
+  content. Enter saves, Esc / blur on unchanged value cancels.
+  Suggested tasks stay read-only until approved. The task's id,
+  createdAt, status, and source fields are preserved across the
+  edit — only `content` plus a new optional `updatedAt` timestamp
+  are touched.
+- **Drag-to-reorder.** Open user-authored task rows are now
+  HTML5-draggable. Pick a row up, see a blue insertion line on the
+  top or bottom edge of any other row, drop to commit. Done tasks
+  (`●`) and pending suggestions (`⋄`) stay sort-locked by their
+  bucket rules — only the open user-authored bucket reorders.
+  Backed by a new optional `position` integer per task; pre-existing
+  tasks (no position) sort by `createdAt` so historical data renders
+  identically.
+- **Hover tooltip.** Hovering any task row briefly (~220ms) brings
+  up a small dark tooltip near the cursor showing the full task
+  description. Useful when a long task is truncated in a narrow
+  kanban column, but renders for every task so the behavior is
+  consistent. Position flips to avoid the viewport edge; hides
+  during refresh ticks so it never orphans.
+
+### Changed
+
+- Tasks block on dormant cards stays fully visible (previously
+  collapsed to just the `(done/total)` fraction). User feedback was
+  that paused sessions still have unfinished work worth seeing.
+- Cards stop visually jumping on the 5-second refresh tick when
+  nothing changed in their data — identical-payload dedupe + per-
+  card content diff replaces the wholesale `#app.innerHTML` rebuild
+  with targeted innerHTML swaps that preserve cardEl DOM identity
+  (and hover state).
+
+### Fixed
+
+- Edit Enter now reliably commits across IME-style keyboards. The
+  keydown handler detects Enter via `key` / `keyCode` / `which`, plus
+  a `keyup` fallback for layouts that only emit Enter on keyup. A
+  `committed` flag prevents the two-event path from double-firing.
+- Restored the `×` delete affordance and `✓/✗` suggestion controls
+  that were accidentally dropped from the task-row render during
+  the edit-feature refactor.
+- Empty kanban cards now render a quiet `+ add task` affordance so
+  users can create the first task without needing to discover an
+  expand target that doesn't exist yet. Collapsed kanban cards that
+  already have tasks also gain a small `+ add task` link below the
+  preview rows so adding a second/third task is one click away.
+
+### Notes
+
+- Schema additions: `position` (int) and `updatedAt` (epoch) — both
+  optional. The on-disk file from 0.5.0 loads without changes and
+  the new fields are populated only on the first edit/reorder of
+  each task.
+- `tests/test_tasks_module.py` grew from 8 to 10 cases;
+  `tests/test_bridge_dispatch.py` from 10 to 12 — all green. Run
+  with `~/.claude-sessions-status-venv/bin/python3 tests/test_*.py`.
+
 ## 0.5.0 — 2026-06-04
 
 The popover gains **per-session tasks** — a user-owned checklist per
