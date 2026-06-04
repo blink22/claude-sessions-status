@@ -4,6 +4,83 @@ All notable changes to this project are documented here. Format roughly
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.0 — 2026-06-04
+
+The popover gains **per-session tasks** — a user-owned checklist per
+Claude Code session, surfaced inline on each card. The juggler use case:
+when you click into a session that's been dormant for an hour, you
+immediately see what *you* asked it to do and what's left, instead of
+having to scroll the transcript to remember. Tasks are user-authored
+(not derived from the model's `TodoWrite`), persist across turns, and
+travel with the session.
+
+### Added
+
+- **User-curated tasks per session.** Click `+ add task` on any card,
+  type a task, hit Enter — it persists, survives badge restarts, and
+  reappears whenever you open the popover. Click the glyph (`○`/`●`)
+  to flip open/done; hover and click `×` to delete.
+- **Inline kanban expansion.** In kanban mode, clicking the
+  `tasks (n/m)` label expands the card in place to show the full task
+  list + an input row. Click again (or click anywhere outside the
+  tasks area) to collapse. Sibling cards in the column reflow down.
+- **Always-on input in list mode.** The list view is 360px wide —
+  plenty of room — so every card shows the full task list and the
+  `+ add task` input by default. No click-to-expand needed.
+- **Discoverable add-task affordance on populated kanban cards.** A
+  small `+ add task` link sits below the preview rows on collapsed
+  cards that already have tasks, so adding a second/third task
+  doesn't require discovering the expand-the-label flow.
+- **Tasks visible on dormant cards.** Dormant sessions no longer
+  collapse their tasks to just a `(8/30)` fraction — the full row
+  preview shows just like active cards, since paused work still has
+  a to-do list worth seeing.
+- **Persistence sidecar.** New file at
+  `~/.claude-sessions-status-tasks.json`, atomic-replace writes, in-
+  memory mtime cache, automatic recovery from corruption (backed up
+  to `.corrupt-<ms-timestamp>`), automatic sweep of orphaned `.tmp`
+  files left by a SIGKILL mid-write.
+- **Schema-versioned forward-compat fields.** Each task carries a
+  `source` (`user`/`suggested`) and `approved` flag. v0.5 only ever
+  emits user-authored tasks; a future release will add an opt-in AI
+  suggestion layer that uses the same shape without a migration.
+- **Approve / reject UI** for AI-suggested tasks already wired in
+  (dashed-glyph rendering, ✓/✗ controls). The Haiku sweeper that
+  populates suggestions ships in a follow-up release — the
+  interaction surface is ready when it lands.
+- **`tests/` directory.** Two pure-Python regression suites:
+  `test_tasks_module.py` (8 tests — CRUD, validation, unicode,
+  10-thread concurrency, atomic writes, render order, corruption
+  recovery) and `test_bridge_dispatch.py` (10 tests — every
+  WKScriptMessageHandler action with synthetic JS payloads,
+  malformed-input rejection, NSString-like duck types). Run with
+  `~/.claude-sessions-status-venv/bin/python3 tests/test_*.py`.
+
+### Changed — performance
+
+- **Cards no longer jump on refresh ticks.** Two layered render
+  optimizations: identical-payload dedupe skips no-op refreshes
+  entirely; same-shape refreshes update only changed cards' inner
+  HTML (cardEl divs stay in place, hover state preserved). The
+  whole popover only repaints when sessions actually move buckets
+  or appear/disappear.
+- **Hot-reload extended.** Editing `scripts/kanban.html` already
+  triggered a reload; that path now coexists cleanly with the new
+  per-card render path.
+
+### Notes
+
+- **Backward compatibility:** existing user data in
+  `~/.claude-sessions-status-*` files (seen state, badge position,
+  density, mode preference, etc.) is unchanged. The new tasks file
+  is additive — if it doesn't exist, the badge creates it on first
+  task creation. No migration required from 0.4.0.
+- **Data treated as production:** writes go through `_atomic_write_json`
+  with tempfile + `os.replace`, single in-process lock, and corrupt
+  files are quarantined rather than discarded.
+- **No new runtime dependencies.** Same `pyobjc-framework-WebKit`
+  introduced in 0.4.0.
+
 ## 0.4.0 — 2026-06-03
 
 The popover gets a from-scratch redesign. Kanban and list views both
