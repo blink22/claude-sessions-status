@@ -413,6 +413,35 @@
   .card .task-row.suggested .tglyph { color: var(--text-3); }
   .card .task-row.suggested .ttext  { color: var(--text-2); font-style: italic; }
 
+  /* Floating tooltip shown on hover over truncated task text.
+   * Single element appended to body, positioned in fixed coords near
+   * the cursor by JS. pointer-events: none so it never intercepts
+   * the next hover. Styled to match the popover's Linear dark
+   * theme — slight lift via shadow, hairline border, dark bg. */
+  .task-tooltip {
+    position: fixed;
+    background: var(--bg-popover);
+    border: 1px solid var(--hairline-strong);
+    border-radius: 4px;
+    padding: 6px 9px;
+    font-family: var(--sans);
+    font-size: 11.5px;
+    line-height: 1.4;
+    color: var(--text-1);
+    max-width: 340px;
+    z-index: 9999;
+    pointer-events: none;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.45);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    /* Hidden until JS sets display:block + position. */
+    display: none;
+    /* Soft fade-in once visible. */
+    opacity: 0;
+    transition: opacity 80ms ease;
+  }
+  .task-tooltip.visible { opacity: 1; }
+
   /* Editable task text — hover hint that the row is clickable for
    * editing. Subtle: just a barely-perceptible underline so the
    * static look isn't noisy. */
@@ -973,9 +1002,13 @@
       ? '<input class="ttext-edit" type="text"'
         + ' data-action="task-edit-input" data-task-id="' + tid + '"'
         + ' value="' + esc(draftValue !== null ? draftValue : (t.content || '')) + '" />'
+      // No native `title` attribute — the browser's default tooltip
+      // would either say "Click to edit" (misleading) or duplicate
+      // the visible content. The custom hover tooltip handler in
+      // wireCardClicks shows the full task description for
+      // truncated rows; nothing else needs a tooltip.
       : '<span class="ttext' + (isEditable ? ' editable' : '') + '"'
         + (isEditable ? ' data-action="task-edit-begin" data-task-id="' + tid + '"' : '')
-        + (isEditable ? ' title="Click to edit"' : '')
         + '>' + esc(t.content || '') + '</span>';
 
     // Trailing controls: suggestions get ✓/✗; user tasks get ×.
@@ -989,6 +1022,7 @@
     return '<div class="task-row ' + cls + (inEdit ? ' editing' : '') + '" data-task-id="' + tid + '">'
       + '<span class="tglyph" data-action="task-toggle" data-task-id="' + tid + '">' + glyph + '</span>'
       + textEl
+      + tail
       + '</div>';
   }
 
@@ -1057,6 +1091,12 @@
     try { payloadJson = JSON.stringify(data); } catch (_) {}
     if (payloadJson !== null && payloadJson === _lastPayloadJson) return;
     _lastPayloadJson = payloadJson;
+
+    // Hide any visible hover tooltip + cancel pending show-timer.
+    // If we don't, an in-flight refresh that replaces the .ttext
+    // element under the cursor leaves the tooltip orphaned in the
+    // body — the mouseleave on the detached element never fires.
+    _hideTaskTooltip();
 
     // Apply the mode class to the body so all our mode-{kanban,list}
     // CSS rules can target the right layout. Defaults to kanban when
@@ -1222,6 +1262,56 @@
   // attached at most once per cardEl lifetime, and the inner per-element
   // listeners are always against freshly-replaced children so there's
   // no duplication risk.
+  // ---- Tooltip for truncated task text ----
+  // A single floating div appended to <body>. Shown on hover over a
+  // .ttext element whose contents overflow horizontally (i.e. the
+  // text is clipped with `…`). Position is computed once at hover
+  // entry — we don't follow the cursor, since chasing the mouse is
+  // distracting. Falls within the viewport via a simple flip-axis
+  // check when the default below-right placement would clip.
+  let _taskTooltipEl = null;
+  let _taskTooltipTimer = null;
+  function _getTaskTooltip() {
+    if (!_taskTooltipEl) {
+      _taskTooltipEl = document.createElement('div');
+      _taskTooltipEl.className = 'task-tooltip';
+      document.body.appendChild(_taskTooltipEl);
+    }
+    return _taskTooltipEl;
+  }
+  function _showTaskTooltip(text, cursorX, cursorY) {
+    const tt = _getTaskTooltip();
+    tt.textContent = text;
+    tt.style.display = 'block';
+    tt.style.left = '0px';
+    tt.style.top = '0px';
+    // Measure now that text + width are in the DOM.
+    const offsetX = 12, offsetY = 14;
+    let left = cursorX + offsetX;
+    let top = cursorY + offsetY;
+    const rect = tt.getBoundingClientRect();
+    // Flip horizontally if the tooltip would clip the right edge.
+    if (left + rect.width > window.innerWidth - 4) {
+      left = Math.max(4, cursorX - rect.width - offsetX);
+    }
+    // Flip vertically if it would clip the bottom edge.
+    if (top + rect.height > window.innerHeight - 4) {
+      top = Math.max(4, cursorY - rect.height - offsetY);
+    }
+    tt.style.left = left + 'px';
+    tt.style.top = top + 'px';
+    // Trigger the fade-in via class toggle (display:block already
+    // applied above; opacity transitions from 0 → 1).
+    requestAnimationFrame(function() { tt.classList.add('visible'); });
+  }
+  function _hideTaskTooltip() {
+    if (_taskTooltipTimer) { clearTimeout(_taskTooltipTimer); _taskTooltipTimer = null; }
+    if (_taskTooltipEl) {
+      _taskTooltipEl.classList.remove('visible');
+      _taskTooltipEl.style.display = 'none';
+    }
+  }
+
   function wireCardClicks(cardEl) {
     if (!cardEl) return;
 
@@ -1285,26 +1375,37 @@
     // to render an <input> via rerenderOneCard; the input gets focus
     // + caret-at-end on the new render. Only user-authored rows
     // expose this affordance (suggestions get the ✓/✗ controls).
+    //
+    // Focus is deferred via requestAnimationFrame so WebKit's
+    // post-click focus resolution (which decides keyboard focus
+    // based on the original click target) doesn't race against our
+    // programmatic .focus() on a freshly-rendered element. Without
+    // this defer, keystrokes can land outside the input even though
+    // the input has DOM focus.
     cardEl.querySelectorAll('[data-action="task-edit-begin"]').forEach(function(el) {
       el.addEventListener('click', function(ev) {
         ev.stopPropagation();
         const tid = el.dataset.taskId;
         if (!tid) return;
-        // Seed the editing-state Map with the current content so the
-        // input renders pre-filled. The Map's mere presence signals
-        // edit mode to taskRowHtml.
         const row = lastRows.get(cardEl.dataset.session || '');
         const t = row && (row.tasks || []).find(function(x) { return x.id === tid; });
         editingTasks.set(tid, (t && t.content) || '');
         rerenderOneCard(cardEl);
-        // Move focus to the newly-rendered input.
-        const inp = cardEl.querySelector(
-          'input[data-action="task-edit-input"][data-task-id="' + tid + '"]'
-        );
-        if (inp) {
+        // Defer focus to the next frame so WebKit's click-handling
+        // doesn't immediately re-claim focus elsewhere.
+        const focusInput = function() {
+          const inp = cardEl.querySelector(
+            'input[data-action="task-edit-input"][data-task-id="' + tid + '"]'
+          );
+          if (!inp) return;
           inp.focus();
           const len = (inp.value || '').length;
           try { inp.setSelectionRange(len, len); } catch (e) { /* ok */ }
+        };
+        if (typeof requestAnimationFrame === 'function') {
+          requestAnimationFrame(focusInput);
+        } else {
+          setTimeout(focusInput, 0);
         }
       });
     });
@@ -1319,12 +1420,19 @@
       const row = lastRows.get(cardEl.dataset.session || '');
       const original = (row && (row.tasks || []).find(function(x) { return x.id === tid; }) || {}).content || '';
 
-      const commit = function() {
+      // Local flag so the keyup-Enter fallback doesn't fire a second
+      // taskEdit after the keydown-Enter already committed. Without
+      // this guard, the input persists until the Python refresh
+      // round-trips back, and during that window both keydown AND
+      // keyup fire on the same Enter press → two taskEdit messages
+      // with identical content → duplicate stderr lines + redundant
+      // refresh. Idempotent for content but noisy.
+      let committed = false;
+      const commit = function(why) {
+        if (committed) return;
+        committed = true;
         const text = (inp.value || '').trim();
         if (!text) {
-          // Empty content — refuse the edit and revert to view. We
-          // could treat empty-on-Enter as a delete, but that's a
-          // bigger destructive action and deserves the explicit ×.
           editingTasks.delete(tid);
           rerenderOneCard(cardEl);
           return;
@@ -1339,33 +1447,69 @@
           sessionId: cardEl.dataset.session || '',
           taskId: tid,
           content: text,
+          // Helps trace in /tmp/floating.log when diagnosing
+          // "Enter doesn't save" — we'll see whether the commit
+          // fired from Enter or blur or whatever.
+          source: why || 'unknown',
         });
-        // Clear local edit state; the refresh from Python will
-        // render the new content. Don't rerender locally — that
-        // would briefly flash the old content before the refresh
-        // lands and override.
         editingTasks.delete(tid);
       };
 
-      // Track draft so a refresh mid-edit can restore the in-flight
-      // value rather than dropping the user's typing.
       inp.addEventListener('input', function() {
         editingTasks.set(tid, inp.value);
       });
+      // Keydown: detect Enter via multiple identifiers so an IME or
+      // a quirky layout doesn't silently swallow the commit. Some
+      // bridges report key='Process' or keyCode=229 during IME
+      // composition, and a later 'keyup' carries the real Enter —
+      // so we also bind keyup for the Enter fallback path.
+      const isEnter = function(ev) {
+        return ev.key === 'Enter' || ev.keyCode === 13 || ev.which === 13;
+      };
+      const isEscape = function(ev) {
+        return ev.key === 'Escape' || ev.keyCode === 27 || ev.which === 27;
+      };
       inp.addEventListener('keydown', function(ev) {
         ev.stopPropagation();
-        if (ev.key === 'Enter') {
+        if (isEnter(ev)) {
           ev.preventDefault();
-          commit();
-        } else if (ev.key === 'Escape') {
+          commit('enter-keydown');
+        } else if (isEscape(ev)) {
           ev.preventDefault();
           editingTasks.delete(tid);
           rerenderOneCard(cardEl);
         }
       });
-      inp.addEventListener('blur', commit);
-      // Don't let the inner click bubble up to the card-resume handler.
+      // Defensive fallback: some keyboards / IME setups fire Enter
+      // only as keyup. If we already committed via keydown, the
+      // input is destroyed by the next refresh and this handler
+      // is harmless.
+      inp.addEventListener('keyup', function(ev) {
+        if (isEnter(ev) && document.body.contains(inp)) {
+          ev.preventDefault();
+          commit('enter-keyup');
+        }
+      });
+      inp.addEventListener('blur', function() { commit('blur'); });
       inp.addEventListener('click', function(ev) { ev.stopPropagation(); });
+    });
+
+    // Hover on task text → show the full content in a floating
+    // tooltip near the cursor. Shown for ALL task rows on hover
+    // (not gated on truncation) so the behavior is consistent
+    // regardless of column width or wrap state. 220ms delay keeps
+    // it from popping up on accidental mouseovers.
+    cardEl.querySelectorAll('.task-row .ttext').forEach(function(ttextEl) {
+      ttextEl.addEventListener('mouseenter', function(ev) {
+        const text = ttextEl.textContent || '';
+        if (!text) return;
+        const x = ev.clientX, y = ev.clientY;
+        if (_taskTooltipTimer) clearTimeout(_taskTooltipTimer);
+        _taskTooltipTimer = setTimeout(function() {
+          _showTaskTooltip(text, x, y);
+        }, 220);
+      });
+      ttextEl.addEventListener('mouseleave', _hideTaskTooltip);
     });
 
     // Hover × → delete user-authored task.
@@ -1446,6 +1590,11 @@
     const sid = cardEl.dataset.session || '';
     const row = lastRows.get(sid);
     if (!row) return;
+    // Hide any hover tooltip + cancel pending timer before we
+    // detach the .ttext under the user's cursor. Without this, a
+    // tooltip that was about to show (or already showing) becomes
+    // orphaned chrome — mouseleave never fires on a detached node.
+    _hideTaskTooltip();
     // Reflect expansion in the class so .expanded CSS rules apply.
     const wasExpanded = expandedCards.has(sid);
     if (wasExpanded) cardEl.classList.add('expanded');

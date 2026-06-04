@@ -2227,14 +2227,31 @@ class PopoverVC(NSViewController):
             # tasks.update_task enforces that rule.
             tid = pstr("taskId")
             content = pstr("content")
+            # Trace every attempt so we can diagnose Enter-doesn't-save
+            # complaints by tailing /tmp/floating.log. The `source`
+            # field comes from the JS commit() and tells us whether
+            # the event fired from enter-keydown / enter-keyup / blur.
+            # Truncate the content preview so a 280-char task doesn't
+            # flood the log.
+            sys.stderr.write(
+                f"[tasks] edit recv sid={sid[:8] if sid else '<empty>'} "
+                f"tid={tid!r} source={pstr('source')!r} "
+                f"content_len={len(content)} "
+                f"preview={content[:60]!r}\n"
+            )
             if not sid or not tid or not content:
+                sys.stderr.write(
+                    f"[tasks] edit dropped — sid={bool(sid)} "
+                    f"tid={bool(tid)} content={bool(content)}\n"
+                )
                 return
             if tasks_module.update_task(sid, tid, content) is None:
                 sys.stderr.write(
-                    f"[tasks] edit rejected sid={sid[:8]} tid={tid} "
-                    f"content_len={len(content)}\n"
+                    f"[tasks] edit rejected by update_task — "
+                    f"sid={sid[:8]} tid={tid} content_len={len(content)}\n"
                 )
                 return
+            sys.stderr.write(f"[tasks] edit applied sid={sid[:8]} tid={tid}\n")
             self.refresh()
         elif action == "taskDelete":
             # Hover-revealed × on a user-authored task row.
