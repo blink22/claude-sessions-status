@@ -231,6 +231,12 @@
   .drawer-task.open.pink   .glyph { color: #d989b8; }
   .drawer-task.done .glyph,
   .drawer-task.done .text { color: var(--text-4); }
+  /* User-authored rows get a clickable glyph that toggles open/done
+   * (mirrors the per-card .tglyph). Pointer + hover lift make the
+   * affordance discoverable; suggestions omit the class and stay
+   * read-only until approved. */
+  .drawer-task .glyph.clickable { cursor: pointer; }
+  .drawer-task .glyph.clickable:hover { color: var(--text-1); }
   .drawer-task .text {
     color: var(--text-1);
     overflow: hidden;
@@ -1951,10 +1957,11 @@
         const tid = esc(t.id || '');
         // Reorder + delete eligibility — mirrors the per-card rules:
         // only OPEN, USER-AUTHORED tasks (or APPROVED suggestions)
-        // get these affordances. Done tasks are immutable from the
-        // drawer (toggle them back to open via the per-card glyph
-        // if you want to re-edit), and unapproved suggestions still
-        // need the ✓/✗ flow before they become reorderable.
+        // get the reorder/delete affordances. Done tasks can't be
+        // reordered (sort-locked by completedAt) but their glyph IS
+        // clickable to flip back to open — see the clickable-glyph
+        // branch below and the drawer-task-toggle handler. Unapproved
+        // suggestions still need the ✓/✗ flow before any mutation.
         const isUserTask = t.source !== 'suggested' || t.approved;
         const isReorderable = isUserTask && t.status === 'open';
         const isDeletable = isUserTask;
@@ -1987,7 +1994,11 @@
             + (isReorderable ? ' draggable="true"' : '')
             + '>'
           + '<div class="row">'
-          +   '<span class="glyph"'
+          +   '<span class="glyph' + (isUserTask ? ' clickable' : '') + '"'
+          +     (isUserTask
+                  ? ' data-action="drawer-task-toggle" data-task-id="' + tid + '"'
+                    + ' title="Mark ' + (t.status === 'done' ? 'open' : 'done') + '"'
+                  : '')
           +     (isReorderable ? ' draggable="false"' : '')
           +   '>' + glyph + '</span>'
           +   '<span class="text">' + text + '</span>'
@@ -2138,6 +2149,27 @@
         if (drawerDoneRevealed.has(cwd)) drawerDoneRevealed.delete(cwd);
         else drawerDoneRevealed.add(cwd);
         renderDrawer(_drawerData);
+      });
+    });
+
+    // Task glyph (○/●) → flip open ↔ done, mirroring the per-card
+    // glyph. Routes through the same `taskToggle` bridge action the
+    // card view uses, so attached and unattached tasks both work
+    // (unattached rows carry their pseudo-session id in
+    // data-session-id, which toggle_task accepts). The resume-click
+    // handler above short-circuits on [data-action] elements, so
+    // toggling never also opens the host session. Only user-authored
+    // rows expose this — suggestions stay immutable until approved,
+    // the same rule the delete/start controls already follow.
+    root.querySelectorAll('[data-action="drawer-task-toggle"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const taskEl = el.closest('.drawer-task');
+        if (!taskEl) return;
+        const sid = taskEl.dataset.sessionId || '';
+        const tid = taskEl.dataset.taskId || '';
+        if (!sid || !tid) return;
+        send('taskToggle', { sessionId: sid, taskId: tid });
       });
     });
 
