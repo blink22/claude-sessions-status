@@ -991,10 +991,22 @@ def is_dormant(
           that long AND has no live CLI process do we declare it
           dormant.
 
-    NEEDS YOU and WORKING are kept visible up to DORMANT_AFTER_SECS
-    because they're inherently demanding attention."""
+    NEEDS YOU is kept visible up to DORMANT_AFTER_SECS because it's
+    inherently demanding attention: a session paused on a question
+    (AskUserQuestion / ExitPlanMode) goes quiet *by design* while it
+    waits for the user, so neither the grace window (c) nor the
+    finished-stale rule (b) should retire it early. Only the absolute
+    ceiling (a) applies. This matters most for Claude Desktop GUI
+    sessions, which never write pid files and so are never in ``live``;
+    without this exemption every GUI session waiting on a question would
+    fall out of NEEDS YOU after RECENT_ACTIVITY_GRACE_SECS and vanish
+    from 'needs attention' exactly when the user still owes it a reply."""
     if ago_seconds > DORMANT_AFTER_SECS:
         return True
+    # A session demanding the user's attention never goes dormant early —
+    # its quiet is the user not having answered yet, not abandonment.
+    if bucket == BUCKET_NEEDS:
+        return False
     if bucket == BUCKET_READY and ago_seconds > STALE_FINISHED_SECS:
         return True
     if (
