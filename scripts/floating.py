@@ -164,11 +164,33 @@ REFRESH_SECS = max(1.0, float(os.environ.get("CLAUDE_SESSIONS_REFRESH", "5")))
 # Persists across launches so the badge remembers the user's preference.
 POPOVER_MODE_FILE = HOME / ".claude-sessions-status-popover-mode"
 POPOVER_LIST_SIZE = (360.0, 480.0)
-POPOVER_KANBAN_SIZE = (720.0, 480.0)
+# Kanban mode includes the 200px slim sidebar (Idea 2.α from the
+# canonical mockup) as fixed chrome on the left, so each kanban
+# size grows by 200px relative to the pre-sidebar baseline. List
+# mode is too narrow to host the sidebar — CSS hides it there.
+POPOVER_KANBAN_SIZE = (920.0, 480.0)
 # When the user toggles "Show older" in kanban mode, the dormant
 # sessions render as a 4th column on the right. The popover widens
 # to give that column room without squeezing the other three.
-POPOVER_KANBAN_WITH_DORMANT_SIZE = (940.0, 480.0)
+POPOVER_KANBAN_WITH_DORMANT_SIZE = (1140.0, 480.0)
+# Opening the right-side tasks drawer adds another 280-px track to
+# the body grid. The popover grows by that amount instead of
+# shrinking the kanban — same UX pattern as "Show older" — so the
+# kanban + sidebar widths stay constant whether the drawer is open
+# or closed. Drawer-open composes with show_dormant: both add
+# their own 280 / 220 px when active.
+DRAWER_WIDTH_PX = 280.0
+POPOVER_KANBAN_WITH_DRAWER_SIZE = (
+    POPOVER_KANBAN_SIZE[0] + DRAWER_WIDTH_PX, POPOVER_KANBAN_SIZE[1])
+POPOVER_KANBAN_WITH_DORMANT_AND_DRAWER_SIZE = (
+    POPOVER_KANBAN_WITH_DORMANT_SIZE[0] + DRAWER_WIDTH_PX,
+    POPOVER_KANBAN_WITH_DORMANT_SIZE[1])
+# Persist drawer-open state Python-side (mirrors the popover-mode
+# file pattern) so the popover opens at the correct size on the
+# very first render. Without this, the popover would briefly flash
+# at the closed size before JS read localStorage and asked Python
+# to grow it — visible jank on every open.
+DRAWER_OPEN_FILE = HOME / ".claude-sessions-status-drawer-open"
 
 
 def _read_popover_mode() -> str:
@@ -185,6 +207,20 @@ def _write_popover_mode(mode: str) -> None:
     if mode not in ("list", "kanban"):
         return
     _atomic_write_text(POPOVER_MODE_FILE, mode)
+
+
+def _read_drawer_open() -> bool:
+    """Read persisted drawer-open flag. Defaults to False (closed) on
+    missing / malformed file so first-time users see a clean popover
+    without the right-side panel."""
+    try:
+        return DRAWER_OPEN_FILE.read_text(encoding="utf-8").strip() == "1"
+    except OSError:
+        return False
+
+
+def _write_drawer_open(open_: bool) -> None:
+    _atomic_write_text(DRAWER_OPEN_FILE, "1" if open_ else "0")
 
 
 # ---------- Dormant visibility (popover-only toggle) ----------
@@ -763,6 +799,16 @@ def _get_buckets() -> dict[str, list[dict]]:
         # override in dashboard.py:_prepare_row.
         if sub_sum.get("running"):
             bucket = "working"
+            state = "Working…"
+        # When the parent's most recent assistant turn dispatched a Task
+        # (sub-agent), align the displayed state with the WORKING bucket
+        # that `classify` already chose. Without this, the card shows
+        # "Waiting on you" (the state_for output for any assistant entry
+        # ending in text) under the WORKING column — visually confusing.
+        # Triggers even when `sub_sum.running == 0`, which happens during
+        # long quiet stretches inside a sub-agent (no jsonl write for
+        # >60s) — the parent is still genuinely waiting on its child.
+        elif phase_label == "Awaiting sub-agent" and bucket == "working":
             state = "Working…"
         row = {
             "s": s,
@@ -1532,10 +1578,22 @@ class PopoverVC(NSViewController):
     popover_ref = objc.ivar("popover_ref")    # NSPopover, set by BadgeController
     last_rendered_rows = objc.ivar("last_rendered_rows")  # for mark-all-read
     show_dormant = objc.ivar("show_dormant")   # bool — toggle to hide dormant
-    dormant_btn = objc.ivar("dormant_btn")     # the NSButton checkbox
+    dormant_btn = objc.ivar("dormant_btn")     # the "Show older" recessed pill
     density = objc.ivar("density")             # "glance" | "focus" | "detail"
-    density_seg = objc.ivar("density_seg")     # NSSegmentedControl
+    density_seg = objc.ivar("density_seg")     # legacy — kept for compat, unused
     mark_all_btn = objc.ivar("mark_all_btn")
+    # Center mode-switch pills (replaced the NSSegmentedControl). Two
+    # push-on-push-off NSButtons with mutex behavior implemented in
+    # modeButtonClicked:. self.segmented is kept as None for any old
+    # callers that look for it.
+    mode_list_btn = objc.ivar("mode_list_btn")
+    mode_kanban_btn = objc.ivar("mode_kanban_btn")
+    # Drawer-related state. drawer_open mirrors ~/.claude-sessions-
+    # status-drawer-open + the body.drawer-open class in JS; tasks_btn
+    # is the native top-bar toggle (recessed-pill NSButton) that
+    # replaces the floating HTML #drawer-toggle.
+    drawer_open = objc.ivar("drawer_open")
+    tasks_btn = objc.ivar("tasks_btn")
 
     @objc.python_method
     def set_popover(self, popover):
@@ -1555,16 +1613,20 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _load_view_safely(self):
-        # Restore last-used mode + density + show_dormant.
+        # Restore last-used mode + density + show_dormant + drawer_open.
         self.mode = _read_popover_mode()
         self.density = _read_density()
         self.show_dormant = _read_show_dormant()
-        # The dormant column adds a 4th lane in kanban → wider popover.
-        size = (
-            POPOVER_KANBAN_WITH_DORMANT_SIZE
-            if (self.mode == "kanban" and self.show_dormant)
-            else (POPOVER_KANBAN_SIZE if self.mode == "kanban" else POPOVER_LIST_SIZE)
-        )
+        # Persisted drawer-open flag (~/.claude-sessions-status-drawer-
+        # open). Drawer-open grows the popover by DRAWER_WIDTH_PX so
+        # the kanban + sidebar widths stay constant; reading it here
+        # before the initial sizing avoids a visible "snap wider" on
+        # the first render when the user had the drawer open.
+        self.drawer_open = _read_drawer_open()
+        # Initial popover size — accounts for mode + show_dormant +
+        # drawer_open in one shot via the same helper used everywhere
+        # else (single source of truth).
+        size = self._target_popover_size()
         w, h = size
 
         container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
@@ -1579,88 +1641,139 @@ class PopoverVC(NSViewController):
                 NSColor.windowBackgroundColor().CGColor()
             )
 
-        # ---- Top bar: segmented control (List | Kanban) ----
-        # Width is tight enough that it fits in the 360pt list-mode
-        # popover without colliding with the density popup (left) or
-        # the dormant toggle (right).
+        # ---- Top bar: every control uses the same recessed-pill style ----
+        # The dark-popover toolbar (top 32-px strip) hosts FOUR control
+        # groups, all rendered as NSBezelStyleRecessed NSButtons so
+        # they read as one consistent design language:
+        #   • Center: List / Kanban  — mutex pair (push-on-push-off,
+        #     two pills with mutually-exclusive selection)
+        #   • Right:  Tasks · N      — push-on-push-off toggle
+        #             Show older     — push-on-push-off toggle
+        #   • Right(L): Mark all N read — momentary push (briefly
+        #     flashes, no sticky state)
+        # The previous Glance/Focus/Detail density popup at the top-left
+        # was removed entirely in this pass — the user can no longer
+        # change density from the UI, but the persisted value still
+        # drives rendering.
         TOP_BAR_HEIGHT = 32.0
+        NS_BUTTON_TYPE_MOMENTARY_LIGHT = 0
+        NS_BUTTON_TYPE_PUSH_ON_PUSH_OFF = 1
+        NS_BEZEL_STYLE_RECESSED = 13
+        TOGGLE_GAP_PX = 6.0
+        toggle_font = NSFont.systemFontOfSize_(11.0)
+
+        def _make_toolbar_toggle(title, initial_on, action_sel,
+                                 button_type=NS_BUTTON_TYPE_PUSH_ON_PUSH_OFF):
+            # _FirstMouseButton overrides acceptsFirstMouse: so the
+            # very first click after the popover opens fires the
+            # action — without this, NSPopover eats the first click
+            # because its window isn't yet key.
+            btn = _FirstMouseButton.alloc().init()
+            btn.setButtonType_(button_type)
+            btn.setBezelStyle_(NS_BEZEL_STYLE_RECESSED)
+            btn.setFont_(toggle_font)
+            btn.setTitle_(title)
+            btn.setState_(1 if initial_on else 0)
+            btn.setTarget_(self)
+            btn.setAction_(action_sel)
+            # Recessed-style buttons need an explicit content tint to
+            # look right on the dark popover; otherwise the "off" state
+            # text reads almost invisibly. labelColor adapts to system
+            # appearance so this stays correct in both light/dark.
+            if hasattr(btn, "setContentTintColor_"):
+                btn.setContentTintColor_(NSColor.labelColor())
+            btn.sizeToFit()
+            return btn
+
+        # List | Kanban — mode picker. NSSegmentedControl is the
+        # macOS-native one-of-N control; using it (rather than two
+        # standalone pills) communicates the radio semantics visually
+        # and keeps state mutex correct without any JS scaffolding.
+        # NSSegmentStyleSeparated (= 8) renders each segment as a
+        # discrete recessed pill — visually consistent with the
+        # other recessed-bezel buttons on the right edge.
+        NS_SEGMENT_STYLE_SEPARATED = 8
         seg = NSSegmentedControl.alloc().init()
         seg.setSegmentCount_(2)
         seg.setLabel_forSegment_("List", 0)
         seg.setLabel_forSegment_("Kanban", 1)
-        seg.setSegmentStyle_(NSSegmentStyleAutomatic)
+        seg.setSegmentStyle_(NS_SEGMENT_STYLE_SEPARATED)
         seg.setTrackingMode_(NSSegmentSwitchTrackingSelectOne)
         seg.setSelectedSegment_(0 if self.mode == "list" else 1)
         seg.setTarget_(self)
         seg.setAction_("segmentChanged:")
-        # Center the segmented control horizontally in the top bar.
-        seg_w = 130.0
-        seg.setFrame_(NSMakeRect((w - seg_w) / 2, h - TOP_BAR_HEIGHT + 4, seg_w, 22))
-        seg.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin)
+        seg.setFont_(toggle_font)
+        # Width: let it size to its content, then center horizontally.
+        seg.sizeToFit()
+        sf = seg.frame()
+        seg.setFrame_(NSMakeRect(
+            (w - sf.size.width) / 2.0, h - TOP_BAR_HEIGHT + 4,
+            sf.size.width, sf.size.height,
+        ))
+        seg.setAutoresizingMask_(
+            NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin)
         container.addSubview_(seg)
         self.segmented = seg
+        # The two-pill mutex experiment (mode_list_btn / mode_kanban_btn)
+        # is retired — kept as None so any stale wiring no-ops safely.
+        self.mode_list_btn = None
+        self.mode_kanban_btn = None
 
-        # ---- Top bar (left): density popup (Glance / Focus / Detail) ----
-        # A compact NSPopUpButton instead of a segmented control. The
-        # segmented version was 180pt wide and overlapped the centered
-        # List/Kanban control in 360pt list mode. The popup is ~90pt
-        # and shows the current selection inline ("Focus ▾").
-        density_pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(12, h - TOP_BAR_HEIGHT + 4, 96, 22),
-            False,
-        )
-        density_pop.addItemsWithTitles_(["Glance", "Focus", "Detail"])
-        density_pop.selectItemAtIndex_(DENSITIES.index(self.density))
-        density_pop.setTarget_(self)
-        density_pop.setAction_("densityChanged:")
-        density_pop.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
-        container.addSubview_(density_pop)
-        self.density_seg = density_pop
-
-        # ---- Top bar (right): "Show dormant" checkbox toggle ----
-        # Lives in the right corner so it doesn't compete with the
-        # primary List/Kanban control. self.show_dormant is set in the
-        # _load_view_safely preamble so the initial popover size can
-        # depend on it; here we just build the UI for the toggle.
-        dormant_btn = NSButton.alloc().init()
-        dormant_btn.setButtonType_(3)        # NSButtonTypeSwitch (checkbox)
-        dormant_btn.setTitle_("Show older")
-        dormant_btn.setState_(1 if self.show_dormant else 0)
-        dormant_btn.setTarget_(self)
-        dormant_btn.setAction_("toggleDormant:")
-        dormant_btn.sizeToFit()
+        dormant_btn = _make_toolbar_toggle(
+            "Show older", self.show_dormant, "toggleDormant:")
+        # Right-anchor the dormant pill 12px from the popover edge.
         dbf = dormant_btn.frame()
         dormant_btn.setFrame_(NSMakeRect(
             w - dbf.size.width - 12,
-            h - TOP_BAR_HEIGHT + 6,
+            h - TOP_BAR_HEIGHT + 4,
             dbf.size.width, dbf.size.height,
         ))
-        # Stick to the right edge as the popover resizes.
         dormant_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
         container.addSubview_(dormant_btn)
         self.dormant_btn = dormant_btn
 
-        # ---- Top bar (right, kanban only): "Mark all N read" button ----
+        # Tasks pill — second toolbar toggle, sits to the LEFT of
+        # Show older with TOGGLE_GAP_PX of breathing room so the two
+        # read as a button group. Title gets a "· N" count suffix on
+        # each refresh (see _update_tasks_btn_count) when there are
+        # open tasks, so the user has a glanceable signal even when
+        # the drawer is closed.
+        tasks_btn = _make_toolbar_toggle(
+            "Tasks", self.drawer_open, "toggleTasksDrawer:")
+        tbf = tasks_btn.frame()
+        tasks_btn.setFrame_(NSMakeRect(
+            w - dbf.size.width - 12 - TOGGLE_GAP_PX - tbf.size.width,
+            h - TOP_BAR_HEIGHT + 4,
+            tbf.size.width, tbf.size.height,
+        ))
+        tasks_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+        # List mode has no drawer (popover is too narrow for it) so
+        # the Tasks pill stays hidden there. Visibility is also
+        # refreshed in _update_tasks_btn_count on every render.
+        tasks_btn.setHidden_(self.mode == "list")
+        container.addSubview_(tasks_btn)
+        self.tasks_btn = tasks_btn
+
+        # ---- Top bar (right, kanban only): "Mark all N read" pill ----
+        # Same recessed-bezel look as the other top-bar controls, but
+        # MOMENTARY (button-type 0) — clicking fires the action and
+        # the pill returns to its un-pressed state immediately, since
+        # mark-all-read isn't a toggle.
         # Hidden in list mode (which already has an inline footer link
         # inside the NSTextView) and when there are zero unreads. We
         # set the title + final frame on each refresh because the
         # number changes.
-        mark_btn = _FirstMouseButton.alloc().init()
-        mark_btn.setBordered_(False)
-        mark_btn.setFont_(NSFont.systemFontOfSize_(12))
-        mark_btn.setTarget_(self)
-        mark_btn.setAction_("markAllReadClicked:")
-        mark_btn.setTitle_("")
-        mark_btn.setHidden_(True)
-        mark_btn.setContentTintColor_(
-            NSColor.controlAccentColor()
-            if hasattr(NSColor, "controlAccentColor") else NSColor.labelColor()
+        mark_btn = _make_toolbar_toggle(
+            "", False, "markAllReadClicked:",
+            button_type=NS_BUTTON_TYPE_MOMENTARY_LIGHT,
         )
-        # Slot it to the LEFT of the dormant checkbox. Stays right-aligned
-        # as the popover resizes.
+        mark_btn.setHidden_(True)
+        # Initial frame is finalized in _update_mark_all_button on
+        # each refresh; the y/height numbers here just give it a
+        # valid frame before the first refresh runs.
         mark_btn.setFrame_(NSMakeRect(
-            w - dbf.size.width - 24,  # placeholder; finalized in refresh
-            h - TOP_BAR_HEIGHT + 6,
+            w - dbf.size.width - 24,
+            h - TOP_BAR_HEIGHT + 4,
             0, dbf.size.height,
         ))
         mark_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
@@ -1830,11 +1943,23 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _target_popover_size(self) -> tuple:
-        """Pick the right popover (w, h) for the current mode + toggle."""
+        """Pick the right popover (w, h) for the current mode + the two
+        compose-able expansion toggles (show_dormant adds a 4th column,
+        drawer_open adds a right-side panel). Both grow the popover
+        rather than shrinking the kanban so the cards' column widths
+        stay constant whichever toggles are on."""
         if self.mode != "kanban":
             return POPOVER_LIST_SIZE
+        # drawer_open is a defensive getattr so legacy code paths that
+        # construct PopoverVC without going through _load_view_safely
+        # still get a valid size (default: drawer closed).
+        drawer = bool(getattr(self, "drawer_open", False))
+        if self.show_dormant and drawer:
+            return POPOVER_KANBAN_WITH_DORMANT_AND_DRAWER_SIZE
         if self.show_dormant:
             return POPOVER_KANBAN_WITH_DORMANT_SIZE
+        if drawer:
+            return POPOVER_KANBAN_WITH_DRAWER_SIZE
         return POPOVER_KANBAN_SIZE
 
     @objc.python_method
@@ -1858,18 +1983,27 @@ class PopoverVC(NSViewController):
         btn.sizeToFit()
         bf = btn.frame()
         # Anchor to the right edge of the container, immediately left
-        # of the dormant checkbox.
+        # of the Tasks pill (which itself sits to the left of the
+        # Show Older pill). With three right-anchored elements, the
+        # mark-all link drifts further left so it doesn't collide.
         container = self.view()
         cw = container.frame().size.width if container is not None else 720
-        # Match the dormant button's top inset (h - TOP_BAR_HEIGHT + 6).
+        # Match the dormant pill's top inset (h - TOP_BAR_HEIGHT + 4 —
+        # recessed-bezel buttons are taller than the old checkbox so
+        # the +4 inset centers better in the 32-px top bar).
         TOP_BAR_HEIGHT = 32.0
         ch = container.frame().size.height if container is not None else 480
         dormant_w = (
             self.dormant_btn.frame().size.width
             if self.dormant_btn is not None else 90.0
         )
-        x = cw - dormant_w - 24 - bf.size.width
-        y = ch - TOP_BAR_HEIGHT + 6
+        tasks_w = (
+            self.tasks_btn.frame().size.width
+            if getattr(self, "tasks_btn", None) is not None else 70.0
+        )
+        # right edge - dormant - 6px gap - tasks - 12px gap - bf
+        x = cw - 12 - dormant_w - 6 - tasks_w - 12 - bf.size.width
+        y = ch - TOP_BAR_HEIGHT + 4
         btn.setFrame_(NSMakeRect(x, y, bf.size.width, bf.size.height))
         btn.setHidden_(False)
 
@@ -1884,20 +2018,33 @@ class PopoverVC(NSViewController):
             sys.stderr.write(f"[_apply_popover_size] {e!r}\n")
 
     def segmentChanged_(self, sender):
+        """Primary callback for the List | Kanban segmented control.
+        The separated-style NSSegmentedControl owns the radio
+        semantics — clicking a segment selects it and deselects the
+        other, all without any extra JS. We just translate the
+        selected index into a mode string and hand off to the
+        shared _switch_mode helper."""
         try:
             idx = sender.selectedSegment()
             new_mode = "kanban" if idx == 1 else "list"
-            if new_mode == self.mode:
-                return
-            self.mode = new_mode
-            _write_popover_mode(new_mode)
-            self._apply_popover_size()
-            self._install_layout()
-            self.refresh()
+            self._switch_mode(new_mode)
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[segmentChanged_] {e!r}\n")
-            import traceback
-            traceback.print_exc(file=sys.stderr)
+
+    # modeButtonClicked_ retired alongside the two-pill mutex
+    # experiment — NSSegmentedControl owns the radio behavior now.
+
+    @objc.python_method
+    def _switch_mode(self, new_mode: str) -> None:
+        if new_mode not in ("list", "kanban"):
+            return
+        if new_mode == self.mode:
+            return
+        self.mode = new_mode
+        _write_popover_mode(new_mode)
+        self._apply_popover_size()
+        self._install_layout()
+        self.refresh()
 
     def toggleDormant_(self, sender):
         """Flip whether dormant sessions are shown in the popover. In
@@ -1909,6 +2056,74 @@ class PopoverVC(NSViewController):
             self.refresh()
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[toggleDormant_] {e!r}\n")
+
+    def toggleTasksDrawer_(self, sender):
+        """Top-bar Tasks pill clicked. Delegates to the JS layer so
+        the existing flow (localStorage + body.drawer-open class +
+        bridge → drawerToggled action → popover resize) stays the
+        single source of truth. Python doesn't directly touch the
+        drawer state here — it gets called BACK via drawerToggled
+        almost immediately and updates self.drawer_open + the
+        button's own visual state there.
+
+        The button's own toggled state (sender.state()) is therefore
+        ephemeral until the JS round-trip completes; if anything
+        fails on the JS side, the drawerToggled handler will simply
+        not fire and the button reverts on the next refresh's
+        _update_tasks_btn_count call."""
+        try:
+            if self.kanban_web is not None:
+                self.kanban_web.evaluateJavaScript_completionHandler_(
+                    "window.toggleDrawer && window.toggleDrawer();", None
+                )
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[toggleTasksDrawer_] {e!r}\n")
+
+    @objc.python_method
+    def _update_tasks_btn_count(self, drawer_data) -> None:
+        """Refresh the Tasks pill's title to include the live count of
+        OPEN tasks across all visible sessions (e.g. "Tasks · 3").
+        Called from _render_popover after the drawer payload is built.
+        Falls back to a bare "Tasks" label when zero — keeps the pill
+        from showing a noisy "· 0" badge."""
+        btn = getattr(self, "tasks_btn", None)
+        if btn is None:
+            return
+        # Hide entirely in list mode — no drawer there. Show otherwise.
+        try:
+            btn.setHidden_(self.mode == "list")
+        except Exception:  # noqa: BLE001
+            pass
+        if self.mode == "list":
+            return
+        n = 0
+        if drawer_data:
+            for g in (drawer_data.get("groups") or []):
+                for t in (g.get("tasks") or []):
+                    if t.get("status") == "open":
+                        n += 1
+        new_title = "Tasks" if n == 0 else f"Tasks · {n}"
+        try:
+            if btn.title() != new_title:
+                btn.setTitle_(new_title)
+                btn.sizeToFit()
+                # Re-anchor right edge: sizeToFit may have changed width.
+                container = self.view()
+                if container is not None and self.dormant_btn is not None:
+                    cw = container.frame().size.width
+                    ch = container.frame().size.height
+                    dbf = self.dormant_btn.frame()
+                    tbf = btn.frame()
+                    btn.setFrame_(NSMakeRect(
+                        cw - dbf.size.width - 12 - 6.0 - tbf.size.width,
+                        ch - 32.0 + 4,
+                        tbf.size.width, tbf.size.height,
+                    ))
+                    # mark-all-button anchors off these widths too —
+                    # nudge it back into place after the resize.
+                    self._update_mark_all_button()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[_update_tasks_btn_count] {e!r}\n")
 
     def densityChanged_(self, sender):
         """Glance / Focus / Detail — orthogonal to list/kanban."""
@@ -2030,6 +2245,11 @@ class PopoverVC(NSViewController):
             "phase": row.get("phase_label") or "",
             "gist": row.get("gist") or "",
             "age": format_ago(row.get("ago_s") or 0),
+            # Raw seconds-ago — used by the sidebar's "Today" smart
+            # view (filter to ago < 24h) and any other client-side
+            # recency rules. Kept as a number so JS doesn't have to
+            # parse `format_ago`'s "5m" / "2h" string back into one.
+            "ago_s": float(row.get("ago_s") or 0),
             "bucket": row.get("bucket") or "dormant",
             "unread": bool(row.get("unread")),
             "subagents": subs_out,
@@ -2040,6 +2260,282 @@ class PopoverVC(NSViewController):
     def _render_kanban(self, buckets):
         """Back-compat alias for the unified popover renderer."""
         self._render_popover(buckets)
+
+    @objc.python_method
+    def _build_drawer_data(self, buckets: dict) -> dict:
+        """Build the right-side tasks-drawer payload — all open + done
+        tasks across every visible session, grouped by their cwd (the
+        cwd basename becomes the project name; a stable md5 hash picks
+        the project color). The drawer is the closest we get to a
+        cross-project task view without the full projects entity.
+
+        Shape:
+            {
+                "groups": [
+                    {
+                        "label": "Talk back plugin",
+                        "color": "purple",
+                        "cwd":   "/Users/.../Talk back plugin",
+                        "tasks": [
+                            {"id", "content", "status", "sessionId",
+                             "sessionTitle", "approved", "source"},
+                            ...
+                        ],
+                    },
+                    ...
+                ]
+            }
+
+        Tasks within a group are ordered by their session's bucket
+        (needs → working → ready → dormant) so the most-urgent work
+        floats to the top per project."""
+        groups: dict[str, dict] = {}
+        bucket_priority = {"needs": 0, "working": 1, "ready": 2, "dormant": 3}
+        # Two-pass scan:
+        # 1. Walk all buckets, register every session under its cwd
+        #    group (so the create / reattach pickers see ALL sessions
+        #    in a project, even sessions with zero tasks). Sessions
+        #    appearing here without tasks won't have any task rows
+        #    rendered — they're only present in the .sessions list
+        #    used by the pickers.
+        # 2. Tasks are appended in a second loop below — only groups
+        #    that contain at least one task survive.
+        for bkey in ("needs", "working", "ready", "dormant"):
+            for row in (buckets.get(bkey) or []):
+                meta = row.get("meta") or {}
+                cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) else ""
+                sid = (row.get("s") or {}).get("sessionId") or ""
+                if not sid:
+                    continue
+                session_title = (row.get("title") or "(untitled)").strip()
+                session_tasks = tasks_module.tasks_for_session(sid)
+                if not session_tasks:
+                    # Track the session for the picker but don't
+                    # surface a group from it alone — groups need
+                    # at least one task to be worth showing.
+                    if cwd in groups:
+                        if sid not in groups[cwd]["_session_ids"]:
+                            groups[cwd]["_session_ids"].add(sid)
+                            groups[cwd]["sessions"].append({
+                                "id": sid,
+                                "title": session_title,
+                                "bucket": bkey,
+                                "phase": row.get("phase_label") or "",
+                            })
+                    continue
+                if cwd not in groups:
+                    label, color = tasks_module.derive_project_label(cwd)
+                    groups[cwd] = {
+                        "label": label,
+                        "color": color,
+                        "cwd": cwd,
+                        "tasks": [],
+                        "sessions": [],   # for the create + reattach pickers
+                        "_min_bucket_priority": bucket_priority[bkey],
+                        "_session_ids": set(),
+                    }
+                else:
+                    # Keep the lowest (most urgent) bucket-priority
+                    # seen — drives cross-group ordering below.
+                    groups[cwd]["_min_bucket_priority"] = min(
+                        groups[cwd]["_min_bucket_priority"],
+                        bucket_priority[bkey],
+                    )
+                # Build a slim session entry per group so the drawer's
+                # create/reattach pickers can list them. Skip dupes —
+                # in practice a session appears in exactly one bucket.
+                if sid and sid not in groups[cwd]["_session_ids"]:
+                    groups[cwd]["_session_ids"].add(sid)
+                    groups[cwd]["sessions"].append({
+                        "id": sid,
+                        "title": session_title,
+                        "bucket": bkey,
+                        "phase": row.get("phase_label") or "",
+                    })
+                for t in session_tasks:
+                    groups[cwd]["tasks"].append({
+                        "id": t.get("id") or "",
+                        "content": t.get("content") or "",
+                        "status": t.get("status") or "open",
+                        "sessionId": sid,
+                        "sessionTitle": session_title,
+                        "approved": bool(t.get("approved", True)),
+                        "source": t.get("source") or "user",
+                    })
+        # Second pass: backfill any sessions that share a cwd with an
+        # existing group but were skipped on the first pass (e.g.,
+        # session has no tasks AND appeared before its sibling with
+        # tasks). Ensures the create + reattach pickers see every
+        # session in the project group.
+        for bkey in ("needs", "working", "ready", "dormant"):
+            for row in (buckets.get(bkey) or []):
+                meta = row.get("meta") or {}
+                cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) else ""
+                sid = (row.get("s") or {}).get("sessionId") or ""
+                if not sid or cwd not in groups:
+                    continue
+                if sid in groups[cwd]["_session_ids"]:
+                    continue
+                groups[cwd]["_session_ids"].add(sid)
+                groups[cwd]["sessions"].append({
+                    "id": sid,
+                    "title": (row.get("title") or "(untitled)").strip(),
+                    "bucket": bkey,
+                    "phase": row.get("phase_label") or "",
+                })
+
+        # Third pass: unattached tasks. These live under per-project
+        # pseudo-session ids (__unattached__:<cwd>) in tasks.json —
+        # they have no real Claude session yet. Surface them inside
+        # the same cwd's drawer group so the user sees them next to
+        # the attached ones. If the cwd has no group yet (rare —
+        # would mean an unattached task in a project with zero live
+        # sessions), bootstrap one so the task still renders.
+        try:
+            ts_state = tasks_module.load_state() or {}
+        except Exception:  # noqa: BLE001
+            ts_state = {}
+        ts_sessions = (ts_state.get("sessions") or {}) if isinstance(ts_state, dict) else {}
+        for pseudo_sid, entry in ts_sessions.items():
+            if not tasks_module.is_unattached_sid(pseudo_sid):
+                continue
+            if not isinstance(entry, dict):
+                continue
+            pseudo_tasks = entry.get("tasks") or []
+            # Skip empty pseudo-sessions — they'd add a phantom group
+            # with no rows.
+            if not any(
+                t for t in pseudo_tasks
+                if t.get("status") in ("open", "done")
+            ):
+                continue
+            pseudo_cwd = tasks_module.cwd_for_unattached_sid(pseudo_sid)
+            if pseudo_cwd not in groups:
+                # No live session in this cwd, but unattached tasks
+                # exist — bootstrap the group so they have a home.
+                label, color = tasks_module.derive_project_label(pseudo_cwd)
+                groups[pseudo_cwd] = {
+                    "label": label,
+                    "color": color,
+                    "cwd": pseudo_cwd,
+                    "tasks": [],
+                    "sessions": [],
+                    # No real bucket — sort below projects with live
+                    # work but above truly empty ones.
+                    "_min_bucket_priority": 98,
+                    "_session_ids": set(),
+                }
+            for t in pseudo_tasks:
+                if t.get("status") not in ("open", "done"):
+                    continue
+                groups[pseudo_cwd]["tasks"].append({
+                    "id": t.get("id") or "",
+                    "content": t.get("content") or "",
+                    "status": t.get("status") or "open",
+                    "sessionId": pseudo_sid,
+                    # Sentinel — the drawer JS reads this and renders
+                    # "(unattached) — ↗ attach" instead of "↗ <title>".
+                    "sessionTitle": "",
+                    "unattached": True,
+                    "approved": bool(t.get("approved", True)),
+                    "source": t.get("source") or "user",
+                })
+
+        # Order groups by their most-urgent session bucket, so
+        # projects with NEEDS-YOU work sit at the top of the drawer.
+        ordered = sorted(
+            groups.values(),
+            key=lambda g: (g.get("_min_bucket_priority", 99), g["label"].lower()),
+        )
+        # Strip the internal sort keys before sending to JS.
+        for g in ordered:
+            g.pop("_min_bucket_priority", None)
+            g.pop("_session_ids", None)
+        return {"groups": ordered}
+
+    @objc.python_method
+    def _build_sidebar_data(self, buckets: dict) -> dict:
+        """Build the left-rail (Idea 2.α) payload — project list derived
+        from session cwds, with per-project session counts and an
+        alertCount for any NEEDS-YOU sessions in that project. Plus the
+        two smart-view counts (Needs you, Today). Projects are the
+        cross-session organizing principle until the full projects
+        entity ships; until then we use cwd as the natural project key.
+
+        Shape:
+            {
+              "projects": [
+                {
+                  "cwd":        "/Users/foo/Talk back plugin",
+                  "label":      "Talk back plugin",
+                  "color":      "purple",
+                  "count":      5,         # sessions in this project
+                  "alertCount": 1,         # sessions in NEEDS YOU bucket
+                },
+                ...
+              ],
+              "totals": {
+                "all":     17,             # total visible sessions
+                "needsYou": 3,             # smart view: bucket == needs
+                "today":   6,              # smart view: ago < 24h
+              },
+            }
+
+        Projects are ordered by alertCount desc, then label asc, so
+        projects with NEEDS-YOU work float to the top of the rail.
+        Returned even in list mode so the popover-mode toggle doesn't
+        have to re-fetch; the kanban-only sidebar CSS gates display."""
+        import time as _time
+        projects: dict[str, dict] = {}
+        total_all = 0
+        total_needs = 0
+        total_today = 0
+        now = _time.time()
+        # Last-24h window — matches the "Today" smart view in the mockup.
+        TODAY_WINDOW_S = 24 * 3600
+        for bkey in ("needs", "working", "ready", "dormant"):
+            for row in (buckets.get(bkey) or []):
+                meta = row.get("meta") or {}
+                cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) else ""
+                sid = (row.get("s") or {}).get("sessionId") or ""
+                if not sid:
+                    continue
+                total_all += 1
+                if bkey == "needs":
+                    total_needs += 1
+                ago_s = row.get("ago_s")
+                if isinstance(ago_s, (int, float)) and ago_s < TODAY_WINDOW_S:
+                    total_today += 1
+                # cwd may legitimately be "" for some sessions — bucket
+                # them under a stable "(no folder)" pseudo-key so they
+                # still appear in the sidebar instead of vanishing.
+                key = cwd or "__no_cwd__"
+                if key not in projects:
+                    label, color = tasks_module.derive_project_label(cwd)
+                    projects[key] = {
+                        "cwd": cwd,
+                        "label": label,
+                        "color": color,
+                        "count": 0,
+                        "alertCount": 0,
+                    }
+                projects[key]["count"] += 1
+                if bkey == "needs":
+                    projects[key]["alertCount"] += 1
+        ordered = sorted(
+            projects.values(),
+            # alert-bearing projects first, then alphabetical for stable
+            # order across refreshes. Negation flips alertCount to desc.
+            key=lambda p: (-p["alertCount"], p["label"].lower()),
+        )
+        return {
+            "projects": ordered,
+            "totals": {
+                "all": total_all,
+                "needsYou": total_needs,
+                "today": total_today,
+            },
+        }
 
     @objc.python_method
     def _render_popover(self, buckets):
@@ -2064,6 +2560,24 @@ class PopoverVC(NSViewController):
             "density": self.density or "focus",
             # "list" or "kanban" — controls the CSS layout branch.
             "mode": "list" if self.mode == "list" else "kanban",
+            # Right-side tasks drawer: tasks grouped by cwd (the
+            # placeholder for projects until the full projects entity
+            # ships). JS in kanban.html renders this when the drawer
+            # is open. Only computed in kanban mode — list mode is
+            # too narrow to host the drawer.
+            "drawer": (
+                self._build_drawer_data(buckets)
+                if self.mode != "list" else None
+            ),
+            # Left-rail project sidebar (Idea 2.α from the canonical
+            # mockup): one entry per cwd-derived project + the two
+            # smart views (Needs you, Today). JS uses this to render
+            # the rail AND to filter the kanban when the user picks
+            # one. Kanban-only — list mode is too narrow.
+            "sidebar": (
+                self._build_sidebar_data(buckets)
+                if self.mode != "list" else None
+            ),
         }
 
         # If the JS isn't ready yet (initial loadHTMLString hasn't
@@ -2075,6 +2589,11 @@ class PopoverVC(NSViewController):
             self._kanban_web_evaluate(payload)
 
         self._update_mark_all_button()
+        # Refresh the Tasks pill's count badge. Cheap (one pass over
+        # the already-built drawer payload). Hidden in list mode by
+        # the pill itself being hidden — _update_tasks_btn_count is
+        # a no-op when self.tasks_btn doesn't exist.
+        self._update_tasks_btn_count(payload.get("drawer"))
 
     @objc.python_method
     def _kanban_web_evaluate(self, payload: dict):
@@ -2195,6 +2714,32 @@ class PopoverVC(NSViewController):
             if self.kanban_web_pending is not None:
                 self._kanban_web_evaluate(self.kanban_web_pending)
                 self.kanban_web_pending = None
+        elif action == "drawerToggled":
+            # JS toggled the right-side tasks drawer. Persist + grow
+            # the popover so the kanban + sidebar widths stay constant
+            # (same pattern as show_dormant). The body grid is already
+            # animating its own track from 0fr → 280px; growing the
+            # popover by the same 280px keeps the kanban width fixed
+            # instead of squeezing it.
+            new_state = bool(payload.get("open"))
+            if new_state == bool(getattr(self, "drawer_open", False)):
+                return  # no-op — JS resends on every render for sync
+            self.drawer_open = new_state
+            try:
+                _write_drawer_open(new_state)
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[kanban-web] drawer persist: {e!r}\n")
+            # Keep the native Tasks toolbar pill in sync. The user
+            # may have toggled via the pill (sender.state() already
+            # mirrors the new state) OR via a future JS path; sync
+            # the button defensively so both surfaces stay aligned.
+            tasks_btn = getattr(self, "tasks_btn", None)
+            if tasks_btn is not None:
+                try:
+                    tasks_btn.setState_(1 if new_state else 0)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._apply_popover_size()
         elif action == "taskCreate":
             # User typed a task into the + add input and hit Enter.
             content = pstr("content")
@@ -2207,6 +2752,26 @@ class PopoverVC(NSViewController):
                 # the user can edit and retry without losing context.
                 sys.stderr.write(
                     f"[tasks] create rejected sid={sid[:8]} "
+                    f"content_len={len(content)}\n"
+                )
+                return
+            self.refresh()
+        elif action == "taskCreateUnattached":
+            # Drawer "+ add task" with no explicit session chosen.
+            # The task is stored under a per-project pseudo-session id
+            # (__unattached__:<cwd>) so existing CRUD code paths work
+            # unchanged. The drawer renders these with an "(unattached)
+            # — ↗ attach" sub-label that opens the existing picker; on
+            # pick, taskAttachSession moves the task out of the pseudo-
+            # session into the real one.
+            content = pstr("content")
+            unattached_cwd = pstr("cwd")
+            if not content:
+                return
+            created = tasks_module.create_unattached_task(unattached_cwd, content)
+            if created is None:
+                sys.stderr.write(
+                    f"[tasks] unattached create rejected cwd={unattached_cwd!r} "
                     f"content_len={len(content)}\n"
                 )
                 return
@@ -2260,6 +2825,53 @@ class PopoverVC(NSViewController):
                 return
             if not tasks_module.delete_task(sid, tid):
                 sys.stderr.write(f"[tasks] delete miss sid={sid[:8]} tid={tid}\n")
+                return
+            self.refresh()
+        elif action == "taskCopy":
+            # JS-side fallback for clipboard writes that fail under
+            # WKWebView (the modern Clipboard API can be blocked in
+            # non-secure contexts). The payload carries the literal
+            # task text; we shell out to pbcopy. Fire-and-forget —
+            # no refresh, no error surfacing to the user.
+            text = pstr("content")
+            if not text:
+                return
+            self._copy_to_clipboard(text)
+        elif action == "taskStart":
+            # User edited the prompt in the modal and hit "Start".
+            # Spawn a fresh Terminal at the target cwd and run
+            # `claude <prompt>` so the new session opens with that
+            # prompt as its first user message.
+            prompt = pstr("prompt")
+            target_cwd = pstr("cwd")
+            if not prompt:
+                return
+            self._spawn_new_terminal_with_prompt(target_cwd, prompt)
+            # Close the popover so the new Terminal window has focus.
+            if self.popover_ref is not None:
+                try:
+                    self.popover_ref.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        elif action == "taskAttachSession":
+            # Move a task from one session to another. Used by the
+            # drawer's "change attachment" picker and (eventually) by
+            # drag-to-attach. The current session is required so we
+            # can find the task in O(1) bucket lookup; the new session
+            # must exist (validated by tasks.move_task_to_session).
+            tid = pstr("taskId")
+            new_sid = pstr("newSessionId")
+            # sid here = the task's current session (the resume target
+            # field repurposed for this action — JS sends both).
+            if not tid or not sid or not new_sid:
+                return
+            if sid == new_sid:
+                return  # no-op
+            if not tasks_module.move_task_to_session(sid, tid, new_sid):
+                sys.stderr.write(
+                    f"[tasks] attach failed sid={sid[:8]} → "
+                    f"{new_sid[:8]} tid={tid}\n"
+                )
                 return
             self.refresh()
         elif action == "taskReorder":
@@ -2480,6 +3092,72 @@ class PopoverVC(NSViewController):
             )
         except (OSError, subprocess.SubprocessError) as e:
             sys.stderr.write(f"[_spawn_new_terminal_session] {e!r}\n")
+
+    @objc.python_method
+    def _spawn_new_terminal_with_prompt(self, cwd: str, prompt: str) -> None:
+        """Open a fresh Terminal window at ``cwd`` and launch
+        ``claude <prompt>`` so the new Claude Code session starts with
+        the user's edited task text as its first message. Used by the
+        "▶ start" affordance on task rows.
+
+        We pass the prompt as a single positional argument; Claude
+        Code's CLI treats argv[1:] as the initial user prompt and
+        opens the interactive REPL with that already submitted. Both
+        cwd and prompt are shlex-quoted, then the whole shell command
+        is JSON-encoded so AppleScript's `do script` sees a single,
+        properly-escaped string — without that the quoted shell
+        snippet's embedded quotes break the AppleScript parser."""
+        import shlex
+        if not cwd:
+            cwd = os.path.expanduser("~")
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return
+        shell_cmd = (
+            f"cd {shlex.quote(cwd)} && claude {shlex.quote(prompt)}"
+        )
+        # Build the AppleScript program with JSON-quoted shell string
+        # so quotes/backslashes inside the prompt don't escape. We
+        # pass ensure_ascii=False so non-ASCII (emoji, accented
+        # characters, RTL text) survives intact — AppleScript does
+        # NOT decode JSON's \uXXXX escapes inside string literals,
+        # so a prompt like "review the café UX 🚀" would otherwise
+        # arrive in Terminal as literal "é ... 🚀"
+        # text. JSON's other escapes (\", \\, \n, \r, \t) coincide
+        # with AppleScript's string-literal escapes, so the rest
+        # stays safe.
+        applescript_str = json.dumps(shell_cmd, ensure_ascii=False)
+        try:
+            subprocess.Popen(
+                [
+                    "osascript",
+                    "-e", 'tell application "Terminal" to activate',
+                    "-e", f'tell application "Terminal" to do script {applescript_str}',
+                ],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            sys.stderr.write(f"[_spawn_new_terminal_with_prompt] {e!r}\n")
+
+    @objc.python_method
+    def _copy_to_clipboard(self, text: str) -> bool:
+        """Write ``text`` to the macOS clipboard via pbcopy. Used as a
+        fallback when the JS-side navigator.clipboard.writeText path
+        rejects (some WKWebView contexts treat themselves as non-
+        secure and block the modern Clipboard API). Returns True iff
+        pbcopy exited cleanly."""
+        if not isinstance(text, str):
+            return False
+        try:
+            p = subprocess.Popen(
+                ["pbcopy"], stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            p.communicate(input=text.encode("utf-8"), timeout=2.0)
+            return p.returncode == 0
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            sys.stderr.write(f"[_copy_to_clipboard] {e!r}\n")
+            return False
 
     @objc.python_method
     def _accent_color(self):

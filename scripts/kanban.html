@@ -8,6 +8,13 @@
   :root {
     --bg-popover:       #1c1c20;
     --bg-popover-lift:  #232328;
+    /* One step darker than --bg-popover — used by the project sidebar
+     * (left rail) and the tasks drawer (right rail) to set them apart
+     * from the main kanban canvas without a hard border. Previously
+     * referenced from drawer styles without a definition; that left
+     * the drawer transparent. Defining it here fixes that latent bug
+     * and gives the new sidebar a matching deep-surface tone. */
+    --bg-popover-deep:  #16161a;
     --hairline:         rgba(255,255,255,0.06);
     --hairline-strong:  rgba(255,255,255,0.10);
     --border-card:      rgba(255,255,255,0.04);
@@ -41,6 +48,410 @@
     /* Smoother text — matches native AppKit antialiasing better. */
     -webkit-font-smoothing: antialiased;
   }
+  /* ===========================================================
+   * Tasks drawer — collapsible right-side panel showing tasks
+   * across sessions, grouped by their cwd-derived project.
+   * Available in kanban mode only (list mode is too narrow).
+   * State persists per-WebView via localStorage.
+   * =========================================================== */
+  body {
+    /* Body becomes a 3-track grid so the left project sidebar and
+     * the right tasks drawer can each take real space; the kanban
+     * shrinks proportionally. Sidebar is a fixed 200px (Idea 2.α
+     * from the canonical mockup). Drawer toggles 0fr ↔ 280px.
+     * List mode collapses to a single track — see override below. */
+    display: grid;
+    grid-template-columns: 200px 1fr 0fr;
+    transition: grid-template-columns 160ms ease;
+  }
+  body.drawer-open { grid-template-columns: 200px 1fr 280px; }
+  /* List mode hides BOTH the sidebar and the drawer — the popover
+   * is too narrow (~360px) to host either. The Tasks toggle pill
+   * lives in the native top bar and is also hidden by Python in
+   * list mode (see floating.py:_update_tasks_btn_count). */
+  body.mode-list { grid-template-columns: 1fr !important; }
+  body.mode-list #drawer { display: none; }
+  body.mode-list #sidebar { display: none; }
+
+  #drawer {
+    background: var(--bg-popover-deep);
+    border-left: 1px solid var(--hairline);
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-width: 0;
+  }
+  #drawer::-webkit-scrollbar { width: 6px; }
+  #drawer::-webkit-scrollbar-track { background: transparent; }
+  #drawer::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.10); border-radius: 3px; }
+
+  /* The drawer toggle used to live here as a floating HTML button
+   * (#drawer-toggle). It moved into the native AppKit top bar
+   * alongside "Show older" — see floating.py:_load_view_safely
+   * (tasks_btn). The CSS rules + DOM node were removed so the
+   * top-right corner is no longer crowded by two competing toggle
+   * surfaces. JS toggleDrawer() still drives the body class +
+   * localStorage + bridge message; the native pill simply calls
+   * window.toggleDrawer() via evaluateJavaScript. */
+
+  .drawer-head {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--hairline);
+    font-family: var(--mono); font-size: 9px;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text-3);
+    display: flex; justify-content: space-between; align-items: baseline;
+    background: var(--bg-popover-deep);
+    position: sticky; top: 0; z-index: 2;
+  }
+  .drawer-head .total { color: var(--text-4); }
+
+  .drawer-group { border-bottom: 1px solid var(--hairline); }
+  .drawer-group-header {
+    padding: 8px 12px 4px;
+    display: flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 9.5px;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    font-weight: 600;
+  }
+  .drawer-group-header .pdot {
+    width: 7px; height: 7px; border-radius: 50%;
+  }
+  .drawer-group-header .pdot.purple { background: #b790ee; }
+  .drawer-group-header .pdot.teal   { background: #5dd0cf; }
+  .drawer-group-header .pdot.orange { background: #f5a85f; }
+  .drawer-group-header .pdot.yellow { background: #e8c46c; }
+  .drawer-group-header .pdot.mint   { background: #7dc4a9; }
+  .drawer-group-header .pdot.pink   { background: #d989b8; }
+  .drawer-group-header .name {
+    color: var(--text-2); flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .drawer-group-header .ct { color: var(--text-4); }
+
+  .drawer-task {
+    /* position:relative anchors the absolute-positioned .tdelete
+     * × button to the row's right edge without disturbing the
+     * existing grid that the text + glyph use. */
+    position: relative;
+    padding: 4px 12px 6px 28px;
+    font-size: 11px;
+    line-height: 1.45;
+    cursor: pointer;
+    border-left: 2px solid transparent;
+  }
+  .drawer-task:hover {
+    background: rgba(255,255,255,0.03);
+    border-left-color: var(--hairline-strong);
+  }
+  /* Reorderable rows get the grab/grabbing cursor so the user knows
+   * they can be dragged. Inner interactive children (glyph + ↗
+   * session subline + the [copy][start][delete] controls) override
+   * back to a functional cursor — without this, the OS-level
+   * draggable cursor shadows them and the affordance reads as
+   * unclickable. */
+  .drawer-task.reorderable { cursor: grab; }
+  .drawer-task.reorderable:active { cursor: grabbing; }
+  .drawer-task.reorderable .glyph,
+  .drawer-task.reorderable .sess,
+  .drawer-task.reorderable .drawer-ctrls .ctrl { cursor: pointer; }
+  /* While being dragged: fade the source row to ~35% so the user
+   * can see the row beneath the insertion line clearly. */
+  .drawer-task.dragging { opacity: 0.35; }
+  /* Drop-target hints — a 2-px colored line on the top or bottom
+   * edge of the hovered target row tells the user where the
+   * dragged task will land. Matches the per-card affordance. */
+  .drawer-task.drag-over-before { box-shadow: inset 0 2px 0 0 var(--blue); }
+  .drawer-task.drag-over-after  { box-shadow: inset 0 -2px 0 0 var(--blue); }
+  /* Same-session restriction: cross-session targets get a muted
+   * red insertion line so the user knows the drop will be rejected.
+   * The taskReorder bridge action is per-session; cross-session
+   * moves should use the ↗ session reattach affordance instead. */
+  .drawer-task.drag-reject { box-shadow: inset 0 0 0 1px rgba(240,111,111,0.30); }
+
+  /* Trailing controls for drawer tasks: [📋 copy][▶ start][× delete].
+   * Hidden at rest, fade in on row hover. Live in the row grid as
+   * a 3rd column so they sit inline with the text instead of
+   * stacking absolutely on top of each other (which the previous
+   * absolute-positioned standalone .tdelete did before the row
+   * gained copy + start siblings). */
+  .drawer-task .drawer-ctrls {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 80ms ease;
+  }
+  .drawer-task:hover .drawer-ctrls { opacity: 1; }
+  .drawer-task .drawer-ctrls .ctrl {
+    color: var(--text-4);
+    font-size: 11px;
+    line-height: 1;
+    padding: 3px 5px;
+    cursor: pointer;
+    border-radius: 3px;
+    user-select: none;
+    transition: color 80ms ease, background 80ms ease;
+  }
+  .drawer-task .drawer-ctrls .ctrl:hover {
+    color: var(--text-1);
+    background: rgba(255,255,255,0.06);
+  }
+  .drawer-task .drawer-ctrls .ctrl.tcopy:hover  { color: var(--blue); }
+  .drawer-task .drawer-ctrls .ctrl.tstart:hover { color: var(--green); }
+  .drawer-task .drawer-ctrls .ctrl.tdelete:hover {
+    color: var(--red);
+    background: rgba(240,111,111,0.10);
+  }
+  /* Emoji icons need a slightly larger glyph size so they look in
+   * proportion with the text glyph (○/●) sitting next to them. */
+  .drawer-task .drawer-ctrls .ctrl.tcopy,
+  .drawer-task .drawer-ctrls .ctrl.tstart { font-size: 10px; }
+  /* The × glyph is taller than the emoji icons; bump it so all
+   * three read as the same visual weight. */
+  .drawer-task .drawer-ctrls .ctrl.tdelete { font-size: 13px; padding-top: 1px; }
+
+  /* Three-column grid so the controls take the trailing column
+   * without forcing a wrap on the .text in the middle. */
+  .drawer-task .row {
+    display: grid;
+    grid-template-columns: 12px 1fr auto;
+    column-gap: 6px;
+    align-items: center;
+  }
+  .drawer-task .glyph {
+    font-family: var(--mono); font-size: 11px;
+    color: var(--text-3); text-align: center;
+  }
+  .drawer-task.open.purple .glyph { color: #b790ee; }
+  .drawer-task.open.teal   .glyph { color: #5dd0cf; }
+  .drawer-task.open.orange .glyph { color: #f5a85f; }
+  .drawer-task.open.yellow .glyph { color: #e8c46c; }
+  .drawer-task.open.mint   .glyph { color: #7dc4a9; }
+  .drawer-task.open.pink   .glyph { color: #d989b8; }
+  .drawer-task.done .glyph,
+  .drawer-task.done .text { color: var(--text-4); }
+  .drawer-task .text {
+    color: var(--text-1);
+    overflow: hidden;
+    word-wrap: break-word;
+  }
+  .drawer-task .sess {
+    color: var(--text-4);
+    font-family: var(--mono);
+    font-size: 9.5px;
+    margin-top: 2px;
+    padding-left: 18px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .drawer-empty {
+    padding: 24px 16px;
+    color: var(--text-3);
+    font-size: 11px;
+    text-align: center;
+    line-height: 1.5;
+  }
+
+  /* Unattached-task sub-line: "(unattached) ↗ attach". The
+   * "(unattached)" tag is muted/italic to read as state-not-action;
+   * "↗ attach" lights up on hover to invite the user to attach. */
+  .drawer-task .sess.unattached { color: var(--text-4); }
+  .drawer-task .sess.unattached .unattached-tag {
+    font-style: italic;
+    color: var(--text-4);
+    margin-right: 4px;
+  }
+  .drawer-task .sess.unattached .attach-cta {
+    color: var(--blue);
+    opacity: 0.75;
+    transition: opacity 80ms ease;
+  }
+  .drawer-task .sess.unattached:hover .attach-cta { opacity: 1; }
+  /* Unattached task rows get a subtle dashed left border so the user
+   * can see at a glance which rows still need a session. */
+  .drawer-task.unattached {
+    border-left-style: dashed;
+    border-left-color: rgba(106,166,248,0.30);
+  }
+  .drawer-task.unattached:hover { border-left-color: var(--blue); }
+
+  /* ---- Add-task affordance + form within each drawer group ---- */
+  .drawer-add-link {
+    padding: 4px 12px 8px 28px;
+    font-family: var(--sans);
+    font-size: 10.5px;
+    color: var(--text-4);
+    cursor: pointer;
+    user-select: none;
+  }
+  .drawer-add-link:hover { color: var(--text-2); }
+
+  /* "▸ ● N done" / "▾ hide N done" collapse pill inside each
+   * drawer group. Same visual language as the per-card .done-toggle
+   * but adapted to the drawer's typography + left-indent. Sits
+   * between the open task rows and the "+ add task" link, so the
+   * eye flows: open → toggle → (done rows if revealed) → add. */
+  .drawer-done-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px 4px 28px;
+    font-family: var(--mono);
+    font-size: 9.5px;
+    color: var(--text-4);
+    cursor: pointer;
+    user-select: none;
+    line-height: 1.3;
+  }
+  .drawer-done-toggle:hover { color: var(--text-2); }
+  .drawer-done-toggle .chev { width: 8px; display: inline-block; }
+  .drawer-done-toggle .dot { color: var(--green, #4fc78a); font-size: 10px; }
+  .drawer-done-toggle.revealed {
+    color: var(--text-3);
+    padding-bottom: 2px;
+  }
+
+  .drawer-add-form {
+    padding: 6px 10px 10px 28px;
+    background: rgba(255,255,255,0.02);
+    border-top: 1px dashed rgba(255,255,255,0.06);
+    border-bottom: 1px dashed rgba(255,255,255,0.06);
+  }
+  .drawer-add-form input {
+    width: 100%;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 3px;
+    color: var(--text-1);
+    padding: 4px 7px;
+    font-family: var(--sans);
+    font-size: 11px;
+    outline: none;
+  }
+  .drawer-add-form input:focus {
+    border-color: rgba(106,166,248,0.40);
+    background: rgba(106,166,248,0.06);
+  }
+  .drawer-add-form .session-pick {
+    margin-top: 5px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-3);
+  }
+  .drawer-add-form .session-pick .pick-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border-radius: 2px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    cursor: pointer;
+    color: var(--text-2);
+  }
+  .drawer-add-form .session-pick .pick-chip:hover {
+    border-color: rgba(255,255,255,0.18);
+    color: var(--text-1);
+  }
+  .drawer-add-form .session-pick .pick-chip .caret {
+    font-size: 8px;
+    color: var(--text-4);
+  }
+  .drawer-add-form .hint {
+    margin-top: 5px;
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--text-4);
+    letter-spacing: 0.04em;
+  }
+  /* "↗ attach" callout inside the add-form hint. Subtly tinted so
+   * the user catches the next step at a glance without it
+   * competing with the actual Enter/Esc instructions. */
+  .drawer-add-form .hint .hint-cta { color: var(--blue); opacity: 0.7; }
+
+  /* ---- Session-picker popover (used by add form + reattach) ---- */
+  .session-picker-popover {
+    position: absolute;
+    z-index: 200;
+    background: var(--bg-popover);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 6px;
+    box-shadow: 0 12px 28px rgba(0,0,0,0.45);
+    padding: 4px 0;
+    min-width: 220px;
+    max-width: 280px;
+    font-family: var(--sans);
+  }
+  .session-picker-head {
+    padding: 6px 10px 4px;
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-4);
+    border-bottom: 1px solid var(--hairline);
+    margin-bottom: 4px;
+  }
+  .session-picker-item {
+    padding: 5px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-size: 11.5px;
+  }
+  .session-picker-item:hover {
+    background: rgba(255,255,255,0.05);
+  }
+  .session-picker-item.current {
+    background: rgba(106,166,248,0.08);
+  }
+  .session-picker-item .sdot {
+    font-size: 11px; line-height: 1;
+    flex-shrink: 0;
+  }
+  .session-picker-item.bucket-working .sdot { color: var(--amber); }
+  .session-picker-item.bucket-needs   .sdot { color: var(--red); }
+  .session-picker-item.bucket-ready   .sdot { color: var(--green); }
+  .session-picker-item.bucket-dormant .sdot { color: var(--text-3); }
+  .session-picker-item .stitle {
+    color: var(--text-1);
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .session-picker-item .sphase {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    color: var(--text-4);
+  }
+  .session-picker-item .current-tag {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--blue);
+    letter-spacing: 0.04em;
+    margin-left: 6px;
+  }
+  .session-picker-empty {
+    padding: 10px 12px;
+    font-size: 11px;
+    color: var(--text-3);
+    text-align: center;
+    font-style: italic;
+  }
+
+  /* The session label inside a drawer task — click target for reattach */
+  .drawer-task .sess {
+    cursor: pointer;
+  }
+  .drawer-task .sess:hover {
+    color: var(--text-2);
+  }
+
   /* ===========================================================
    * Layout — KANBAN mode (3 or 4 columns side by side)
    * =========================================================== */
@@ -429,6 +840,17 @@
   .card .task-row.drag-over-after {
     box-shadow: inset 0 -2px 0 0 var(--blue);
   }
+  /* Reorderable rows announce drag-ability by switching the row's
+   * own cursor to grab. Inner interactive elements (the glyph + the
+   * control icons + an in-edit input) override back to their
+   * functional cursor so the click target stays legible. Without
+   * these overrides the OS-level draggable cursor would shadow the
+   * glyph and make "mark done" look unclickable. */
+  .card .task-row.reorderable { cursor: grab; }
+  .card .task-row.reorderable:active { cursor: grabbing; }
+  .card .task-row.reorderable .tglyph,
+  .card .task-row.reorderable .ctrls .ctrl { cursor: pointer; }
+  .card .task-row.reorderable .ttext.editable { cursor: text; }
   /* While ANY row is being dragged in the popover, soften body-level
    * affordances that would otherwise distract (e.g., title hover
    * underline on .ttext.editable). */
@@ -541,6 +963,36 @@
   .card .task-row .ctrl.reject  { color: var(--red); }
   .card .task-row .ctrl:hover { background: rgba(255,255,255,0.10); }
 
+  /* User-task controls ([copy][start][delete]) — same layout as the
+   * suggestion ctrls but hover-revealed so the row reads as calm at
+   * rest. The legacy ".tdelete" rule above no longer matches (since
+   * the × is now wrapped in .ctrls.user > .ctrl.tdelete); these
+   * rules take over. Tinted per-action on hover so the user can
+   * tell copy/start/delete apart at a glance. */
+  .card .task-row .ctrls.user {
+    border: none;
+    background: transparent;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .card .task-row:hover .ctrls.user { opacity: 1; }
+  .card .task-row .ctrls.user .ctrl {
+    border: none;
+    background: transparent;
+    color: var(--text-3);
+  }
+  .card .task-row .ctrls.user .ctrl:hover {
+    background: rgba(255,255,255,0.08);
+    color: var(--text-1);
+  }
+  .card .task-row .ctrls.user .ctrl.tcopy:hover  { color: var(--blue); }
+  .card .task-row .ctrls.user .ctrl.tstart:hover { color: var(--green); }
+  .card .task-row .ctrls.user .ctrl.tdelete:hover {
+    color: var(--red);
+    background: rgba(240,111,111,0.10);
+  }
+  .card .task-row .ctrls.user .ctrl.tdelete { font-size: 13px; }
+
   /* "+ add task" link on collapsed kanban cards that already have
    * tasks. Hidden in list mode (the input is always visible there)
    * and on the expanded state (the input renders directly).
@@ -580,6 +1032,36 @@
     cursor: pointer;
   }
   .card .tasks .more:hover { color: var(--text-3); }
+
+  /* "▸ ● N done" collapse pill — folds completed tasks behind one
+   * line on an expanded card. Click to reveal the rows; click again
+   * to re-collapse. Sits below the open + suggested rows so the
+   * eye flows top-down: in-flight work first, completed work last. */
+  .card .tasks .done-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 9.5px;
+    color: var(--text-4);
+    margin-top: 6px;
+    padding: 2px 0;
+    cursor: pointer;
+    user-select: none;
+    line-height: 1.3;
+  }
+  .card .tasks .done-toggle:hover { color: var(--text-2); }
+  .card .tasks .done-toggle .chev { width: 8px; display: inline-block; }
+  .card .tasks .done-toggle .dot {
+    color: var(--green, #4fc78a);
+    font-size: 10px;
+  }
+  /* Revealed (expanded) state — slightly stronger so it visibly
+   * acts as a "section header" above the done rows it now leads. */
+  .card .tasks .done-toggle.revealed {
+    color: var(--text-3);
+    margin-bottom: 2px;
+  }
 
   /* Sub-divider above suggested tasks. */
   .card .tasks .sugg-divider {
@@ -714,10 +1196,253 @@
     opacity: 0.7;
   }
   .card.dormant .title { color: var(--text-2); font-weight: 400; }
+
+  /* ===========================================================
+   * Project sidebar — Idea 2.α from /tmp/projects-structure-d-
+   * mockup.html. A 200px left rail listing All-projects, every
+   * cwd-derived project, and two smart views (Needs you / Today).
+   * Click an item to filter the kanban to that selection. State
+   * persists in localStorage so the rail remembers the user's
+   * last selection across popover open/close.
+   * =========================================================== */
+  #sidebar {
+    background: var(--bg-popover-deep, #18181d);
+    border-right: 1px solid var(--hairline);
+    padding: 8px 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-width: 0;
+    user-select: none;
+  }
+  #sidebar::-webkit-scrollbar { width: 6px; }
+  #sidebar::-webkit-scrollbar-track { background: transparent; }
+  #sidebar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.10); border-radius: 3px; }
+
+  .sb-section-title {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-4);
+    padding: 10px 14px 6px;
+  }
+  .sb-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: var(--text-2);
+    cursor: pointer;
+    border-left: 2px solid transparent;
+    line-height: 1.3;
+  }
+  .sb-item:hover { background: rgba(255,255,255,0.03); color: var(--text-1); }
+  .sb-item.on {
+    background: rgba(183,144,238,0.10);
+    color: var(--text-1);
+    border-left-color: #b790ee;
+  }
+  /* Per-color tinted highlights when a colored project is selected;
+   * the left-border stripe + faint background pick up that project's
+   * accent so the rail visibly anchors to its dot. */
+  .sb-item.on[data-color="teal"]   { background: rgba(93,208,207,0.10);  border-left-color: #5dd0cf; }
+  .sb-item.on[data-color="orange"] { background: rgba(245,168,95,0.10);  border-left-color: #f5a85f; }
+  .sb-item.on[data-color="yellow"] { background: rgba(232,196,108,0.10); border-left-color: #e8c46c; }
+  .sb-item.on[data-color="mint"]   { background: rgba(125,196,169,0.10); border-left-color: #7dc4a9; }
+  .sb-item.on[data-color="pink"]   { background: rgba(217,137,184,0.10); border-left-color: #d989b8; }
+  .sb-item.on[data-color="all"]    { background: rgba(255,255,255,0.05); border-left-color: var(--text-3); }
+  .sb-item.on[data-color="red"]    { background: rgba(240,111,111,0.10); border-left-color: var(--red); }
+  .sb-item.on[data-color="blue"]   { background: rgba(106,166,248,0.10); border-left-color: var(--blue); }
+
+  .sb-item .pdot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .sb-item .pdot.purple { background: #b790ee; }
+  .sb-item .pdot.teal   { background: #5dd0cf; }
+  .sb-item .pdot.orange { background: #f5a85f; }
+  .sb-item .pdot.yellow { background: #e8c46c; }
+  .sb-item .pdot.mint   { background: #7dc4a9; }
+  .sb-item .pdot.pink   { background: #d989b8; }
+  /* "All projects" + smart-view dots: hollow ring so they read as
+   * "no specific project color" — they're virtual filters. */
+  .sb-item .pdot.all {
+    background: transparent;
+    border: 1.5px solid var(--text-3);
+    /* The border eats 1.5px on each side — bump base size to 8px to
+     * compensate so the ring matches the solid 8px dots visually. */
+    width: 8px;
+    height: 8px;
+    box-sizing: border-box;
+  }
+  .sb-item .label {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sb-item .count {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-4);
+  }
+  .sb-item.on .count { color: var(--text-2); }
+  .sb-item .count.alert { color: var(--red); font-weight: 600; }
+  .sb-divider { height: 1px; background: var(--hairline); margin: 8px 12px; }
+  .sb-search {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--hairline);
+    background: rgba(0,0,0,0.10);
+  }
+  .sb-search input {
+    width: 100%;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 3px;
+    color: var(--text-1);
+    padding: 4px 8px;
+    font-size: 11px;
+    font-family: var(--sans);
+    box-sizing: border-box;
+    outline: none;
+  }
+  .sb-search input:focus { border-color: rgba(106,166,248,0.40); }
+  /* "No matches" placeholder when project search filters out
+   * everything. Kept inside the Projects section as a dim line. */
+  .sb-empty {
+    padding: 4px 14px 8px;
+    font-size: 11px;
+    color: var(--text-4);
+    font-style: italic;
+  }
+
+  /* ===========================================================
+   * Task-start modal — pre-flight prompt editor.
+   * Opened by clicking the ▶ start affordance on any user task
+   * row. Shows the task content in an editable textarea, and on
+   * confirm spawns a fresh Terminal at the task's folder running
+   * `claude <prompt>`. Esc cancels.
+   * =========================================================== */
+  #task-start-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.50);
+    z-index: 1000;
+    display: none;             /* shown by JS as 'flex' */
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(2px);
+  }
+  #task-start-modal.open { display: flex; }
+  #task-start-modal .modal-card {
+    width: min(540px, calc(100% - 48px));
+    background: var(--bg-popover-lift);
+    border: 1px solid var(--hairline-strong);
+    border-radius: 8px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.50);
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  #task-start-modal .modal-head {
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--text-2);
+    line-height: 1.4;
+  }
+  #task-start-modal .modal-head strong {
+    color: var(--text-1);
+    font-weight: 600;
+    font-family: var(--mono);
+    font-size: 11.5px;
+  }
+  #task-start-modal textarea {
+    width: 100%;
+    min-height: 120px;
+    max-height: 240px;
+    background: rgba(0,0,0,0.30);
+    border: 1px solid var(--hairline-strong);
+    border-radius: 4px;
+    color: var(--text-1);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 10px 12px;
+    resize: vertical;
+    outline: none;
+    box-sizing: border-box;
+  }
+  #task-start-modal textarea:focus {
+    border-color: rgba(106,166,248,0.50);
+  }
+  #task-start-modal .btns {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 2px;
+  }
+  #task-start-modal .btn {
+    font-family: var(--sans);
+    font-size: 12px;
+    padding: 6px 14px;
+    border-radius: 4px;
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--text-2);
+    cursor: pointer;
+    transition: background 80ms ease, color 80ms ease, border-color 80ms ease;
+  }
+  #task-start-modal .btn:hover {
+    background: rgba(255,255,255,0.06);
+    color: var(--text-1);
+  }
+  #task-start-modal .btn.primary {
+    background: var(--blue);
+    border-color: var(--blue);
+    color: #fff;
+    font-weight: 600;
+  }
+  #task-start-modal .btn.primary:hover {
+    background: #7eb2f8;
+    border-color: #7eb2f8;
+  }
+  #task-start-modal .hint {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    color: var(--text-4);
+    letter-spacing: 0.04em;
+    margin-top: -4px;
+  }
 </style>
 </head>
 <body>
+<aside id="sidebar"></aside>
 <div id="app"></div>
+<div id="drawer"></div>
+<!-- #drawer-toggle moved into the native AppKit top bar (Show older
+     + Tasks pill group). See floating.py:_load_view_safely. -->
+
+<!-- Task-start modal — built once at load, populated + shown on
+     demand by openTaskStartModal(). Lives at the root so it stacks
+     above everything else in the popover. -->
+<div id="task-start-modal" aria-hidden="true">
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      Start a new Claude session in <strong id="tsm-folder">~/</strong>
+    </div>
+    <textarea id="tsm-prompt" placeholder="What should Claude do?"></textarea>
+    <div class="hint">Edit if needed · Cmd+Enter to launch · Esc to cancel</div>
+    <div class="btns">
+      <button class="btn" id="tsm-cancel" type="button">Cancel</button>
+      <button class="btn primary" id="tsm-confirm" type="button">Start ▶</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (function() {
   'use strict';
@@ -777,6 +1502,1050 @@
   //   editingTasks.get(taskId) === undefined  →  view mode
   //   editingTasks.get(taskId) === "..."      →  edit mode, draft text
   const editingTasks = new Map();
+
+  // Sessions whose done-tasks block is currently REVEALED. Default
+  // (sid NOT in set) = done tasks are folded behind a single
+  // "▸ ● N done" pill on the card; click the pill to add the sid
+  // here and expand. Click again to remove + collapse. Survives
+  // refresh ticks via this in-memory Set (lives in the WKWebView's
+  // JS context, same as expandedCards); resets when the panel
+  // process restarts — which matches the "default to collapsed"
+  // intent: stale work shouldn't keep itself open across launches.
+  const doneRevealed = new Set();
+
+  // ---- Tasks drawer state ----
+  // Persisted across popover open/close via localStorage so the
+  // user's preference survives the WKWebView reload (e.g. hot
+  // reload of kanban.html, or app restart).
+  const DRAWER_STORAGE_KEY = 'cssDrawerOpen';
+  function getDrawerOpen() {
+    try { return localStorage.getItem(DRAWER_STORAGE_KEY) === '1'; }
+    catch (e) { return false; }
+  }
+  function setDrawerOpen(open) {
+    try { localStorage.setItem(DRAWER_STORAGE_KEY, open ? '1' : '0'); }
+    catch (e) { /* private browsing or storage denied — non-fatal */ }
+    document.body.classList.toggle('drawer-open', !!open);
+    // Tell Python so it can grow the popover by DRAWER_WIDTH_PX
+    // (same UX pattern as the "Show older" toggle). Without this,
+    // opening the drawer would just squeeze the kanban into a
+    // narrower track inside the existing popover size. Python
+    // de-dups identical state so this is safe to call on every
+    // toggle AND on the initial mount sync from DOMContentLoaded.
+    try { send('drawerToggled', { open: !!open }); }
+    catch (e) { /* bridge not ready yet — Python's persisted flag
+                  + the no-op guard cover the next refresh tick */ }
+  }
+  function toggleDrawer() {
+    setDrawerOpen(!getDrawerOpen());
+  }
+  // Expose toggleDrawer on window so the native Tasks pill in the
+  // top bar can invoke it via WKWebView.evaluateJavaScript. Without
+  // this, `window.toggleDrawer` would be undefined (the IIFE keeps
+  // toggleDrawer module-private).
+  window.toggleDrawer = toggleDrawer;
+  // Restore the body class from localStorage on initial mount. The
+  // toggle BUTTON itself now lives in the native AppKit top bar
+  // (floating.py:_load_view_safely > tasks_btn), so we no longer
+  // attach a DOM click handler here — only sync the class +
+  // Python state from the persisted JS-side flag.
+  document.addEventListener('DOMContentLoaded', function() {
+    setDrawerOpen(getDrawerOpen());
+  }, { once: true });
+
+  // ---- Drawer per-group state ----
+  // Which group currently has its "+ add task" form open. Only one
+  // form open at a time; clicking "+ add" on another group closes
+  // the current one. Keyed by group cwd (a stable identifier).
+  // Stored across refreshes so the form survives the 5s tick.
+  let _drawerAddCwd = null;
+  // Per-group draft text + chosen session id (so the form re-opens
+  // with the user's in-flight content + session pick).
+  const _drawerAddDrafts = new Map();  // cwd -> { content, sessionId }
+  // The cached payload from the latest renderApp — used by the
+  // session picker popover to enumerate sessions in a group.
+  let _drawerData = null;
+
+  // Drawer-side per-group "done revealed" state. Mirrors
+  // `doneRevealed` for the per-card tasks block, but keyed by cwd
+  // (the drawer's group key) instead of sessionId. Default (cwd
+  // NOT in set) = done tasks are folded behind a single
+  // "▸ ● N done" pill at the bottom of the group; click reveals
+  // all done rows; click again re-collapses. Lives in this Set
+  // for the lifetime of the WKWebView (same survival rules as
+  // doneRevealed) — resets to "everything collapsed" on panel
+  // restart, which matches the "completed work fades out by
+  // default" intent.
+  const drawerDoneRevealed = new Set();
+
+  // ===========================================================
+  // Project sidebar (Idea 2.α from the canonical mockup)
+  // -----------------------------------------------------------
+  // The slim left rail. State: which item is selected (All /
+  // a specific project's cwd / one of two smart views). Persists
+  // in localStorage so the popover re-opens to the last view.
+  // ===========================================================
+  const SIDEBAR_SELECTION_KEY = 'kanban.sidebar.selection.v1';
+  const SIDEBAR_SEARCH_KEY    = 'kanban.sidebar.search.v1';
+
+  function _readSidebarSelection() {
+    // Selection shape: {kind: 'all'|'project'|'needsYou'|'today',
+    //                   cwd: string|null}. Anything malformed -> All.
+    try {
+      const raw = localStorage.getItem(SIDEBAR_SELECTION_KEY);
+      if (!raw) return { kind: 'all', cwd: null };
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.kind === 'string') {
+        return {
+          kind: parsed.kind,
+          cwd: typeof parsed.cwd === 'string' ? parsed.cwd : null,
+        };
+      }
+    } catch (e) { /* swallow — start fresh */ }
+    return { kind: 'all', cwd: null };
+  }
+  function _writeSidebarSelection(sel) {
+    try { localStorage.setItem(SIDEBAR_SELECTION_KEY, JSON.stringify(sel)); }
+    catch (e) { /* localStorage full / disabled — fine, in-memory still works */ }
+  }
+  function _readSidebarSearch() {
+    try { return localStorage.getItem(SIDEBAR_SEARCH_KEY) || ''; }
+    catch (e) { return ''; }
+  }
+  function _writeSidebarSearch(q) {
+    try { localStorage.setItem(SIDEBAR_SEARCH_KEY, q || ''); }
+    catch (e) { /* ignore */ }
+  }
+
+  let _sidebarSelection = _readSidebarSelection();
+  let _sidebarSearch    = _readSidebarSearch();
+  // Latest sidebar payload from Python (project list + totals).
+  // Cached so a sidebar interaction can re-render without a Python
+  // round-trip — we just re-filter the latest buckets locally.
+  let _sidebarData = null;
+  // Latest full payload object — needed so sidebar clicks can call
+  // renderApp(_lastData) and re-build the kanban with a different
+  // filter applied. Set on every successful renderApp.
+  let _lastData = null;
+
+  function setSidebarSelection(sel) {
+    _sidebarSelection = sel || { kind: 'all', cwd: null };
+    _writeSidebarSelection(_sidebarSelection);
+    // Bust the payload-equality short-circuit in renderApp so the
+    // re-render actually fires even though the Python payload is
+    // bytes-identical to the previous one.
+    _lastPayloadJson = null;
+    if (_lastData) renderApp(_lastData);
+  }
+
+  function _selectionEquals(a, b) {
+    if (!a || !b) return false;
+    if (a.kind !== b.kind) return false;
+    if (a.kind === 'project') return (a.cwd || '') === (b.cwd || '');
+    return true;
+  }
+
+  // Apply the user's sidebar filter to the bucket payload. Returns
+  // a NEW buckets object with the same shape so downstream column
+  // code is unchanged — counts and card lists naturally reflect the
+  // filter without any extra plumbing.
+  function filterBuckets(buckets, sel) {
+    if (!sel || sel.kind === 'all') return buckets;
+    const out = {};
+    const TODAY_S = 24 * 3600;
+    ['needs','working','ready','dormant'].forEach(function(key) {
+      const rows = buckets[key] || [];
+      let kept;
+      if (sel.kind === 'project') {
+        const want = sel.cwd || '';
+        kept = rows.filter(function(r) { return (r.cwd || '') === want; });
+      } else if (sel.kind === 'needsYou') {
+        // Surface only the Needs You column's contents — the other
+        // status columns render empty under this smart view. The
+        // user can still see "what wants me right now" without
+        // mixing in working/ready noise.
+        kept = (key === 'needs') ? rows.slice() : [];
+      } else if (sel.kind === 'today') {
+        kept = rows.filter(function(r) {
+          return typeof r.ago_s === 'number' && r.ago_s < TODAY_S;
+        });
+      } else {
+        kept = rows.slice();
+      }
+      out[key] = kept;
+    });
+    return out;
+  }
+
+  function renderSidebar(sidebar) {
+    const root = document.getElementById('sidebar');
+    if (!root) return;
+    _sidebarData = sidebar || null;
+
+    // If the previously selected project no longer exists (cwd
+    // aged out of the visible session set), fall back to All so
+    // the user doesn't get stuck on an empty filter.
+    if (_sidebarSelection.kind === 'project') {
+      const exists = (sidebar && sidebar.projects || []).some(function(p) {
+        return (p.cwd || '') === (_sidebarSelection.cwd || '');
+      });
+      if (!exists) _sidebarSelection = { kind: 'all', cwd: null };
+    }
+
+    if (!sidebar) {
+      // List mode (or pre-handshake) — empty out the rail; CSS
+      // already hides it in list mode so this is just hygiene.
+      root.innerHTML = '';
+      return;
+    }
+    const sel = _sidebarSelection;
+    const totals = sidebar.totals || { all: 0, needsYou: 0, today: 0 };
+    const projects = Array.isArray(sidebar.projects) ? sidebar.projects : [];
+
+    // Capture focus on the search input so a 5s refresh doesn't
+    // yank the caret out mid-type.
+    const activeEl = document.activeElement;
+    const wasSearchFocused = !!(activeEl
+      && activeEl.matches
+      && activeEl.matches('#sidebar input[data-sb-search]'));
+    let searchCaret = 0;
+    if (wasSearchFocused) searchCaret = activeEl.selectionStart || 0;
+
+    // Project search filter — case-insensitive substring match.
+    const q = (_sidebarSearch || '').trim().toLowerCase();
+    const matched = q
+      ? projects.filter(function(p) { return (p.label || '').toLowerCase().indexOf(q) !== -1; })
+      : projects;
+
+    const allOn       = (sel.kind === 'all');
+    const needsYouOn  = (sel.kind === 'needsYou');
+    const todayOn     = (sel.kind === 'today');
+
+    let html = ''
+      + '<div class="sb-search">'
+      +   '<input type="text" data-sb-search placeholder="Search projects…" value="' + esc(_sidebarSearch || '') + '">'
+      + '</div>'
+      + '<div class="sb-section-title">View</div>'
+      + '<div class="sb-item' + (allOn ? ' on' : '') + '" data-sb-action="all" data-color="all">'
+      +   '<span class="pdot all"></span>'
+      +   '<span class="label">All projects</span>'
+      +   '<span class="count">' + (totals.all || 0) + '</span>'
+      + '</div>'
+      + '<div class="sb-divider"></div>'
+      + '<div class="sb-section-title">Projects</div>';
+    if (matched.length === 0) {
+      html += '<div class="sb-empty">' + (q ? 'no match' : 'no projects') + '</div>';
+    } else {
+      matched.forEach(function(p) {
+        const isOn = (sel.kind === 'project' && (sel.cwd || '') === (p.cwd || ''));
+        const color = p.color || 'purple';
+        const cwdAttr = esc(p.cwd || '');
+        const alertCls = (p.alertCount && p.alertCount > 0) ? ' alert' : '';
+        const countVal = (p.alertCount && p.alertCount > 0)
+          ? String(p.alertCount)
+          : String(p.count || 0);
+        html += ''
+          + '<div class="sb-item' + (isOn ? ' on' : '') + '"'
+          +    ' data-sb-action="project"'
+          +    ' data-cwd="' + cwdAttr + '"'
+          +    ' data-color="' + esc(color) + '">'
+          +   '<span class="pdot ' + esc(color) + '"></span>'
+          +   '<span class="label" title="' + esc(p.label || '') + '">' + esc(p.label || '') + '</span>'
+          +   '<span class="count' + alertCls + '">' + countVal + '</span>'
+          + '</div>';
+      });
+    }
+    html += ''
+      + '<div class="sb-divider"></div>'
+      + '<div class="sb-section-title">Smart views</div>'
+      + '<div class="sb-item' + (needsYouOn ? ' on' : '') + '" data-sb-action="needsYou" data-color="red">'
+      +   '<span class="pdot all"></span>'
+      +   '<span class="label">Needs you</span>'
+      +   '<span class="count' + ((totals.needsYou || 0) > 0 ? ' alert' : '') + '">' + (totals.needsYou || 0) + '</span>'
+      + '</div>'
+      + '<div class="sb-item' + (todayOn ? ' on' : '') + '" data-sb-action="today" data-color="blue">'
+      +   '<span class="pdot all"></span>'
+      +   '<span class="label">Today</span>'
+      +   '<span class="count">' + (totals.today || 0) + '</span>'
+      + '</div>';
+    root.innerHTML = html;
+    wireSidebarClicks(root);
+
+    // Restore search focus + caret if the user was typing.
+    if (wasSearchFocused) {
+      const inp = root.querySelector('input[data-sb-search]');
+      if (inp) {
+        inp.focus();
+        try { inp.setSelectionRange(searchCaret, searchCaret); }
+        catch (e) { /* ignore */ }
+      }
+    }
+  }
+
+  function wireSidebarClicks(root) {
+    // Item click → switch selection. The data-sb-action attribute
+    // distinguishes all / project / needsYou / today.
+    root.querySelectorAll('[data-sb-action]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        const action = el.getAttribute('data-sb-action');
+        let next;
+        if (action === 'project') {
+          next = { kind: 'project', cwd: el.getAttribute('data-cwd') || '' };
+        } else if (action === 'needsYou') {
+          next = { kind: 'needsYou', cwd: null };
+        } else if (action === 'today') {
+          next = { kind: 'today', cwd: null };
+        } else {
+          next = { kind: 'all', cwd: null };
+        }
+        // Click the active item again → reset to All (familiar
+        // affordance: clicking a selected filter clears it).
+        if (_selectionEquals(next, _sidebarSelection)) {
+          next = { kind: 'all', cwd: null };
+        }
+        setSidebarSelection(next);
+      });
+    });
+    // Search input — filter the visible project list as the user
+    // types. Cheap (in-memory filter, no Python round-trip).
+    const searchEl = root.querySelector('input[data-sb-search]');
+    if (searchEl) {
+      searchEl.addEventListener('input', function() {
+        _sidebarSearch = searchEl.value || '';
+        _writeSidebarSearch(_sidebarSearch);
+        // Re-render just the sidebar (cheap) — no need to rebuild
+        // the kanban since search is sidebar-local.
+        renderSidebar(_sidebarData);
+      });
+      // Escape clears the search.
+      searchEl.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Escape') {
+          ev.preventDefault();
+          _sidebarSearch = '';
+          _writeSidebarSearch('');
+          renderSidebar(_sidebarData);
+        }
+      });
+    }
+  }
+
+  function renderDrawer(drawer, visibleSids) {
+    const root = document.getElementById('drawer');
+    if (!root) return;
+    // The drawer count badge used to live inside the floating
+    // #drawer-toggle button; that toggle moved into the native
+    // top bar and Python computes its own count via the drawer
+    // payload (see floating.py:_update_tasks_btn_count). The
+    // local `countEl` lookups below are no-ops on a null ref —
+    // kept as null so the legacy code paths don't crash if/when
+    // someone re-introduces an in-doc count node later.
+    const countEl = null;
+
+    // Mirror the kanban's sidebar filter inside the drawer. When the
+    // user picks a project / Needs you / Today in the left rail, the
+    // drawer narrows to tasks from the same set of sessions. Done by
+    // dropping any task whose sessionId isn't in `visibleSids`, then
+    // dropping groups that empty out. `visibleSids === null` means
+    // the sidebar is on All-projects (no filter) — leave drawer as-is.
+    //
+    // Unattached tasks (sessionId == __unattached__:<cwd>) are NEVER
+    // in visibleSids — they don't live in `buckets`. Apply selection-
+    // specific rules to them directly:
+    //   • project   — keep when the row's groupCwd == sel.cwd. Picking
+    //                 a project should NEVER hide its parked todos.
+    //   • needsYou  — drop. Unattached rows can't "need" anything by
+    //                 session-bucket definition; surfacing them under
+    //                 "Needs you" would dilute the alert.
+    //   • today     — keep. The user just authored these recently;
+    //                 surfacing them under "Today" matches intent.
+    //
+    // The cache (`_drawerData`) keeps the UNFILTERED copy so the
+    // session pickers (create + reattach forms) always show every
+    // session in a project, even ones filtered out of the current
+    // view.
+    _drawerData = drawer || null;
+    if (drawer && visibleSids instanceof Set) {
+      const sel = _sidebarSelection || { kind: 'all', cwd: null };
+      const keepUnattached = function(_t, groupCwd) {
+        if (sel.kind === 'project') {
+          return (groupCwd || '') === (sel.cwd || '');
+        }
+        if (sel.kind === 'today')    return true;
+        if (sel.kind === 'needsYou') return false;
+        return true;  // fallback (shouldn't reach — sel.kind=='all' bypasses this branch)
+      };
+      const filteredGroups = [];
+      (drawer.groups || []).forEach(function(g) {
+        const tasks = (g.tasks || []).filter(function(t) {
+          if (t.unattached) return keepUnattached(t, g.cwd);
+          return visibleSids.has(t.sessionId);
+        });
+        if (tasks.length > 0) {
+          filteredGroups.push(Object.assign({}, g, { tasks: tasks }));
+        }
+      });
+      drawer = { groups: filteredGroups };
+    }
+    // Capture which input was focused so a 5s refresh doesn't yank
+    // focus out of the user's typing inside the drawer.
+    const activeEl = document.activeElement;
+    let focusCwd = null, focusCaret = 0;
+    if (activeEl && typeof activeEl.matches === 'function'
+        && activeEl.matches('input[data-drawer-add-input]')) {
+      focusCwd = activeEl.getAttribute('data-cwd');
+      focusCaret = activeEl.selectionStart || 0;
+    }
+    if (!drawer || !Array.isArray(drawer.groups) || drawer.groups.length === 0) {
+      root.innerHTML =
+        '<div class="drawer-head"><span>Tasks</span><span class="total">0</span></div>'
+        + '<div class="drawer-empty">No tasks yet across any open session.<br><br>'
+        + 'Click "+ add task" on any session card to start.</div>';
+      if (countEl) countEl.textContent = '';
+      return;
+    }
+    let total = 0, totalOpen = 0;
+    drawer.groups.forEach(function(g) {
+      (g.tasks || []).forEach(function(t) {
+        total++;
+        if (t.status === 'open') totalOpen++;
+      });
+    });
+    if (countEl) countEl.textContent = totalOpen > 0 ? String(totalOpen) : '';
+
+    const html = [];
+    html.push(
+      '<div class="drawer-head">'
+      + '<span>Tasks by project</span>'
+      + '<span class="total">' + totalOpen + ' open / ' + total + '</span>'
+      + '</div>'
+    );
+
+    drawer.groups.forEach(function(g) {
+      const color = esc(g.color || 'purple');
+      const label = esc(g.label || '(unnamed)');
+      const groupCwd = g.cwd || '';
+      const sessions = Array.isArray(g.sessions) ? g.sessions : [];
+      const tasks = Array.isArray(g.tasks) ? g.tasks : [];
+      const openCount = tasks.filter(function(t) { return t.status === 'open'; }).length;
+      html.push('<div class="drawer-group" data-cwd="' + esc(groupCwd) + '">');
+      html.push(
+        '<div class="drawer-group-header">'
+        + '<span class="pdot ' + color + '"></span>'
+        + '<span class="name">' + label + '</span>'
+        + '<span class="ct">' + openCount + ' open</span>'
+        + '</div>'
+      );
+      // Split tasks into open + done so we can render done behind a
+      // collapsible pill at the bottom of the group. Open tasks
+      // always show. Done tasks collapse by default — clicking the
+      // "▸ ● N done" pill reveals them; click again re-collapses.
+      // Mirrors the per-card behavior in renderTasksBlock so the
+      // two surfaces feel consistent.
+      const openTasks = tasks.filter(function(t) { return t.status !== 'done'; });
+      const doneTasks = tasks.filter(function(t) { return t.status === 'done'; });
+      const renderTaskRow = function(t) {
+        const cls = (t.status === 'done' ? 'done' : 'open') + ' ' + color;
+        const glyph = t.status === 'done' ? '●' : '○';
+        const text = esc(t.content || '');
+        const sess = esc(t.sessionTitle || '');
+        const tid = esc(t.id || '');
+        // Reorder + delete eligibility — mirrors the per-card rules:
+        // only OPEN, USER-AUTHORED tasks (or APPROVED suggestions)
+        // get these affordances. Done tasks are immutable from the
+        // drawer (toggle them back to open via the per-card glyph
+        // if you want to re-edit), and unapproved suggestions still
+        // need the ✓/✗ flow before they become reorderable.
+        const isUserTask = t.source !== 'suggested' || t.approved;
+        const isReorderable = isUserTask && t.status === 'open';
+        const isDeletable = isUserTask;
+        const isUnattached = !!t.unattached;
+        // Sub-line label: attached → "↗ <session title>" (click to
+        // reattach). Unattached → "(unattached) ↗ attach" (same
+        // picker, but the move-to operation goes pseudo → real). The
+        // [data-action="reattach"] handler is shared so both flows
+        // route through openSessionPicker → taskAttachSession.
+        let subLine = '';
+        if (isUnattached) {
+          subLine = '<div class="sess unattached" data-action="reattach">'
+                  + '<span class="unattached-tag">(unattached)</span>'
+                  + ' <span class="attach-cta">↗ attach</span>'
+                  + '</div>';
+        } else if (sess) {
+          subLine = '<div class="sess" data-action="reattach">↗ ' + sess + '</div>';
+        }
+        // draggable="false" on each interactive child keeps the
+        // row's draggable="true" from making them grab-cursor
+        // shadowed. Without this, clicking the controls in a
+        // reorderable row can be swallowed by a drag start.
+        return ''
+          + '<div class="drawer-task ' + cls
+            + (isReorderable ? ' reorderable' : '')
+            + (isUnattached ? ' unattached' : '') + '"'
+            + ' data-task-id="' + tid + '"'
+            + ' data-session-id="' + esc(t.sessionId || '') + '"'
+            + ' data-cwd="' + esc(groupCwd) + '"'
+            + (isReorderable ? ' draggable="true"' : '')
+            + '>'
+          + '<div class="row">'
+          +   '<span class="glyph"'
+          +     (isReorderable ? ' draggable="false"' : '')
+          +   '>' + glyph + '</span>'
+          +   '<span class="text">' + text + '</span>'
+          +   (isDeletable
+              ? '<span class="drawer-ctrls" draggable="false">'
+                + '<span class="ctrl tcopy" data-action="drawer-task-copy"'
+                  + ' data-task-id="' + tid + '" title="Copy prompt" draggable="false">📋</span>'
+                + '<span class="ctrl tstart" data-action="drawer-task-start"'
+                  + ' data-task-id="' + tid + '" title="Start in this folder" draggable="false">▶</span>'
+                + '<span class="ctrl tdelete" data-action="drawer-task-delete"'
+                  + ' data-task-id="' + tid + '" title="Delete" draggable="false">×</span>'
+                + '</span>'
+              : '')
+          + '</div>'
+          + subLine
+          + '</div>';
+      };
+
+      // Open tasks always render — these are the "active" rows.
+      openTasks.forEach(function(t) { html.push(renderTaskRow(t)); });
+
+      // Done tasks — collapsed by default behind a single pill.
+      // Click "▸ ● N done" to reveal; click "▾ hide N done" to fold
+      // back. Per-group state lives in drawerDoneRevealed (keyed
+      // by cwd). When there are zero done tasks the pill is omitted
+      // entirely so we don't leave a dangling "0 done" line.
+      if (doneTasks.length > 0) {
+        const revealed = drawerDoneRevealed.has(groupCwd);
+        if (revealed) {
+          html.push(
+            '<div class="drawer-done-toggle revealed"'
+            + ' data-action="drawer-toggle-done"'
+            + ' data-cwd="' + esc(groupCwd) + '"'
+            + ' title="Hide completed tasks">'
+            + '<span class="chev">▾</span>'
+            + '<span>hide ' + doneTasks.length + ' done</span>'
+            + '</div>'
+          );
+          doneTasks.forEach(function(t) { html.push(renderTaskRow(t)); });
+        } else {
+          html.push(
+            '<div class="drawer-done-toggle"'
+            + ' data-action="drawer-toggle-done"'
+            + ' data-cwd="' + esc(groupCwd) + '"'
+            + ' title="Show completed tasks">'
+            + '<span class="chev">▸</span>'
+            + '<span class="dot">●</span>'
+            + '<span>' + doneTasks.length + ' done</span>'
+            + '</div>'
+          );
+        }
+      }
+
+      // Add-task affordance / form for this group. Tasks created
+      // here are UNATTACHED by default — the user types content +
+      // hits Enter and the task lands in the project's pseudo-
+      // session bucket (__unattached__:<cwd>). They later attach
+      // it to a real session by clicking "↗ attach" on the row.
+      // We no longer gate on `sessions.length > 0` because the
+      // drawer can host pure-unattached groups (no live sessions
+      // in this cwd, but pending todos exist).
+      {
+        const isOpen = _drawerAddCwd === groupCwd;
+        if (isOpen) {
+          const draft = _drawerAddDrafts.get(groupCwd) || {};
+          const draftText = esc(draft.content || '');
+          html.push(
+            '<div class="drawer-add-form">'
+            + '<input type="text" placeholder="What needs to happen?"'
+            + ' data-drawer-add-input data-cwd="' + esc(groupCwd) + '"'
+            + ' value="' + draftText + '" />'
+            + '<div class="hint">Enter to save · Esc to cancel'
+            +   ' · attach later via <span class="hint-cta">↗ attach</span>'
+            + '</div>'
+            + '</div>'
+          );
+        } else {
+          html.push(
+            '<div class="drawer-add-link" data-action="drawer-add-open"'
+            + ' data-cwd="' + esc(groupCwd) + '">+ add task</div>'
+          );
+        }
+      }
+      html.push('</div>');
+    });
+    root.innerHTML = html.join('');
+    wireDrawerClicks(root);
+
+    // Restore focus into the open add-input if it lost it across
+    // the refresh (e.g., user was typing when the 5s tick fired).
+    if (focusCwd) {
+      const inp = root.querySelector(
+        'input[data-drawer-add-input][data-cwd="' + cssEscape(focusCwd) + '"]'
+      );
+      if (inp) {
+        inp.focus();
+        try { inp.setSelectionRange(focusCaret, focusCaret); }
+        catch (e) { /* ok */ }
+      }
+    }
+  }
+
+  // Wire every interactive element inside the drawer. Called on every
+  // renderDrawer() — the drawer's contents are wholesale-replaced.
+  function wireDrawerClicks(root) {
+    if (!root) return;
+
+    // Task row click → resume the host session (but NOT when the
+    // click landed on the session label, which has its own handler).
+    root.querySelectorAll('.drawer-task').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        if (ev.target.closest('[data-action]')) return;
+        const sid = el.dataset.sessionId;
+        if (!sid) return;
+        send('resume', { sessionId: sid, cwd: '' });
+      });
+    });
+
+    // Session label (the "↗ session" sub-line) → open reattach picker.
+    root.querySelectorAll('[data-action="reattach"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const taskEl = el.closest('.drawer-task');
+        if (!taskEl) return;
+        const cwd = taskEl.dataset.cwd || '';
+        const currentSid = taskEl.dataset.sessionId || '';
+        const taskId = taskEl.dataset.taskId || '';
+        openSessionPicker(el, cwd, currentSid, function(newSid) {
+          if (!newSid || newSid === currentSid) return;
+          send('taskAttachSession', {
+            sessionId: currentSid,       // task's CURRENT session
+            taskId: taskId,
+            newSessionId: newSid,
+          });
+        });
+      });
+    });
+
+    // "▸ ● N done" / "▾ hide N done" → toggle the group's done
+    // tasks between collapsed (pill only) and revealed (pill +
+    // rows). Per-group state lives in drawerDoneRevealed; the
+    // re-render goes through renderDrawer with the cached
+    // _drawerData so we don't need a Python round-trip.
+    root.querySelectorAll('[data-action="drawer-toggle-done"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const cwd = el.getAttribute('data-cwd') || '';
+        if (drawerDoneRevealed.has(cwd)) drawerDoneRevealed.delete(cwd);
+        else drawerDoneRevealed.add(cwd);
+        renderDrawer(_drawerData);
+      });
+    });
+
+    // × delete button → drop the user-authored task from disk via
+    // the same taskDelete bridge action the per-card × uses. The
+    // resume-click handler above already short-circuits when the
+    // event target sits inside a [data-action] element, so we
+    // don't accidentally open the session on the way out.
+    root.querySelectorAll('[data-action="drawer-task-delete"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const taskEl = el.closest('.drawer-task');
+        if (!taskEl) return;
+        const sid = taskEl.dataset.sessionId || '';
+        const tid = taskEl.dataset.taskId || '';
+        if (!sid || !tid) return;
+        send('taskDelete', { sessionId: sid, taskId: tid });
+      });
+    });
+
+    // 📋 copy task content → clipboard. Source-of-truth for the
+    // task text is the cached _drawerData (the unfiltered Python
+    // payload) so we read it from there rather than scraping the
+    // DOM's already-escaped innerHTML.
+    root.querySelectorAll('[data-action="drawer-task-copy"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const taskEl = el.closest('.drawer-task');
+        if (!taskEl) return;
+        const tid = taskEl.dataset.taskId || '';
+        if (!tid || !_drawerData) return;
+        let found = null;
+        (_drawerData.groups || []).some(function(g) {
+          return (g.tasks || []).some(function(t) {
+            if (t.id === tid) { found = t; return true; }
+            return false;
+          });
+        });
+        if (found) copyTaskPrompt(found.content || '');
+      });
+    });
+
+    // ▶ start in this folder. Group's cwd → modal → Python
+    // spawns Terminal at that path running claude <prompt>.
+    root.querySelectorAll('[data-action="drawer-task-start"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const taskEl = el.closest('.drawer-task');
+        if (!taskEl) return;
+        const tid = taskEl.dataset.taskId || '';
+        const cwd = taskEl.dataset.cwd || '';
+        if (!tid || !_drawerData) return;
+        let found = null;
+        (_drawerData.groups || []).some(function(g) {
+          return (g.tasks || []).some(function(t) {
+            if (t.id === tid) { found = t; return true; }
+            return false;
+          });
+        });
+        if (found) openTaskStartModal(found.content || '', cwd);
+      });
+    });
+
+    // Drag-to-reorder. Restricted to same-session targets — the
+    // backend taskReorder API rewrites positions within ONE
+    // session, so cross-session drops are rejected (the user can
+    // already reattach across sessions via the ↗ affordance).
+    // Pattern mirrors the per-card .task-row.reorderable wiring.
+    root.querySelectorAll('.drawer-task.reorderable').forEach(function(rowEl) {
+      rowEl.addEventListener('dragstart', function(ev) {
+        if (!ev.dataTransfer) return;
+        ev.dataTransfer.effectAllowed = 'move';
+        try { ev.dataTransfer.setData('text/plain', rowEl.dataset.taskId || ''); }
+        catch (e) { /* some browsers throw on setData here */ }
+        rowEl.classList.add('dragging');
+        document.body.classList.add('dragging-task');
+      });
+      rowEl.addEventListener('dragend', function() {
+        // Global cleanup — a 5s refresh during the drag could
+        // detach the original rowEl and re-emit the .dragging
+        // class on a fresh element; sweep all states defensively.
+        document.querySelectorAll(
+          '.drawer-task.dragging, .drawer-task.drag-over-before,'
+          + ' .drawer-task.drag-over-after, .drawer-task.drag-reject'
+        ).forEach(function(el) {
+          el.classList.remove(
+            'dragging', 'drag-over-before', 'drag-over-after', 'drag-reject');
+        });
+        document.body.classList.remove('dragging-task');
+      });
+    });
+
+    // Drop targets — same-session reorderable rows. Cross-session
+    // rows get a muted red rejection hint instead of an insertion
+    // line so the user knows where the limit is.
+    root.querySelectorAll('.drawer-task.reorderable').forEach(function(target) {
+      target.addEventListener('dragover', function(ev) {
+        const dragging = root.querySelector('.drawer-task.dragging');
+        if (!dragging || dragging === target) return;
+        const sameSession = (dragging.dataset.sessionId || '')
+          === (target.dataset.sessionId || '');
+        if (!sameSession) {
+          // Disallow the drop but still preventDefault so we get
+          // dragleave events to clear the rejection hint.
+          ev.preventDefault();
+          if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'none';
+          target.classList.add('drag-reject');
+          target.classList.remove('drag-over-before', 'drag-over-after');
+          return;
+        }
+        ev.preventDefault();  // allow drop
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
+        const rect = target.getBoundingClientRect();
+        const isBefore = (ev.clientY - rect.top) < (rect.height / 2);
+        target.classList.toggle('drag-over-before', isBefore);
+        target.classList.toggle('drag-over-after', !isBefore);
+        target.classList.remove('drag-reject');
+      });
+      target.addEventListener('dragleave', function() {
+        target.classList.remove(
+          'drag-over-before', 'drag-over-after', 'drag-reject');
+      });
+      target.addEventListener('drop', function(ev) {
+        const dragging = root.querySelector('.drawer-task.dragging');
+        if (!dragging || dragging === target) return;
+        const sid = dragging.dataset.sessionId || '';
+        if (!sid || sid !== (target.dataset.sessionId || '')) {
+          // Cross-session drop — silently reject. The drag-reject
+          // class clears via dragend's sweep.
+          target.classList.remove('drag-reject');
+          return;
+        }
+        ev.preventDefault();
+        const rect = target.getBoundingClientRect();
+        const isBefore = (ev.clientY - rect.top) < (rect.height / 2);
+        // Optimistic move in the DOM — the Python refresh
+        // (~100ms later) confirms the order from disk.
+        if (isBefore) {
+          target.parentNode.insertBefore(dragging, target);
+        } else {
+          target.parentNode.insertBefore(dragging, target.nextSibling);
+        }
+        target.classList.remove(
+          'drag-over-before', 'drag-over-after', 'drag-reject');
+        // Collect the new order of ALL same-session reorderable
+        // rows currently in the drawer. Done rows / cross-session
+        // rows aren't in this set so they don't pollute the order.
+        const orderedIds = Array.from(
+          root.querySelectorAll(
+            '.drawer-task.reorderable[data-session-id="' + cssEscape(sid) + '"]'
+          )
+        ).map(function(el) { return el.dataset.taskId; }).filter(Boolean);
+        if (orderedIds.length < 2) return;
+        send('taskReorder', { sessionId: sid, orderedIds: orderedIds });
+      });
+    });
+
+    // "+ add task" link → expand into the add-form.
+    root.querySelectorAll('[data-action="drawer-add-open"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const cwd = el.dataset.cwd || '';
+        _drawerAddCwd = cwd;
+        // Pre-seed the draft with default session = first in group.
+        if (!_drawerAddDrafts.has(cwd)) {
+          const g = (_drawerData && _drawerData.groups || []).find(function(x) { return x.cwd === cwd; });
+          const firstSid = g && g.sessions && g.sessions[0] && g.sessions[0].id || '';
+          _drawerAddDrafts.set(cwd, { content: '', sessionId: firstSid });
+        }
+        renderDrawer(_drawerData);
+        // Focus the input.
+        const inp = root.querySelector(
+          'input[data-drawer-add-input][data-cwd="' + cssEscape(cwd) + '"]'
+        );
+        if (inp) inp.focus();
+      });
+    });
+
+    // The add-form input — Enter saves, Esc cancels, input tracks
+    // draft. Tasks created here are UNATTACHED by default: the
+    // taskCreateUnattached bridge action stores them under the
+    // project's pseudo-session id so the user can attach later via
+    // the per-row ↗ attach affordance.
+    root.querySelectorAll('input[data-drawer-add-input]').forEach(function(inp) {
+      const cwd = inp.getAttribute('data-cwd') || '';
+      inp.addEventListener('input', function() {
+        const draft = _drawerAddDrafts.get(cwd) || { content: '' };
+        draft.content = inp.value;
+        _drawerAddDrafts.set(cwd, draft);
+      });
+      inp.addEventListener('keydown', function(ev) {
+        ev.stopPropagation();
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          const text = (inp.value || '').trim();
+          if (!text) return;
+          send('taskCreateUnattached', { cwd: cwd, content: text });
+          // Reset state. The Python refresh that follows will close
+          // the form by re-rendering with _drawerAddCwd null.
+          _drawerAddCwd = null;
+          _drawerAddDrafts.delete(cwd);
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          _drawerAddCwd = null;
+          _drawerAddDrafts.delete(cwd);
+          renderDrawer(_drawerData);
+        }
+      });
+      inp.addEventListener('click', function(ev) { ev.stopPropagation(); });
+    });
+
+    // Legacy add-form session picker — kept as a no-op safety net
+    // in case any cached payload still contains pick-chip nodes
+    // mid-rollout. The new flow has no picker chip; tasks created
+    // in the drawer go unattached and are attached afterward.
+    root.querySelectorAll('[data-action="drawer-pick-session"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const cwd = el.dataset.cwd || '';
+        const currentSid = el.dataset.sessionId || '';
+        openSessionPicker(el, cwd, currentSid, function(newSid) {
+          if (!newSid) return;
+          const draft = _drawerAddDrafts.get(cwd) || { content: '', sessionId: '' };
+          draft.sessionId = newSid;
+          _drawerAddDrafts.set(cwd, draft);
+          renderDrawer(_drawerData);
+        });
+      });
+    });
+  }
+
+  // Floating session-picker popover. Lists sessions in the given
+  // group (by cwd) so the user can pick a different one. The
+  // `onPick` callback receives the chosen session id. Click outside
+  // to dismiss.
+  let _activePicker = null;
+  function openSessionPicker(anchorEl, cwd, currentSid, onPick) {
+    if (_activePicker) {
+      _activePicker.remove();
+      _activePicker = null;
+    }
+    const group = (_drawerData && _drawerData.groups || []).find(function(g) { return g.cwd === cwd; });
+    const sessions = (group && group.sessions) || [];
+
+    const pop = document.createElement('div');
+    pop.className = 'session-picker-popover';
+    pop.innerHTML = '<div class="session-picker-head">Sessions in this project</div>'
+      + (sessions.length === 0
+          ? '<div class="session-picker-empty">No sessions in this project.</div>'
+          : sessions.map(function(s) {
+              const isCurrent = s.id === currentSid;
+              const glyph =
+                s.bucket === 'working' ? '◐' :
+                s.bucket === 'ready'   ? '●' : '○';
+              return '<div class="session-picker-item bucket-' + esc(s.bucket || 'dormant')
+                + (isCurrent ? ' current' : '') + '" data-sid="' + esc(s.id || '') + '">'
+                + '<span class="sdot">' + glyph + '</span>'
+                + '<span class="stitle">' + esc(s.title || '') + '</span>'
+                + (s.phase ? '<span class="sphase">' + esc(s.phase) + '</span>' : '')
+                + (isCurrent ? '<span class="current-tag">CURRENT</span>' : '')
+                + '</div>';
+            }).join(''));
+    document.body.appendChild(pop);
+    _activePicker = pop;
+
+    // Position relative to anchor. Default: below the anchor,
+    // right-aligned. Flip if it would overflow the viewport.
+    const ar = anchorEl.getBoundingClientRect();
+    pop.style.top = (ar.bottom + 4) + 'px';
+    pop.style.left = Math.max(8, ar.right - pop.offsetWidth) + 'px';
+    const pr = pop.getBoundingClientRect();
+    if (pr.right > window.innerWidth - 4) {
+      pop.style.left = Math.max(8, window.innerWidth - pr.width - 8) + 'px';
+    }
+    if (pr.bottom > window.innerHeight - 4) {
+      pop.style.top = Math.max(4, ar.top - pr.height - 4) + 'px';
+    }
+
+    pop.querySelectorAll('.session-picker-item').forEach(function(item) {
+      item.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const sid = item.dataset.sid || '';
+        if (_activePicker) { _activePicker.remove(); _activePicker = null; }
+        onPick(sid);
+      });
+    });
+
+    // Dismiss on outside click. Defer one tick so the same click
+    // that opened the picker doesn't immediately close it.
+    setTimeout(function() {
+      const dismissOnce = function(ev) {
+        if (!pop.contains(ev.target)) {
+          if (_activePicker) { _activePicker.remove(); _activePicker = null; }
+          document.removeEventListener('click', dismissOnce, true);
+        }
+      };
+      document.addEventListener('click', dismissOnce, true);
+    }, 0);
+  }
+
+  // ===========================================================
+  // Per-task: copy prompt + start-in-folder modal.
+  // -----------------------------------------------------------
+  // Both affordances live on every user-authored task row (per-
+  // card + drawer). Copy writes the task text to the clipboard
+  // via navigator.clipboard with a Python pbcopy fallback. Start
+  // opens the modal below, pre-filled with the task text; on
+  // confirm we POST {prompt, cwd} to Python which spawns a new
+  // Terminal at that folder running `claude <prompt>`.
+  // ===========================================================
+  function copyTaskPrompt(text) {
+    if (!text) return;
+    // Try the modern Clipboard API first. WKWebView may consider
+    // itself a non-secure context and reject; fall back to Python
+    // pbcopy via the bridge so the action always works.
+    let usedModern = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(function() {
+          // Promise rejection — fall through to bridge.
+          send('taskCopy', { content: text });
+        });
+        usedModern = true;
+      }
+    } catch (e) { /* permission / API missing */ }
+    if (!usedModern) send('taskCopy', { content: text });
+  }
+
+  // Friendlier folder display: collapse $HOME to ~ when present,
+  // then keep only the last 2 path components so the modal head
+  // stays scannable for deep paths like "~/code/.../app".
+  function shortFolder(cwd) {
+    if (!cwd) return '~';
+    const parts = cwd.split('/').filter(Boolean);
+    if (parts.length <= 2) return cwd || '~';
+    return '…/' + parts.slice(-2).join('/');
+  }
+
+  let _tsmCwd = '';            // captured at open time
+  function openTaskStartModal(prompt, cwd) {
+    const modal = document.getElementById('task-start-modal');
+    const folderEl = document.getElementById('tsm-folder');
+    const promptEl = document.getElementById('tsm-prompt');
+    if (!modal || !folderEl || !promptEl) return;
+    _tsmCwd = cwd || '';
+    folderEl.textContent = shortFolder(cwd);
+    promptEl.value = prompt || '';
+    modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+    // Focus + select-all so the user can either keep the task
+    // text verbatim or replace it with one keystroke.
+    setTimeout(function() {
+      promptEl.focus();
+      try { promptEl.select(); } catch (e) { /* ignore */ }
+    }, 0);
+  }
+  function closeTaskStartModal() {
+    const modal = document.getElementById('task-start-modal');
+    if (!modal) return;
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+    _tsmCwd = '';
+  }
+  function confirmTaskStart() {
+    const promptEl = document.getElementById('tsm-prompt');
+    if (!promptEl) return;
+    const text = (promptEl.value || '').trim();
+    if (!text) return;
+    // Send to Python — it spawns Terminal + closes the popover.
+    send('taskStart', { prompt: text, cwd: _tsmCwd });
+    closeTaskStartModal();
+  }
+  // Wire modal controls once at script load.
+  document.addEventListener('DOMContentLoaded', function() {
+    const cancelBtn = document.getElementById('tsm-cancel');
+    const confirmBtn = document.getElementById('tsm-confirm');
+    const promptEl = document.getElementById('tsm-prompt');
+    const modal = document.getElementById('task-start-modal');
+    if (cancelBtn) cancelBtn.addEventListener('click', closeTaskStartModal);
+    if (confirmBtn) confirmBtn.addEventListener('click', confirmTaskStart);
+    if (modal) {
+      // Click on the dim backdrop (but not the card) cancels.
+      modal.addEventListener('click', function(ev) {
+        if (ev.target === modal) closeTaskStartModal();
+      });
+    }
+    if (promptEl) {
+      promptEl.addEventListener('keydown', function(ev) {
+        // Cmd+Enter (or Ctrl+Enter) = confirm. Plain Enter is left
+        // alone so multi-line prompts work naturally.
+        if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) {
+          ev.preventDefault();
+          confirmTaskStart();
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          closeTaskStartModal();
+        }
+      });
+    }
+    // Esc handler at document level so users can cancel even when
+    // focus has drifted off the textarea.
+    document.addEventListener('keydown', function(ev) {
+      if (ev.key === 'Escape') {
+        const m = document.getElementById('task-start-modal');
+        if (m && m.classList.contains('open')) closeTaskStartModal();
+      }
+    });
+  }, { once: true });
 
   // Escape any HTML in user-supplied strings before inserting via
   // innerHTML. We use textContent where possible but composite rows
@@ -948,9 +2717,29 @@
         rowsHtml += '<div class="sugg-divider"><span>suggested by Haiku</span></div>';
         rowsHtml += suggested.map(taskRowHtml).join('');
       }
-      // Recently-done (cap at 2 for noise control)
-      const recentDone = doneTasks.slice(0, 2);
-      rowsHtml += recentDone.map(taskRowHtml).join('');
+      // Done tasks render behind a collapsible pill — the user
+      // wants completed work out of the way by default, but still
+      // reachable in one click. Default state = collapsed (sid NOT
+      // in doneRevealed). Clicking the pill reveals all done rows
+      // and flips the affordance to a "▾ hide N done" toggle.
+      if (doneTasks.length > 0) {
+        const revealed = doneRevealed.has(sid);
+        if (revealed) {
+          rowsHtml += '<div class="done-toggle revealed" data-toggle-done="1" title="Hide completed tasks">'
+            + '<span class="chev">▾</span>'
+            + '<span>hide ' + doneTasks.length + ' done</span>'
+            + '</div>';
+          // Show ALL done rows when revealed — no slice cap. The
+          // user explicitly asked to see them; trust the click.
+          rowsHtml += doneTasks.map(taskRowHtml).join('');
+        } else {
+          rowsHtml += '<div class="done-toggle" data-toggle-done="1" title="Show completed tasks">'
+            + '<span class="chev">▸</span>'
+            + '<span class="dot">●</span>'
+            + '<span>' + doneTasks.length + ' done</span>'
+            + '</div>';
+        }
+      }
     } else {
       // Collapsed: prioritize open user tasks first, then suggestions
       // if we have room. Done tasks never appear in preview.
@@ -1034,26 +2823,44 @@
         + (isEditable ? ' data-action="task-edit-begin" data-task-id="' + tid + '"' : '')
         + '>' + esc(t.content || '') + '</span>';
 
-    // Trailing controls: suggestions get ✓/✗; user tasks get ×.
-    // Hide them while editing so the input has the full row width.
+    // Trailing controls: suggestions get ✓/✗; user tasks get
+    // [copy][start][×]. Copy writes the task text to the clipboard;
+    // start opens the prompt-edit modal then launches `claude` in
+    // the task's folder. All three fade in on row hover so the
+    // resting state stays calm. Hidden while editing so the input
+    // has the full row width.
+    // draggable="false" on each control + the wrapper keeps the
+    // row's draggable="true" from inheriting onto them, so a
+    // mousedown over a button doesn't show the grab cursor and
+    // doesn't accidentally start a drag instead of clicking.
     const tail = inEdit ? '' : (isSuggested
-      ? '<span class="ctrls">'
-        + '<span class="ctrl approve" data-action="task-approve" data-task-id="' + tid + '" title="Approve">✓</span>'
-        + '<span class="ctrl reject"  data-action="task-reject"  data-task-id="' + tid + '" title="Reject">✗</span>'
+      ? '<span class="ctrls" draggable="false">'
+        + '<span class="ctrl approve" data-action="task-approve" data-task-id="' + tid + '" title="Approve" draggable="false">✓</span>'
+        + '<span class="ctrl reject"  data-action="task-reject"  data-task-id="' + tid + '" title="Reject" draggable="false">✗</span>'
         + '</span>'
-      : '<span class="tdelete" data-action="task-delete" data-task-id="' + tid + '" title="Delete">×</span>');
+      : '<span class="ctrls user" draggable="false">'
+        + '<span class="ctrl tcopy"   data-action="task-copy"   data-task-id="' + tid + '" title="Copy prompt" draggable="false">📋</span>'
+        + '<span class="ctrl tstart"  data-action="task-start"  data-task-id="' + tid + '" title="Start in this folder" draggable="false">▶</span>'
+        + '<span class="ctrl tdelete" data-action="task-delete" data-task-id="' + tid + '" title="Delete" draggable="false">×</span>'
+        + '</span>');
     // Drag-to-reorder: only OPEN user-authored rows are draggable.
     // Done rows are sort-locked by completedAt; suggestions are
     // sort-locked by bucket. The draggable attribute is itself only
     // set when not in edit mode (a draggable input is confusing —
     // the browser would intercept text-selection drag for reorder).
     const isReorderable = isEditable && status === 'open' && !inEdit;
+    // `draggable="false"` on the glyph keeps a mousedown there from
+    // initiating a row drag — the click still toggles open/done.
+    // Without this the row's draggable="true" inherits, the OS shows
+    // the grab cursor over the glyph, and a slow click can get
+    // swallowed by a drag start.
     return '<div class="task-row ' + cls + (inEdit ? ' editing' : '')
       + (isReorderable ? ' reorderable' : '') + '"'
       + ' data-task-id="' + tid + '"'
       + (isReorderable ? ' draggable="true"' : '')
       + '>'
-      + '<span class="tglyph" data-action="task-toggle" data-task-id="' + tid + '">' + glyph + '</span>'
+      + '<span class="tglyph" data-action="task-toggle" data-task-id="' + tid + '"'
+      +   (isReorderable ? ' draggable="false"' : '') + '>' + glyph + '</span>'
       + textEl
       + tail
       + '</div>';
@@ -1114,12 +2921,21 @@
   function renderApp(data) {
     const app = document.getElementById('app');
     if (!app) return;
+    // Cache the latest payload for sidebar-triggered re-renders.
+    // Sidebar clicks need to rebuild the kanban with a new filter
+    // applied — they call renderApp(_lastData) after updating the
+    // selection. Set BEFORE the dedupe check so the cache is fresh
+    // even on a no-op render.
+    _lastData = data;
 
     // Dedupe identical payloads — skip the whole rebuild so cards
     // don't visually jump on quiet refresh ticks. Comparison cost is
     // O(payload size, ~5KB) which is dwarfed by the innerHTML +
     // wireClicks work it avoids. Stringify failures (circular refs,
     // unlikely from Python) fall through to render as before.
+    // NOTE: sidebar selection clicks bust this by setting
+    // `_lastPayloadJson = null` so the re-render fires even though
+    // the Python payload is bytes-identical.
     let payloadJson = null;
     try { payloadJson = JSON.stringify(data); } catch (_) {}
     if (payloadJson !== null && payloadJson === _lastPayloadJson) return;
@@ -1165,7 +2981,33 @@
     // can rebuild a single card without a fresh Python push.
     lastRows.clear();
 
-    const buckets = data.buckets || {};
+    // Render the left rail (Idea 2.α). Done BEFORE filtering the
+    // buckets so the rail always shows the unfiltered totals + per-
+    // project counts — clicking a project should not make the rail
+    // itself shrink. List mode hides the sidebar via CSS; we still
+    // call renderSidebar so it clears any stale content.
+    renderSidebar(data.sidebar);
+
+    // Apply the sidebar selection as a client-side filter to the
+    // bucket payload. The columns code below renders from the
+    // filtered view so counts + card lists reflect the user's pick.
+    const buckets = filterBuckets(data.buckets || {}, _sidebarSelection);
+
+    // Derive the set of sessionIds that survived the filter — passed
+    // to the drawer so its groups + tasks track the same view as the
+    // kanban. When the user picks a project, the drawer narrows to
+    // that project's tasks; when they pick Needs you / Today, the
+    // drawer narrows to tasks from sessions in those smart views.
+    // null = no filter (sidebar selection is All-projects).
+    let visibleSids = null;
+    if (_sidebarSelection && _sidebarSelection.kind !== 'all') {
+      visibleSids = new Set();
+      ['needs','working','ready','dormant'].forEach(function(key) {
+        (buckets[key] || []).forEach(function(r) {
+          if (r.sessionId) visibleSids.add(r.sessionId);
+        });
+      });
+    }
 
     // Compute the new card layout (which sessions in which columns).
     // If this matches what's currently in the DOM, we can do a per-
@@ -1252,6 +3094,13 @@
     }
     _lastShape = newShape;
 
+    // Refresh the right-side tasks drawer with the latest data.
+    // Cheap — drawer DOM is small; safe to do on every render.
+    // Second arg is the sidebar's visible-session-ids set so the
+    // drawer mirrors the kanban's filter; null when nothing is
+    // filtered (the All-projects default).
+    renderDrawer(data.drawer, visibleSids);
+
     // Garbage-collect stale per-card state: any session that's no
     // longer in the current payload (dormant promoted out of view,
     // session deleted on disk, etc.) shouldn't keep accumulating
@@ -1262,6 +3111,21 @@
     draftFocus.forEach(function(_v, sid) {
       if (!lastRows.has(sid)) draftFocus.delete(sid);
     });
+    doneRevealed.forEach(function(sid) {
+      if (!lastRows.has(sid)) doneRevealed.delete(sid);
+    });
+    // Same sweep for the drawer's per-cwd done-revealed Set. Cwds
+    // that no longer appear as a drawer group are stale; otherwise
+    // toggling done-collapse in a project that closes out leaves
+    // ghosts in this Set for the rest of the WKWebView's lifetime.
+    if (drawerDoneRevealed.size > 0) {
+      const liveCwds = new Set(
+        ((_drawerData && _drawerData.groups) || []).map(function(g) { return g.cwd || ''; })
+      );
+      drawerDoneRevealed.forEach(function(cwd) {
+        if (!liveCwds.has(cwd)) drawerDoneRevealed.delete(cwd);
+      });
+    }
 
     // Restore focus + caret if the user was typing into either of
     // the two input kinds (+ add-task or inline task edit) when the
@@ -1387,6 +3251,23 @@
         if (!sid) return;
         if (expandedCards.has(sid)) expandedCards.delete(sid);
         else expandedCards.add(sid);
+        rerenderOneCard(cardEl);
+      });
+    });
+
+    // "▸ ● N done" / "▾ hide N done" pill → toggle whether the
+    // done-task rows are visible inside this card. Distinct from
+    // expandedCards (which expands the WHOLE card); this only
+    // affects the done-tasks sub-block. List mode honors this too
+    // so the user can fold done work out of the way without losing
+    // the otherwise-uncapped task list.
+    cardEl.querySelectorAll('[data-toggle-done="1"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const sid = cardEl.dataset.session || '';
+        if (!sid) return;
+        if (doneRevealed.has(sid)) doneRevealed.delete(sid);
+        else doneRevealed.add(sid);
         rerenderOneCard(cardEl);
       });
     });
@@ -1640,6 +3521,32 @@
           sessionId: cardEl.dataset.session || '',
           taskId: tid,
         });
+      });
+    });
+
+    // 📋 copy → write task content to clipboard.
+    cardEl.querySelectorAll('[data-action="task-copy"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const tid = el.dataset.taskId;
+        if (!tid) return;
+        const row = lastRows.get(cardEl.dataset.session || '');
+        const t = row && (row.tasks || []).find(function(x) { return x.id === tid; });
+        if (!t) return;
+        copyTaskPrompt(t.content || '');
+      });
+    });
+
+    // ▶ start → open prompt-edit modal, then launch claude in cwd.
+    cardEl.querySelectorAll('[data-action="task-start"]').forEach(function(el) {
+      el.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        const tid = el.dataset.taskId;
+        if (!tid) return;
+        const row = lastRows.get(cardEl.dataset.session || '');
+        const t = row && (row.tasks || []).find(function(x) { return x.id === tid; });
+        if (!t) return;
+        openTaskStartModal(t.content || '', cardEl.dataset.cwd || '');
       });
     });
 

@@ -4,11 +4,41 @@ All notable changes to this project are documented here. Format roughly
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased — additions on top of 0.5.0
+## 0.6.0 — 2026-06-05
 
-These changes are on `main` but not yet tagged with a new version.
-Existing 0.5.0 installs pick them up on the next `git pull` (via
-`install.sh` or manually); no schema migration is required.
+Multi-feature release on top of 0.5.0. Schema is fully backward-
+compatible — existing `~/.claude-sessions-status-tasks.json` files
+load unchanged; no migration required. The popover gains a left
+project sidebar, a right tasks drawer, a unified top-bar pill
+control group, unattached tasks, per-task copy/start affordances,
+and a fix for the sub-agent dispatch mis-classification that put
+working sessions in NEEDS YOU.
+
+### Added — project sidebar (Idea 2.α)
+
+- **Slim project rail (left side).** Kanban mode now opens with a
+  200-px sidebar listing every project alongside the kanban columns.
+  Projects are derived from each session's `cwd` (basename = display
+  name, stable md5-hashed accent color from the six-color palette) —
+  the same derivation already used by the tasks drawer, so projects
+  show with consistent colors across both surfaces. Project items
+  show a session count, or an alert count (red) if any session in
+  that project is in NEEDS YOU.
+- **Smart views.** The rail's bottom section adds two cross-project
+  filters: *Needs you* (filters the kanban down to NEEDS YOU sessions
+  across every project) and *Today* (sessions touched in the last 24
+  hours). Both run as client-side filters — no Python round-trip —
+  so toggling them is instant.
+- **Project search.** A small input at the top of the rail filters
+  the visible project list as you type (substring, case-insensitive).
+  Esc clears the query. State persists in localStorage so the next
+  popover open remembers your last view + search.
+- **Sub-agent dispatch classification fix.** Sessions whose parent
+  assistant just dispatched a Task/Agent sub-agent and is waiting on
+  it no longer get pulled into NEEDS YOU by the "long structured
+  text → looks like a plan" heuristic. A new `Awaiting sub-agent`
+  phase routes those to the WORKING bucket directly, and stays
+  stable across the existing 60-second sub-agent mtime grace window.
 
 ### Added — task management
 

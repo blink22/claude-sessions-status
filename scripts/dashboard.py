@@ -931,6 +931,13 @@ def classify(state: str, phase_label: str) -> str:
     """Map (state, phase_label) → one of {needs, working, ready}.
     Dormant is NOT decided here — `is_dormant` overrides this once
     activity-age + process-liveness are known."""
+    # "Awaiting sub-agent" wins over "Maybe stuck": the parent
+    # transcript naturally goes silent for the duration of a long
+    # sub-agent run, so the stuck timer would otherwise flag every
+    # multi-minute delegation as NEEDS YOU. The parent isn't stuck —
+    # it's waiting on its child to return.
+    if phase_label == "Awaiting sub-agent":
+        return BUCKET_WORKING
     if state == "Maybe stuck":
         return BUCKET_NEEDS
     if phase_label in ("Asking you", "Proposing a plan"):
@@ -1035,16 +1042,43 @@ def infer_phase(meta: dict) -> tuple[str, str]:
     recent_tools: list[str] = list(meta.get("recentTools") or [])
     tool_set = set(recent_tools)
     text_lower = last_text.lower()
+    last_tools = meta.get("lastAssistantTools") or []
 
     # Pending AskUserQuestion / ExitPlanMode beats all other classifiers —
     # the assistant is genuinely waiting on the user, not mid-flight.
     if _pending_interactive_tool(meta):
-        last_tools = meta.get("lastAssistantTools") or []
         if "ExitPlanMode" in last_tools:
             return ("📋", "Proposing a plan")
         return ("❓", "Asking you")
 
     user_turn = (last_role == "assistant" and has_text)
+
+    # Sub-agent dispatch override — when the parent's recent tool window
+    # contains Task/Agent and the most recent assistant turn is trailing
+    # narrative text (not an explicit question to the user), the parent
+    # is in "fire and wait" mode. Its narration typically describes what
+    # the sub-agent will do (often with numbered steps), which the
+    # _looks_like_plan / question heuristics below would otherwise
+    # misread as "Proposing a plan" / "Asking you" and pull the session
+    # into NEEDS YOU. The parent isn't waiting on the user — it's
+    # waiting on its child.
+    #
+    # We use `recentTools` (windowed) rather than `lastAssistantTools`
+    # because the parent may dispatch the Task in one turn and then
+    # write follow-up narrative in a later turn before the tool_result
+    # returns; in that case `lastAssistantTools` is [] but `recentTools`
+    # still carries the Agent/Task signal.
+    #
+    # The question guard prevents over-promotion when the parent
+    # legitimately stops to ask after a previous sub-agent finished.
+    if user_turn and ("Task" in tool_set or "Agent" in tool_set):
+        stripped = last_text.rstrip()
+        is_real_question = (
+            stripped.endswith("?")
+            or any(p in text_lower[-300:] for p in _QUESTION_PHRASES)
+        )
+        if not is_real_question:
+            return ("⏳", "Awaiting sub-agent")
 
     if not user_turn:
         # ---- Claude is working: classify by activity ----
@@ -1083,6 +1117,8 @@ def next_action(phase_label: str, role: str | None, ago_seconds: float) -> str:
         return "Answer the question"
     if phase_label == "Proposing a plan":
         return "Read the plan and approve or adjust"
+    if phase_label == "Awaiting sub-agent":
+        return "Wait — sub-agent is on it"
     if phase_label == "Designing":
         return "Review the design output"
     if phase_label == "Coding":
@@ -1153,6 +1189,14 @@ def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> d
         state = "Working…"
         color = YELLOW
         hint = ""  # the agent listing carries the "what's happening" signal
+    # Align state with bucket when the parent dispatched a Task and the
+    # sub-agent has gone quiet (mtime > 60s). `classify` already routes
+    # the "Awaiting sub-agent" phase to WORKING; this keeps the visible
+    # state/color from contradicting that.
+    elif phase_label == "Awaiting sub-agent" and bucket == BUCKET_WORKING:
+        state = "Working…"
+        color = YELLOW
+        hint = ""
 
     return {
         "session": s,

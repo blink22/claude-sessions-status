@@ -71,6 +71,45 @@ _TASKS_PER_SESSION_MAX = 50
 # given there's exactly one writer process.
 _LOCK = threading.Lock()
 
+
+# ---------------- Unattached-task pseudo-session IDs ----------------
+# An "unattached" task is one the user created without picking a session
+# yet — they'll attach it later via the drawer's ↗ attach affordance.
+# Rather than introducing a parallel storage shape (which would require
+# a schema migration and a second set of CRUD functions), we map each
+# project's unattached bucket to a SYNTHETIC session-id of the form
+#     __unattached__:<cwd>
+# That id is never used by a real Claude session (Claude session ids
+# are UUIDs), so collisions are impossible, and every existing
+# tasks.py function (create_task, toggle_task, delete_task,
+# reorder_tasks, move_task_to_session) works against it unchanged.
+# The drawer renderer is the only consumer that has to know about the
+# prefix — to label rows as "(unattached)" and to enumerate pseudo-
+# sessions during its build pass.
+UNATTACHED_PREFIX = "__unattached__:"
+
+
+def is_unattached_sid(sid: str) -> bool:
+    """True iff ``sid`` is a pseudo-session-id for unattached tasks."""
+    return isinstance(sid, str) and sid.startswith(UNATTACHED_PREFIX)
+
+
+def unattached_sid_for_cwd(cwd: str) -> str:
+    """Return the pseudo-session-id used to store unattached tasks for
+    a given project (cwd). Empty cwd maps to the global "(no folder)"
+    bucket — the same bucket derive_project_label labels that way."""
+    if not isinstance(cwd, str):
+        cwd = ""
+    return UNATTACHED_PREFIX + cwd
+
+
+def cwd_for_unattached_sid(sid: str) -> str:
+    """Inverse of unattached_sid_for_cwd. Returns "" for a malformed id
+    (no-op so callers can blindly pass it on)."""
+    if not is_unattached_sid(sid):
+        return ""
+    return sid[len(UNATTACHED_PREFIX):]
+
 # In-memory cache keyed on file mtime, mirroring the existing
 # _load_seen() pattern in floating.py. Avoids re-reading + re-parsing
 # the JSON on every 5s poll when nothing has changed.
@@ -79,6 +118,40 @@ _cache: Optional[tuple] = None  # (mtime, data)
 # One-shot orphan-tmp sweep: runs on the first load_state() call per
 # process so we don't sweep on every refresh tick.
 _swept = False
+
+
+# ---------------- Project derivation (cwd-based, pre-projects-entity) ----------------
+
+# The six built-in project colors. Matches the palette used in the
+# design mockups + the planned schema-v3 ``project.color`` enum.
+# Color names (not hex) so kanban.html can map via its CSS vars.
+_PROJECT_COLORS: tuple[str, ...] = (
+    "purple", "teal", "orange", "yellow", "mint", "pink",
+)
+
+
+def derive_project_label(cwd: str) -> tuple[str, str]:
+    """Return ``(display_name, color_key)`` for a session's cwd.
+
+    This is the bridge from the current schema (no project entity —
+    every task is keyed by sessionId) to the future projects-entity
+    schema. For now we derive the project from the session's cwd:
+    the basename becomes the display name, and a deterministic hash
+    of the full cwd picks one of the 6 palette colors so the same
+    cwd always gets the same color across runs.
+
+    Returns ``("(no folder)", "purple")`` for empty / non-string cwd.
+
+    Uses md5 (not Python's built-in hash) because hash() is salted
+    per-process for security and would assign different colors on
+    each restart — confusing for the user."""
+    import hashlib  # local import: only used by this helper
+    if not isinstance(cwd, str) or not cwd:
+        return ("(no folder)", "purple")
+    name = os.path.basename(cwd.rstrip("/")) or cwd
+    digest = hashlib.md5(cwd.encode("utf-8")).hexdigest()
+    color = _PROJECT_COLORS[int(digest, 16) % len(_PROJECT_COLORS)]
+    return (name, color)
 
 
 # ---------------- IO helpers ----------------
@@ -384,6 +457,21 @@ def create_task(session_id: str, content: str) -> Optional[dict]:
         return task
 
 
+def create_unattached_task(cwd: str, content: str) -> Optional[dict]:
+    """Create a task that's not attached to any real session yet. The
+    task is stored under the project's pseudo-session-id
+    (``__unattached__:<cwd>``) so existing CRUD/persistence paths
+    work unchanged. The user attaches it to a real session later via
+    the drawer's ↗ attach affordance, which calls
+    ``move_task_to_session`` with this pseudo-sid as the source.
+
+    Returns the created task dict (same shape as ``create_task``) or
+    None on validation failure / persistence error. The task's
+    ``sessionId`` from the caller's POV is the pseudo-sid, which the
+    drawer treats as "(unattached)" visually."""
+    return create_task(unattached_sid_for_cwd(cwd), content)
+
+
 def _find_task(state: dict, session_id: str, task_id: str) -> Optional[dict]:
     entry = (state.get("sessions") or {}).get(session_id)
     if not isinstance(entry, dict):
@@ -487,6 +575,60 @@ def update_task(session_id: str, task_id: str, content: str) -> Optional[dict]:
         t["updatedAt"] = time.time()
         _save_state(state)
         return t
+
+
+def move_task_to_session(current_session_id: str, task_id: str,
+                          new_session_id: str) -> bool:
+    """Move a task from one session to another. Used by the drawer's
+    "change attachment" flow and (in future) by drag-to-attach
+    interactions. The task is identified by ``task_id`` — globally
+    unique random tokens — but we still take the caller-supplied
+    ``current_session_id`` so the search is O(1) per session bucket
+    rather than O(total tasks across all sessions).
+
+    Returns True on a successful move + write, False if:
+      - any id is empty
+      - the source session doesn't exist
+      - the task isn't in the source session
+      - the move is a no-op (current == new)
+
+    The task's identity (id, createdAt, content, status, etc.) is
+    preserved. Only its parent bucket changes. The ``position``
+    field is reset because position is scoped to its bucket — the
+    moved task goes to the end of the new session's task list."""
+    if not current_session_id or not task_id or not new_session_id:
+        return False
+    if current_session_id == new_session_id:
+        return False
+    with _LOCK:
+        state = load_state()
+        cur_entry = (state.get("sessions") or {}).get(current_session_id)
+        if not isinstance(cur_entry, dict):
+            return False
+        cur_tasks = cur_entry.get("tasks") or []
+        moved: Optional[dict] = None
+        remaining: list = []
+        for t in cur_tasks:
+            if moved is None and t.get("id") == task_id:
+                moved = t
+            else:
+                remaining.append(t)
+        if moved is None:
+            return False
+        cur_entry["tasks"] = remaining
+        # Reset position — destination's bucket has its own
+        # ordering; the moved task lands at the tail.
+        moved.pop("position", None)
+        # Add to the destination session, creating its entry if it
+        # didn't exist (rare — the new session would have to have no
+        # tasks yet — but defensive).
+        sessions = state.setdefault("sessions", {})
+        new_entry = sessions.setdefault(
+            new_session_id, _empty_session_entry(),
+        )
+        new_entry.setdefault("tasks", []).append(moved)
+        _save_state(state)
+        return True
 
 
 def reorder_tasks(session_id: str, ordered_ids: list[str]) -> bool:
