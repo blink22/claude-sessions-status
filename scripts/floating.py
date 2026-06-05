@@ -401,6 +401,93 @@ def _mark_sessions_read(session_epoch_pairs: list) -> None:
     _save_seen(seen)
 
 
+# ---------- Proactive NEEDS-YOU notifications ----------
+# Opt-in. When a session transitions into the NEEDS YOU bucket, the badge
+# can fire a one-shot macOS notification + subtle sound + a brief visual
+# pulse — turning the badge from "a thing I glance at" into "a thing that
+# tells me." Off by default; toggled from the badge's right-click menu.
+#
+# Transition detection reuses the same epoch-comparison idea as the
+# unread/seen machinery: we remember the lastTurnEpoch we last notified
+# about per session, and only fire when a *newer* turn lands a session in
+# NEEDS YOU. A session that simply sits in NEEDS YOU keeps the same epoch
+# tick after tick, so it never re-notifies — that's the debounce.
+NOTIFY_ENABLED_FILE = HOME / ".claude-sessions-status-notify"
+NOTIFY_STATE_FILE = HOME / ".claude-sessions-status-notify-state.json"
+_NOTIFY_GC_TTL_S = 30 * 86400.0  # 30 days — same horizon as seen GC
+# Slack to absorb millisecond epoch drift between ticks (matches the
+# 0.5s used by _is_session_unread).
+_NOTIFY_EPSILON_S = 0.5
+
+
+def _read_notify_enabled() -> bool:
+    """Whether proactive NEEDS-YOU notifications are on. Opt-in: defaults
+    to False so a fresh install is silent until the user asks for it."""
+    try:
+        v = NOTIFY_ENABLED_FILE.read_text(encoding="utf-8").strip().lower()
+        return v in ("1", "true", "yes", "on")
+    except OSError:
+        return False
+
+
+def _write_notify_enabled(value: bool) -> None:
+    _atomic_write_text(NOTIFY_ENABLED_FILE, "1" if value else "0")
+
+
+def _load_notify_state() -> dict:
+    """Map session-id -> {"epoch": lastNotifiedTurnEpoch, "at": wallclock}.
+    Persisted so a badge restart doesn't re-announce sessions we already
+    notified about."""
+    if not NOTIFY_STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(NOTIFY_STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_notify_state(state: dict) -> None:
+    cutoff = time.time() - _NOTIFY_GC_TTL_S
+    out: dict = {}
+    for sid, entry in state.items():
+        if not isinstance(entry, dict):
+            continue
+        at = entry.get("at")
+        if isinstance(at, (int, float)) and at >= cutoff:
+            out[sid] = entry
+    _atomic_write_text(
+        NOTIFY_STATE_FILE, json.dumps(out, indent=2, sort_keys=True))
+
+
+def _osa_quote(s: str) -> str:
+    """Quote a Python string as an AppleScript string literal."""
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _post_notification(title: str, body: str, *, subtitle: str = "",
+                       sound: bool = True) -> None:
+    """Fire a macOS Notification Center banner via osascript. Detached
+    (Popen, no wait) so it never blocks the badge's 5s refresh runloop."""
+    parts = [
+        "display notification", _osa_quote(body),
+        "with title", _osa_quote(title),
+    ]
+    if subtitle:
+        parts += ["subtitle", _osa_quote(subtitle)]
+    if sound:
+        # A soft, short system sound — present on every macOS install.
+        parts += ["sound name", _osa_quote("Tink")]
+    script = " ".join(parts)
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as e:  # noqa: BLE001
+        sys.stderr.write(f"[notify] osascript failed: {e!r}\n")
+
+
 # Badge — bento-tile layout: three independent rounded-square "tiles"
 # arranged horizontally with small gaps between them. Each tile is its
 # own NSVisualEffectView glass surface, giving each bucket equal visual
@@ -4029,6 +4116,7 @@ class BadgeController(NSObject):
     popover = objc.ivar("popover")
     timer = objc.ivar("timer")
     outside_click_monitor = objc.ivar("outside_click_monitor")  # NSEvent monitor
+    notify_seeded = objc.ivar("notify_seeded")  # bool — first-tick flood guard
 
     def initWithPanelMode_(self, panel_mode: str):
         self = objc.super(BadgeController, self).init()
@@ -4112,6 +4200,11 @@ class BadgeController(NSObject):
 
         # Install a tiny app menu so ⌘Q works.
         self._install_app_menu()
+
+        # First refresh seeds the notify baseline (records sessions already
+        # waiting at launch) without firing — so starting the badge while
+        # things are mid-NEEDS-YOU doesn't dump a burst of banners.
+        self.notify_seeded = False
 
         # Initial paint + timer.
         self.refresh_(None)
@@ -4210,10 +4303,26 @@ class BadgeController(NSObject):
             item.setState_(1 if style == current else 0)  # NSControlStateValueOn
             menu.addItem_(item)
         menu.addItem_(NSMenuItem.separatorItem())
+        # Opt-in proactive notifications when a session enters NEEDS YOU.
+        notify_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Notify on NEEDS YOU", "toggleNotify:", "")
+        notify_item.setTarget_(self)
+        notify_item.setState_(1 if _read_notify_enabled() else 0)
+        menu.addItem_(notify_item)
+        menu.addItem_(NSMenuItem.separatorItem())
         quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit", "terminate:", "q")
         menu.addItem_(quit_item)
         return menu
+
+    def toggleNotify_(self, _sender):
+        """Flip the proactive-notification opt-in. When turning ON, re-seed
+        the baseline so we start fresh from now (no banner for sessions that
+        were already waiting before the user opted in)."""
+        new_value = not _read_notify_enabled()
+        _write_notify_enabled(new_value)
+        if new_value:
+            self.notify_seeded = False
 
     def _install_app_menu(self):
         main = NSMenu.alloc().init()
@@ -4242,6 +4351,123 @@ class BadgeController(NSObject):
             return {"needs": 0, "working": 0, "ready": 0, "dormant": 0}
         return {k: len(v) for k, v in buckets.items()}
 
+    @objc.python_method
+    def _buckets(self) -> dict:
+        """Full enriched buckets (rows, not just counts). Never raises —
+        falls back to empty buckets so a bad parse can't kill the tick."""
+        try:
+            return _get_buckets()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[badge] buckets failed: {e!r}\n")
+            return {"needs": [], "working": [], "ready": [], "dormant": []}
+
+    @objc.python_method
+    def _maybe_notify(self, needs_rows: list) -> None:
+        """Fire a proactive nudge for sessions that just entered NEEDS YOU.
+
+        Debounced via persisted per-session epochs: a session only nudges
+        when a *newer* turn lands it in NEEDS YOU, so one sitting in the
+        bucket never re-fires. The first tick after launch (and right after
+        the user enables the feature) seeds the baseline silently."""
+        if not _read_notify_enabled():
+            return
+        try:
+            state = _load_notify_state()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[notify] load state failed: {e!r}\n")
+            return
+
+        # Current NEEDS YOU sessions: sid -> (epoch, title, phase_label).
+        current: dict = {}
+        for row in needs_rows:
+            sess = row.get("s") or {}
+            sid = sess.get("sessionId") or ""
+            epoch = row.get("lastTurnEpoch")
+            if not sid or not isinstance(epoch, (int, float)):
+                continue
+            current[sid] = (
+                float(epoch),
+                row.get("title") or "Claude session",
+                row.get("phase_label") or "needs you",
+            )
+
+        now = time.time()
+
+        # Seeding pass: record what's already waiting, fire nothing.
+        if not self.notify_seeded:
+            for sid, (epoch, _t, _p) in current.items():
+                state[sid] = {"epoch": epoch, "at": now}
+            try:
+                _save_notify_state(state)
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[notify] seed save failed: {e!r}\n")
+            self.notify_seeded = True
+            return
+
+        # We key the debounce purely on lastTurnEpoch monotonicity, NOT on
+        # observed bucket transitions: a session re-enters NEEDS YOU only by
+        # a new turn landing it there, which advances lastTurnEpoch. The
+        # corollary — consistent with the unread/seen machinery — is that a
+        # round-trip through WORKING that returns to NEEDS YOU *without* the
+        # epoch advancing past epsilon won't re-fire. That only happens when
+        # lastTurnEpoch is the fileMtime fallback rather than a real turn,
+        # which is rare and not worth the extra per-tick bucket bookkeeping.
+        # Old entries for sessions that have left NEEDS YOU are harmless
+        # (epoch only ever climbs) and get reaped by the 30-day GC on save.
+        fresh: list = []  # (title, phase)
+        for sid, (epoch, title, phase) in current.items():
+            prev = state.get(sid)
+            prev_epoch = prev.get("epoch") if isinstance(prev, dict) else None
+            if (not isinstance(prev_epoch, (int, float))
+                    or epoch > prev_epoch + _NOTIFY_EPSILON_S):
+                fresh.append((title, phase))
+                state[sid] = {"epoch": epoch, "at": now}
+
+        if not fresh:
+            return
+
+        try:
+            _save_notify_state(state)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[notify] save failed: {e!r}\n")
+
+        # Coalesce a simultaneous burst into one banner rather than N.
+        if len(fresh) == 1:
+            title, phase = fresh[0]
+            _post_notification("🔔 A session needs you", title, subtitle=phase)
+        else:
+            _post_notification(
+                "🔔 Sessions need you",
+                f"{len(fresh)} sessions are waiting on you")
+        self._pulse_badge()
+
+    @objc.python_method
+    def _pulse_badge(self) -> None:
+        """A brief opacity pulse on the badge to draw the eye toward a new
+        NEEDS YOU. Best-effort — any framework hiccup just no-ops so the
+        badge keeps rendering normally."""
+        try:
+            view = self.badge_view
+            if view is None:
+                return
+            view.setWantsLayer_(True)
+            layer = view.layer()
+            if layer is None:
+                return
+            try:
+                from QuartzCore import CABasicAnimation
+            except ImportError:
+                from Quartz import CABasicAnimation
+            anim = CABasicAnimation.animationWithKeyPath_("opacity")
+            anim.setFromValue_(1.0)
+            anim.setToValue_(0.4)
+            anim.setDuration_(0.45)
+            anim.setAutoreverses_(True)
+            anim.setRepeatCount_(2.0)
+            layer.addAnimation_forKey_(anim, "needsPulse")
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[notify] pulse failed: {e!r}\n")
+
     def refresh_(self, _sender):
         if QUIT_FLAG.exists():
             try:
@@ -4265,8 +4491,12 @@ class BadgeController(NSObject):
                 pass
             NSApp.terminate_(None)
             return
-        # Update badge counts.
-        self.badge_view.set_counts(self._counts())
+        # Pull buckets once: feed the badge counts AND the notify hook
+        # (which needs the NEEDS YOU rows, not just the tally).
+        buckets = self._buckets()
+        self.badge_view.set_counts(
+            {k: len(v) for k, v in buckets.items()})
+        self._maybe_notify(buckets.get("needs", []))
         # If popover is open, re-render its content too. Guard against
         # the case where the popover is mid-dismissal — `isShown()`
         # returns True briefly after `close()` while the animation runs,

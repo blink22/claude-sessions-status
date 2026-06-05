@@ -4,6 +4,27 @@ All notable changes to this project are documented here. Format roughly
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.7.0 — 2026-06-06
+
+### Added — the badge can now nudge you when a session needs you
+
+- **Proactive NEEDS YOU notifications.** The floating badge already
+  carried the NEEDS YOU count, but it was passive — you had to look at
+  it. Now, when a session *transitions* into NEEDS YOU (asking you a
+  question, proposing a plan, or maybe-stuck), the badge fires a one-shot
+  macOS notification with a soft sound and a brief opacity pulse to draw
+  the eye. Opt-in via the badge's right-click menu → **"Notify on NEEDS
+  YOU"** (off by default; persisted in `~/.claude-sessions-status-notify`).
+- **Debounced so it never nags.** Transition detection reuses the same
+  epoch-comparison idea as the unread/seen machinery: a per-session
+  `lastTurnEpoch` is remembered in
+  `~/.claude-sessions-status-notify-state.json`, so a session that simply
+  *sits* in NEEDS YOU never re-fires — only a genuinely newer turn does.
+  The first tick after launch (and right after you opt in) seeds the
+  baseline silently, so starting the badge mid-conversation doesn't dump
+  a burst of banners. A simultaneous burst of several new NEEDS YOU
+  sessions coalesces into a single "N sessions need you" banner.
+
 ## 0.6.1 — 2026-06-06
 
 ### Fixed — clicking a terminal session opened Claude Desktop
