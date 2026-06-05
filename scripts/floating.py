@@ -16,6 +16,7 @@ State files (in $HOME):
   .claude-sessions-status-window.json    saved x/y/w/h
   .claude-sessions-status-panel.pid      pid of the running panel
   .claude-sessions-status-panel-mode     current layout mode
+  .claude-sessions-status-badge-style    floating-button shape (right-click menu)
 
 Requires PyObjC (pyobjc-framework-Cocoa). The launcher in install.py
 spawns this script via a dedicated venv with PyObjC pre-installed, so
@@ -1256,6 +1257,126 @@ def _save_badge_origin(x: float, y: float) -> None:
     _atomic_write_text(BADGE_STATE_FILE, json.dumps({"x": x, "y": y}))
 
 
+# ---------- Badge style (user-selectable floating-button shape) ----------
+# The badge can render in one of several shapes. "bento" is the original
+# three-glass-tile look; the others adopt the expanded popover's visual
+# language (a unified dark surface #1c1c20, hairline borders, muted
+# red/amber/green, SF Mono tabular numerals, dot markers). The choice
+# persists across launches and is changed via the badge's right-click
+# settings menu (BadgeController.badge_settings_menu).
+BADGE_STYLE_FILE = HOME / ".claude-sessions-status-badge-style"
+BADGE_STYLES = ("bento", "pill", "header", "card", "dots")
+BADGE_STYLE_LABELS = {
+    "bento":  "Bento tiles (glass)",
+    "pill":   "Unified pill",
+    "header": "Kanban header",
+    "card":   "Card of chips",
+    "dots":   "Compact dots",
+}
+# Per-style borderless-window dimensions (w, h) in points.
+_BADGE_DIMS = {
+    "bento":  (BADGE_WIDTH, BADGE_HEIGHT),  # 180 x 56
+    "pill":   (156.0, 40.0),
+    "header": (228.0, 52.0),
+    "card":   (176.0, 40.0),
+    "dots":   (150.0, 36.0),
+}
+# Muted bucket colors lifted verbatim from the popover (kanban.html) so
+# the flat badge styles match the expanded window exactly.
+FLAT_BUCKET_HEX = {
+    "needs":   "#f06f6f",
+    "working": "#e0b34a",
+    "ready":   "#4fc78a",
+}
+# Short uppercase labels for the "header" style.
+FLAT_BUCKET_LABEL = {
+    "needs":   "NEEDS",
+    "working": "WORKING",
+    "ready":   "DONE",
+}
+_BADGE_SURFACE_HEX = "#1c1c20"   # --bg-popover
+_BADGE_LIFT_HEX = "#232328"      # --bg-popover-lift
+
+
+def _read_badge_style() -> str:
+    try:
+        v = BADGE_STYLE_FILE.read_text(encoding="utf-8").strip().lower()
+        if v in BADGE_STYLES:
+            return v
+    except OSError:
+        pass
+    return "bento"
+
+
+def _write_badge_style(value: str) -> None:
+    if value not in BADGE_STYLES:
+        return
+    _atomic_write_text(BADGE_STYLE_FILE, value)
+
+
+def _badge_dims(style: str) -> tuple[float, float]:
+    return _BADGE_DIMS.get(style, _BADGE_DIMS["bento"])
+
+
+def _flat_tint(key: str):
+    return _hex_to_nscolor(FLAT_BUCKET_HEX.get(key, "#8a8a8a"))
+
+
+def _white_alpha(a: float):
+    return NSColor.colorWithRed_green_blue_alpha_(1.0, 1.0, 1.0, a)
+
+
+def _mono_tabular_font(size: float, weight: float):
+    """SF Mono / monospaced system font with tabular figures — matches the
+    popover's count typography. Falls back to the rounded tabular font on
+    very old macOS where monospacedSystemFontOfSize_weight_ is missing."""
+    try:
+        f = NSFont.monospacedSystemFontOfSize_weight_(size, weight)
+        if f is not None:
+            return f
+    except Exception:  # noqa: BLE001
+        pass
+    return _rounded_tabular_font(size, weight)
+
+
+# ---- Lightweight drawing primitives shared by the flat badge styles ----
+def _fill_round_rect(rect, radius, color):
+    path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        rect, radius, radius)
+    color.setFill()
+    path.fill()
+
+
+def _stroke_round_rect(rect, radius, line_w, color):
+    # Inset by half the line width so the stroke stays inside `rect`.
+    inset = NSMakeRect(
+        rect.origin.x + line_w / 2.0, rect.origin.y + line_w / 2.0,
+        rect.size.width - line_w, rect.size.height - line_w)
+    path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        inset, radius, radius)
+    path.setLineWidth_(line_w)
+    color.setStroke()
+    path.stroke()
+
+
+def _fill_circle(cx, cy, diameter, color):
+    rect = NSMakeRect(cx - diameter / 2.0, cy - diameter / 2.0,
+                      diameter, diameter)
+    path = NSBezierPath.bezierPathWithOvalInRect_(rect)
+    color.setFill()
+    path.fill()
+
+
+def _badge_attr(text, font, color, kern=0.0):
+    attrs = {
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: color,
+    }
+    if kern:
+        attrs[NSKernAttributeName] = kern
+    return NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+
+
 class BadgeView(NSView):
     """Modern glassmorphic badge — drawn on TOP of an NSVisualEffectView
     that provides the live frosted-glass background. This view only paints
@@ -1267,6 +1388,7 @@ class BadgeView(NSView):
     controller = objc.ivar("controller")   # BadgeController weak ref
     drag_anchor = objc.ivar("drag_anchor") # (mx, my, wx, wy) or None
     did_drag = objc.ivar("did_drag")       # bool
+    style = objc.ivar("style")             # one of BADGE_STYLES
 
     def initWithFrame_(self, frame):
         self = objc.super(BadgeView, self).initWithFrame_(frame)
@@ -1275,6 +1397,7 @@ class BadgeView(NSView):
         self.counts = {"needs": 0, "working": 0, "ready": 0, "dormant": 0}
         self.drag_anchor = None
         self.did_drag = False
+        self.style = "bento"
         # Accessibility: surface this widget to VoiceOver as a labeled
         # button. The dynamic count breakdown is exposed via the
         # accessibilityValue (refreshed in set_counts).
@@ -1310,11 +1433,162 @@ class BadgeView(NSView):
     def set_controller(self, ctrl) -> None:
         self.controller = ctrl
 
+    @objc.python_method
+    def set_style(self, style) -> None:
+        self.style = style if style in BADGE_STYLES else "bento"
+        self.setNeedsDisplay_(True)
+
     def isFlipped(self):
         # Flipped coordinates make manual layout easier (origin top-left).
         return True
 
     def drawRect_(self, _dirty):
+        # Dispatch to the per-style renderer. "bento" keeps the original
+        # glass-tile look (its frosted background is provided by the
+        # NSVisualEffectView tiles behind this view); the flat styles
+        # draw their own unified dark surface to match the popover.
+        try:
+            style = self.style or "bento"
+            if style == "pill":
+                self._draw_pill()
+            elif style == "header":
+                self._draw_header()
+            elif style == "card":
+                self._draw_card()
+            elif style == "dots":
+                self._draw_dots()
+            else:
+                self._draw_bento()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[BadgeView.drawRect_] {e!r}\n")
+
+    @objc.python_method
+    def _draw_pill(self):
+        """Option A — one popover-dark surface, hairline dividers between
+        buckets, colored dot + SF Mono count per bucket."""
+        b = self.bounds()
+        w, h = b.size.width, b.size.height
+        bg = NSMakeRect(0.5, 0.5, w - 1.0, h - 1.0)
+        _fill_round_rect(bg, 12.0, _hex_to_nscolor(_BADGE_SURFACE_HEX))
+        _stroke_round_rect(bg, 12.0, 1.0, _white_alpha(0.10))
+        num_font = _mono_tabular_font(15.0, NSFontWeightMedium)
+        seg_w = w / 3.0
+        for i, key in enumerate(TILE_KEYS):
+            n = int(self.counts.get(key, 0) or 0)
+            seg_x = i * seg_w
+            if i > 0:
+                div = NSMakeRect(seg_x - 0.5, 9.0, 1.0, h - 18.0)
+                _white_alpha(0.06).setFill()
+                NSBezierPath.fillRect_(div)
+            active = n > 0
+            dot_c = _flat_tint(key) if active else _white_alpha(0.28)
+            num_c = _white_alpha(0.92) if active else _white_alpha(0.30)
+            s = _badge_attr(str(n), num_font, num_c)
+            sz = s.size()
+            dot_d, gap = 8.0, 7.0
+            gw = dot_d + gap + sz.width
+            gx = seg_x + (seg_w - gw) / 2.0
+            cy = h / 2.0
+            _fill_circle(gx + dot_d / 2.0, cy, dot_d, dot_c)
+            s.drawAtPoint_(NSMakePoint(gx + dot_d + gap, cy - sz.height / 2.0))
+
+    @objc.python_method
+    def _draw_header(self):
+        """Option B — mini kanban column-headers: a tiny uppercase label
+        with a dot above an SF Mono count, per bucket."""
+        b = self.bounds()
+        w, h = b.size.width, b.size.height
+        bg = NSMakeRect(0.5, 0.5, w - 1.0, h - 1.0)
+        _fill_round_rect(bg, 11.0, _hex_to_nscolor(_BADGE_SURFACE_HEX))
+        _stroke_round_rect(bg, 11.0, 1.0, _white_alpha(0.10))
+        lbl_font = NSFont.systemFontOfSize_weight_(9.0, NSFontWeightSemibold)
+        num_font = _mono_tabular_font(19.0, NSFontWeightMedium)
+        seg_w = w / 3.0
+        for i, key in enumerate(TILE_KEYS):
+            n = int(self.counts.get(key, 0) or 0)
+            seg_x = i * seg_w
+            if i > 0:
+                div = NSMakeRect(seg_x - 0.5, 10.0, 1.0, h - 20.0)
+                _white_alpha(0.06).setFill()
+                NSBezierPath.fillRect_(div)
+            active = n > 0
+            tint = _flat_tint(key) if active else _white_alpha(0.30)
+            # Top row: dot + uppercase label (gray, letter-spaced).
+            lbl = _badge_attr(
+                FLAT_BUCKET_LABEL[key], lbl_font, _white_alpha(0.38), kern=0.7)
+            lsz = lbl.size()
+            dot_d, gap = 6.0, 5.0
+            gw = dot_d + gap + lsz.width
+            gx = seg_x + (seg_w - gw) / 2.0
+            top_cy = 15.0
+            _fill_circle(gx + dot_d / 2.0, top_cy, dot_d, tint)
+            lbl.drawAtPoint_(
+                NSMakePoint(gx + dot_d + gap, top_cy - lsz.height / 2.0))
+            # Bottom row: count, colored (or gray when zero), centered.
+            num = _badge_attr(str(n), num_font, tint)
+            nsz = num.size()
+            num.drawAtPoint_(NSMakePoint(seg_x + (seg_w - nsz.width) / 2.0, 28.0))
+
+    @objc.python_method
+    def _draw_card(self):
+        """Option C — one lifted card holding three count chips, reusing the
+        kanban card surface/border tokens."""
+        b = self.bounds()
+        w, h = b.size.width, b.size.height
+        outer = NSMakeRect(0.5, 0.5, w - 1.0, h - 1.0)
+        _fill_round_rect(outer, 8.0, _hex_to_nscolor(_BADGE_LIFT_HEX))
+        _stroke_round_rect(outer, 8.0, 1.0, _white_alpha(0.05))
+        pad, gap = 7.0, 4.0
+        chip_w = (w - 2.0 * pad - 2.0 * gap) / 3.0
+        chip_h = h - 2.0 * pad
+        num_font = _mono_tabular_font(13.0, NSFontWeightMedium)
+        for i, key in enumerate(TILE_KEYS):
+            n = int(self.counts.get(key, 0) or 0)
+            cx0 = pad + i * (chip_w + gap)
+            chip = NSMakeRect(cx0, pad, chip_w, chip_h)
+            active = n > 0
+            _fill_round_rect(chip, 5.0, _white_alpha(0.03 if active else 0.02))
+            _stroke_round_rect(chip, 5.0, 1.0, _white_alpha(0.05))
+            dot_c = _flat_tint(key) if active else _white_alpha(0.28)
+            num_c = _white_alpha(0.92) if active else _white_alpha(0.30)
+            s = _badge_attr(str(n), num_font, num_c)
+            sz = s.size()
+            dot_d, ig = 8.0, 6.0
+            gw = dot_d + ig + sz.width
+            gx = cx0 + (chip_w - gw) / 2.0
+            cy = h / 2.0
+            _fill_circle(gx + dot_d / 2.0, cy, dot_d, dot_c)
+            s.drawAtPoint_(NSMakePoint(gx + dot_d + ig, cy - sz.height / 2.0))
+
+    @objc.python_method
+    def _draw_dots(self):
+        """Option D — smallest footprint: a capsule with dot + SF Mono count
+        per bucket, no dividers."""
+        b = self.bounds()
+        w, h = b.size.width, b.size.height
+        bg = NSMakeRect(0.5, 0.5, w - 1.0, h - 1.0)
+        _fill_round_rect(bg, h / 2.0, _hex_to_nscolor(_BADGE_SURFACE_HEX))
+        _stroke_round_rect(bg, h / 2.0, 1.0, _white_alpha(0.10))
+        num_font = _mono_tabular_font(13.0, NSFontWeightMedium)
+        dot_d, ig, seg_gap = 8.0, 6.0, 12.0
+        groups = []
+        for key in TILE_KEYS:
+            n = int(self.counts.get(key, 0) or 0)
+            s = _badge_attr(
+                str(n), num_font, _white_alpha(0.92 if n > 0 else 0.30))
+            sz = s.size()
+            groups.append((key, n, s, sz, dot_d + ig + sz.width))
+        total = sum(g[4] for g in groups) + seg_gap * (len(groups) - 1)
+        x = (w - total) / 2.0
+        cy = h / 2.0
+        for key, n, s, sz, gw in groups:
+            dot_c = _flat_tint(key) if n > 0 else _white_alpha(0.28)
+            _fill_circle(x + dot_d / 2.0, cy, dot_d, dot_c)
+            s.drawAtPoint_(NSMakePoint(x + dot_d + ig, cy - sz.height / 2.0))
+            x += gw + seg_gap
+
+    @objc.python_method
+    def _draw_bento(self):
         # Per-tile content: SF Symbol icon at top, big numeral below.
         # The NSVisualEffectView behind each tile provides the glass.
         num_font = _rounded_tabular_font(20.0, NSFontWeightSemibold)
@@ -1367,7 +1641,29 @@ class BadgeView(NSView):
             num_s.drawAtPoint_(NSMakePoint(num_x, num_y))
 
     # ---- Mouse handling: click toggles the panel, drag moves the window ----
+    def acceptsFirstMouse_(self, _event):
+        """Fire on the very first click even when our app isn't front.
+        Without this, the very next click on the badge after another
+        app takes focus (e.g. Terminal, after a task's ▶ Start fires
+        a new Claude session there) gets eaten by AppKit's default
+        first-mouse behavior — the click is treated as "activate the
+        window" only, mouseDown_ never runs, and the badge looks
+        frozen / unresponsive. Returning True wires the first click
+        directly to our handler. Safe because the badge's panel uses
+        NSWindowStyleMaskNonactivatingPanel, so the click won't
+        accidentally promote claude-sessions-status to the front app
+        — it just delivers the event to us as expected."""
+        return True
+
     def mouseDown_(self, event):
+        # ⌃-click (control-click) opens the settings menu, same as a
+        # right-click — the trackpad-friendly path.
+        try:
+            if event.modifierFlags() & (1 << 18):  # NSEventModifierFlagControl
+                self.rightMouseDown_(event)
+                return
+        except Exception:  # noqa: BLE001
+            pass
         win = self.window()
         if win is None:
             return
@@ -1375,6 +1671,17 @@ class BadgeView(NSView):
         wf = win.frame()
         self.drag_anchor = (mouse.x, mouse.y, wf.origin.x, wf.origin.y)
         self.did_drag = False
+
+    def rightMouseDown_(self, event):
+        """Right-click (or ⌃-click) opens the badge settings menu, where
+        the user picks the floating-button shape."""
+        try:
+            if self.controller is None:
+                return
+            menu = self.controller.badge_settings_menu()
+            NSMenu.popUpContextMenu_withEvent_forView_(menu, event, self)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[badge.rightMouseDown_] {e!r}\n")
 
     def mouseDragged_(self, event):
         if self.drag_anchor is None:
@@ -1594,12 +1901,23 @@ class PopoverVC(NSViewController):
     # replaces the floating HTML #drawer-toggle.
     drawer_open = objc.ivar("drawer_open")
     tasks_btn = objc.ivar("tasks_btn")
+    # Settings gear (top-left). Opens the badge-style menu, which lives
+    # on the BadgeController (it owns the badge window we restyle).
+    settings_btn = objc.ivar("settings_btn")
+    badge_controller = objc.ivar("badge_controller")
 
     @objc.python_method
     def set_popover(self, popover):
         """Allows BadgeController to hand us the NSPopover so we can
         resize it when the user toggles mode."""
         self.popover_ref = popover
+
+    @objc.python_method
+    def set_badge_controller(self, ctrl):
+        """BadgeController hands us a back-reference so the settings gear
+        can build + apply the badge-style menu (the controller owns the
+        badge window)."""
+        self.badge_controller = ctrl
 
     def loadView(self):
         try:
@@ -1718,6 +2036,37 @@ class PopoverVC(NSViewController):
         # is retired — kept as None so any stale wiring no-ops safely.
         self.mode_list_btn = None
         self.mode_kanban_btn = None
+
+        # ---- Top bar (left): settings gear ----
+        # Momentary recessed button showing a gear glyph; clicking opens
+        # the badge-style menu (same one as right-clicking the badge).
+        # Anchored to the left edge so it never collides with the
+        # right-side toggles or the centered mode picker.
+        gear = _FirstMouseButton.alloc().init()
+        gear.setButtonType_(NS_BUTTON_TYPE_MOMENTARY_LIGHT)
+        gear.setBezelStyle_(NS_BEZEL_STYLE_RECESSED)
+        gear.setTarget_(self)
+        gear.setAction_("showStyleMenu:")
+        gear_img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "gearshape", "Floating button settings")
+        if gear_img is not None:
+            gear.setImage_(gear_img)
+            gear.setImagePosition_(1)  # NSImageOnly
+        else:
+            gear.setTitle_("Style")
+            gear.setFont_(toggle_font)
+        if hasattr(gear, "setContentTintColor_"):
+            gear.setContentTintColor_(NSColor.labelColor())
+        gear.setToolTip_("Floating button style")
+        gear.sizeToFit()
+        gf = gear.frame()
+        gear.setFrame_(NSMakeRect(
+            10.0, h - TOP_BAR_HEIGHT + 4,
+            max(gf.size.width, 28.0), gf.size.height,
+        ))
+        gear.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
+        container.addSubview_(gear)
+        self.settings_btn = gear
 
         dormant_btn = _make_toolbar_toggle(
             "Show older", self.show_dormant, "toggleDormant:")
@@ -2017,6 +2366,20 @@ class PopoverVC(NSViewController):
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[_apply_popover_size] {e!r}\n")
 
+    def showStyleMenu_(self, sender):
+        """Settings-gear action — pop up the badge-style menu just below
+        the gear. The menu (and its item actions) live on the
+        BadgeController, which owns the badge window being restyled."""
+        try:
+            ctrl = self.badge_controller
+            if ctrl is None:
+                return
+            menu = ctrl.badge_settings_menu()
+            loc = NSMakePoint(0.0, sender.bounds().size.height + 2.0)
+            menu.popUpMenuPositioningItem_atLocation_inView_(None, loc, sender)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[showStyleMenu_] {e!r}\n")
+
     def segmentChanged_(self, sender):
         """Primary callback for the List | Kanban segmented control.
         The separated-style NSSegmentedControl owns the radio
@@ -2045,6 +2408,22 @@ class PopoverVC(NSViewController):
         self._apply_popover_size()
         self._install_layout()
         self.refresh()
+
+    def deferredClosePopover_(self, _sender):
+        """Close the popover on the next runloop tick, off the call
+        stack of whatever triggered the close. Used after spawning
+        a Terminal session — closing the popover synchronously from
+        inside didReceiveScriptMessage: tears the WKWebView down
+        while WebKit is still mid-dispatch, which has produced
+        intermittent main-thread stalls visible as a hover-beachball
+        on the badge. performSelector with delay=0 schedules the
+        close as a separate runloop event so the bridge call
+        finishes cleanly first."""
+        if self.popover_ref is not None:
+            try:
+                self.popover_ref.close()
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[deferredClosePopover] {e!r}\n")
 
     def toggleDormant_(self, sender):
         """Flip whether dormant sessions are shown in the popover. In
@@ -2841,18 +3220,29 @@ class PopoverVC(NSViewController):
             # User edited the prompt in the modal and hit "Start".
             # Spawn a fresh Terminal at the target cwd and run
             # `claude <prompt>` so the new session opens with that
-            # prompt as its first user message.
+            # prompt as its first user message. The spawn is fully
+            # detached (start_new_session=True + DEVNULL stdio) so
+            # the new Claude process shares no terminal control or
+            # signals with the badge — the badge keeps running and
+            # responding to hover normally after Terminal activates.
             prompt = pstr("prompt")
             target_cwd = pstr("cwd")
             if not prompt:
                 return
             self._spawn_new_terminal_with_prompt(target_cwd, prompt)
-            # Close the popover so the new Terminal window has focus.
-            if self.popover_ref is not None:
-                try:
-                    self.popover_ref.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            # Defer the popover close to the next runloop tick. Closing
+            # synchronously from inside this script-message handler
+            # has caused intermittent stalls (visible as a hover
+            # beachball on the badge) when the WKWebView is mid-
+            # dispatch and its parent window starts tearing down.
+            # performSelector with delay=0 schedules the close after
+            # the current event finishes.
+            try:
+                self.performSelector_withObject_afterDelay_(
+                    "deferredClosePopover:", None, 0.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[taskStart deferred close] {e!r}\n")
         elif action == "taskAttachSession":
             # Move a task from one session to another. Used by the
             # drawer's "change attachment" picker and (eventually) by
@@ -3066,11 +3456,39 @@ class PopoverVC(NSViewController):
         self._activate_app("Claude")
 
     @objc.python_method
+    def _detached_popen_kwargs(self) -> dict:
+        """Canonical kwargs for spawning a user-facing helper process
+        (osascript, open -a, …) so the child is FULLY decoupled from
+        the badge:
+
+          • start_new_session=True   — fresh POSIX session + process
+            group, so the child shares no signals, terminal control,
+            or job-control state with us. The badge can quit / be
+            backgrounded / steal focus without touching the child.
+          • stdin / stdout / stderr → /dev/null — no inherited pipes
+            that could leak file descriptors or, worse, block the
+            child's read/write when its other end isn't being read.
+          • close_fds=True — explicit (it's the default on POSIX in
+            Python 3, but stating it makes the intent obvious and
+            survives future refactors).
+
+        The hover-freeze the user hit after clicking ▶ Start traced
+        to the child inheriting state from us; this kwargs bundle is
+        the canonical "fire and forget" pattern."""
+        return {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "start_new_session": True,
+            "close_fds": True,
+        }
+
+    @objc.python_method
     def _activate_app(self, app_name: str) -> None:
         try:
             subprocess.Popen(
                 ["open", "-a", app_name],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **self._detached_popen_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as e:
             sys.stderr.write(f"[_activate_app {app_name}] {e!r}\n")
@@ -3088,7 +3506,7 @@ class PopoverVC(NSViewController):
                     "-e", 'tell application "Terminal" to activate',
                     "-e", f'tell application "Terminal" to do script "{shell_cmd}"',
                 ],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **self._detached_popen_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as e:
             sys.stderr.write(f"[_spawn_new_terminal_session] {e!r}\n")
@@ -3134,7 +3552,7 @@ class PopoverVC(NSViewController):
                     "-e", 'tell application "Terminal" to activate',
                     "-e", f'tell application "Terminal" to do script {applescript_str}',
                 ],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **self._detached_popen_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as e:
             sys.stderr.write(f"[_spawn_new_terminal_with_prompt] {e!r}\n")
@@ -3576,13 +3994,16 @@ class BadgeController(NSObject):
             return None
 
         # Build the badge window — borderless, non-activating panel.
+        # Sized to the user's chosen badge shape (defaults to "bento").
         x, y = _load_badge_origin()
+        badge_style = _read_badge_style()
+        bw, bh = _badge_dims(badge_style)
         style = (
             NSWindowStyleMaskBorderless
             | NSWindowStyleMaskNonactivatingPanel
         )
         win = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(x, y, BADGE_WIDTH, BADGE_HEIGHT),
+            NSMakeRect(x, y, bw, bh),
             style, NSBackingStoreBuffered, False,
         )
         win.setLevel_(NSFloatingWindowLevel)
@@ -3601,50 +4022,10 @@ class BadgeController(NSObject):
             | NS_WINDOW_COLLECTION_FULL_SCREEN_AUX
         )
 
-        # Bento tiles: a transparent container holding 3 independent
-        # NSVisualEffectView glass surfaces (one per bucket), with the
-        # BadgeView drawing numerals + labels overlaid on top.
-        container = NSView.alloc().initWithFrame_(
-            NSMakeRect(0, 0, BADGE_WIDTH, BADGE_HEIGHT)
-        )
-        container.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-
-        for i in range(NUM_TILES):
-            tx = i * (TILE_SIZE + TILE_GAP)
-            tile = NSVisualEffectView.alloc().initWithFrame_(
-                NSMakeRect(tx, 0, TILE_SIZE, TILE_SIZE)
-            )
-            tile.setMaterial_(NSVisualEffectMaterialPopover)
-            tile.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-            tile.setState_(NSVisualEffectStateActive)
-            tile.setWantsLayer_(True)
-            t_layer = tile.layer()
-            if t_layer is not None:
-                t_layer.setCornerRadius_(TILE_CORNER)
-                t_layer.setMasksToBounds_(True)
-                # Hairline inner border on each tile for definition.
-                t_layer.setBorderWidth_(0.5)
-                # CGColor of separatorColor at ~50% alpha.
-                t_layer.setBorderColor_(
-                    NSColor.separatorColor()
-                    .colorWithAlphaComponent_(0.5).CGColor()
-                )
-            container.addSubview_(tile)
-
-        # Foreground BadgeView (transparent) overlaid on the tiles —
-        # draws numerals + labels, captures click/drag for the whole
-        # badge regardless of which tile the user pressed.
-        view = BadgeView.alloc().initWithFrame_(
-            NSMakeRect(0, 0, BADGE_WIDTH, BADGE_HEIGHT)
-        )
-        view.set_controller(self)
-        view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-        container.addSubview_(view)
-
-        win.setContentView_(container)
-
         self.badge_window = win
-        self.badge_view = view
+        # Build the content (tiles / flat surface + foreground BadgeView)
+        # for the active style. Sets self.badge_view.
+        self._build_badge_chrome(badge_style)
 
         # NSPopover anchored to the badge view. Created up-front so we
         # don't pay setup cost on first click. Behavior=Transient should
@@ -3664,6 +4045,9 @@ class BadgeController(NSObject):
         # Hand the VC a reference to the popover so it can resize itself
         # when the user toggles between list and kanban.
         popover_vc.set_popover(self.popover)
+        # And a back-reference so its settings gear can open + apply the
+        # badge-style menu (the controller owns the badge window).
+        popover_vc.set_badge_controller(self)
         self.popover.setContentViewController_(popover_vc)
         # Initial content size matches the saved popover mode (and
         # widens to fit a 4th dormant column when show_dormant is on).
@@ -3693,6 +4077,101 @@ class BadgeController(NSObject):
             REFRESH_SECS, self, "refresh:", None, True
         )
         return self
+
+    @objc.python_method
+    def _build_badge_chrome(self, style):
+        """(Re)build the badge window's content view for `style`. For the
+        bento style this lays out three NSVisualEffectView glass tiles
+        behind a transparent BadgeView; the flat styles need no tiles —
+        the BadgeView paints its own unified dark surface. Replaces
+        self.badge_view with a freshly-styled one."""
+        w, h = _badge_dims(style)
+        container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+        container.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+
+        if style == "bento":
+            for i in range(NUM_TILES):
+                tx = i * (TILE_SIZE + TILE_GAP)
+                tile = NSVisualEffectView.alloc().initWithFrame_(
+                    NSMakeRect(tx, 0, TILE_SIZE, TILE_SIZE)
+                )
+                tile.setMaterial_(NSVisualEffectMaterialPopover)
+                tile.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+                tile.setState_(NSVisualEffectStateActive)
+                tile.setWantsLayer_(True)
+                t_layer = tile.layer()
+                if t_layer is not None:
+                    t_layer.setCornerRadius_(TILE_CORNER)
+                    t_layer.setMasksToBounds_(True)
+                    t_layer.setBorderWidth_(0.5)
+                    t_layer.setBorderColor_(
+                        NSColor.separatorColor()
+                        .colorWithAlphaComponent_(0.5).CGColor()
+                    )
+                container.addSubview_(tile)
+
+        # Foreground BadgeView — draws the foreground (and, for flat
+        # styles, the whole surface) and captures click/drag/right-click.
+        view = BadgeView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+        view.set_controller(self)
+        view.set_style(style)
+        view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        container.addSubview_(view)
+
+        self.badge_window.setContentView_(container)
+        self.badge_view = view
+
+    @objc.python_method
+    def _apply_badge_style(self, style):
+        """Resize the badge window to the new style's dimensions (keeping
+        its on-screen origin) and rebuild its content. Called when the
+        user picks a different shape from the settings menu."""
+        if style not in BADGE_STYLES:
+            return
+        w, h = _badge_dims(style)
+        win = self.badge_window
+        f = win.frame()
+        win.setFrame_display_(
+            NSMakeRect(f.origin.x, f.origin.y, w, h), True)
+        self._build_badge_chrome(style)
+        try:
+            self.badge_view.set_counts(self._counts())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def changeBadgeStyle_(self, sender):
+        """Menu action — persist + apply the chosen badge style."""
+        try:
+            style = str(sender.representedObject())
+        except Exception:  # noqa: BLE001
+            return
+        if style not in BADGE_STYLES:
+            return
+        _write_badge_style(style)
+        self._apply_badge_style(style)
+
+    @objc.python_method
+    def badge_settings_menu(self):
+        """Build the right-click settings menu: a checkmarked list of the
+        available floating-button shapes, plus Quit."""
+        menu = NSMenu.alloc().init()
+        header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Floating Button Style", None, "")
+        header.setEnabled_(False)
+        menu.addItem_(header)
+        current = _read_badge_style()
+        for style in BADGE_STYLES:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                BADGE_STYLE_LABELS[style], "changeBadgeStyle:", "")
+            item.setTarget_(self)
+            item.setRepresentedObject_(style)
+            item.setState_(1 if style == current else 0)  # NSControlStateValueOn
+            menu.addItem_(item)
+        menu.addItem_(NSMenuItem.separatorItem())
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Quit", "terminate:", "q")
+        menu.addItem_(quit_item)
+        return menu
 
     def _install_app_menu(self):
         main = NSMenu.alloc().init()
