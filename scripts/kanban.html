@@ -2923,6 +2923,16 @@
   // fall back to a full DOM rebuild.
   let _lastShape = null;
 
+  // Per-session cache of the last innerHTML we painted into each card,
+  // keyed by sessionId. The per-card update path consults this so a
+  // tick that changed ONE card (e.g. a freshly-active session whose
+  // "5s"→"10s" age busts the payload dedupe) only rewrites that card's
+  // DOM — every other card, with byte-identical HTML, is left
+  // untouched. Without this, a single ticking card forced an
+  // innerHTML swap on all ~20 cards, collapsing hover/selection state
+  // across the board. GC'd alongside the other per-session Sets below.
+  const _cardHtml = new Map();
+
   function sameShape(a, b) {
     if (!a || !b) return false;
     if (a.length !== b.length) return false;
@@ -2968,8 +2978,22 @@
     // NOTE: sidebar selection clicks bust this by setting
     // `_lastPayloadJson = null` so the re-render fires even though
     // the Python payload is bytes-identical.
+    // The dedupe signature OMITS each row's `ago_s` — that float
+    // advances on every 5s tick but drives no rendering decision the
+    // `age` string doesn't already capture (the sidebar's "Today"
+    // filter flips at 24h, exactly where format_ago flips "23h ago"
+    // → "1d ago"). Including it made every quiet tick miss the dedupe
+    // and rebuild the whole app — sidebar, drawer, every card —
+    // yanking the user out of whatever they were doing. With it gone,
+    // a tick that only advanced the clock short-circuits here. The
+    // full `data` (with ago_s intact) is still cached in `_lastData`
+    // above, so the Today filter keeps working.
     let payloadJson = null;
-    try { payloadJson = JSON.stringify(data); } catch (_) {}
+    try {
+      payloadJson = JSON.stringify(data, function(key, value) {
+        return key === 'ago_s' ? undefined : value;
+      });
+    } catch (_) {}
     if (payloadJson !== null && payloadJson === _lastPayloadJson) return;
     _lastPayloadJson = payloadJson;
 
@@ -3078,11 +3102,25 @@
           );
           if (!cardEl) return;
           // Reflect possibly-changed bucket / unread / expanded class
-          cardEl.className = 'card ' + (r.bucket || 'dormant')
+          const newClass = 'card ' + (r.bucket || 'dormant')
             + (r.unread ? ' is-unread' : '')
             + (expandedCards.has(r.sessionId) ? ' expanded' : '');
-          cardEl.dataset.cwd = r.cwd || '';
-          cardEl.innerHTML = renderCard(r);
+          const newCwd = r.cwd || '';
+          const newHtml = renderCard(r);
+          // Skip the DOM write entirely when nothing about this card
+          // changed — same class, same cwd, byte-identical body. This
+          // is the common case on a quiet tick: one card's clock
+          // advanced, the rest are untouched, so we leave their DOM
+          // (and any hover/focus/scroll state) exactly as-is.
+          if (cardEl.className === newClass
+              && cardEl.dataset.cwd === newCwd
+              && _cardHtml.get(r.sessionId) === newHtml) {
+            return;
+          }
+          if (cardEl.className !== newClass) cardEl.className = newClass;
+          if (cardEl.dataset.cwd !== newCwd) cardEl.dataset.cwd = newCwd;
+          cardEl.innerHTML = newHtml;
+          _cardHtml.set(r.sessionId, newHtml);
           // Re-wire the (new) inner children. cardEl-level click
           // listener was attached on initial wire and survives via
           // the data-body-wired flag.
@@ -3102,12 +3140,17 @@
         const cards = rows.length
           ? rows.map(function(r) {
               const isExpanded = expandedCards.has(r.sessionId);
+              // Seed the per-card HTML cache so the next tick's per-card
+              // path can skip cards whose body didn't change. Mirrors
+              // exactly what we hand to innerHTML there.
+              const body = renderCard(r);
+              _cardHtml.set(r.sessionId, body);
               return '<div class="card ' + esc(r.bucket)
                 + (r.unread ? ' is-unread' : '')
                 + (isExpanded ? ' expanded' : '')
                 + '" data-session="' + esc(r.sessionId)
                 + '" data-cwd="' + esc(r.cwd || '')
-                + '">' + renderCard(r) + '</div>';
+                + '">' + body + '</div>';
             }).join('')
           : '<div class="empty">—</div>';
         cols.push(''
@@ -3145,6 +3188,9 @@
     });
     doneRevealed.forEach(function(sid) {
       if (!lastRows.has(sid)) doneRevealed.delete(sid);
+    });
+    _cardHtml.forEach(function(_v, sid) {
+      if (!lastRows.has(sid)) _cardHtml.delete(sid);
     });
     // Same sweep for the drawer's per-cwd done-revealed Set. Cwds
     // that no longer appear as a drawer group are stale; otherwise
@@ -3656,7 +3702,12 @@
     const wasExpanded = expandedCards.has(sid);
     if (wasExpanded) cardEl.classList.add('expanded');
     else cardEl.classList.remove('expanded');
-    cardEl.innerHTML = renderCard(row);
+    const body = renderCard(row);
+    cardEl.innerHTML = body;
+    // Keep the per-card HTML cache in step with this out-of-band
+    // repaint so the next refresh tick sees a match and doesn't
+    // needlessly rewrite this card again.
+    _cardHtml.set(sid, body);
     // Scope handler re-wiring to THIS card — calling the global
     // wireClicks() would attach extra listeners to every other card
     // in the popover on every expand/collapse, which compounds across
