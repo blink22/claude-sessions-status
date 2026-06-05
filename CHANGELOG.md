@@ -4,6 +4,28 @@ All notable changes to this project are documented here. Format roughly
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.6.1 — 2026-06-06
+
+### Fixed — exited sessions stuck in WORKING
+
+- **Sessions you've exited no longer hang in the WORKING column.**
+  Status was inferred purely from the transcript tail plus PID
+  liveness, which wedged two ways: (1) a Claude Desktop session's
+  PID belongs to a long-lived helper process that outlives the
+  conversation, so liveness never cleared it; and (2) when you exit
+  a task mid-turn the last transcript entry is your own message, which
+  the heuristic reads as "Working…". Combined, an exited session could
+  show WORKING for up to the 4-hour dormancy ceiling (or the 10-minute
+  grace window). Now the app reads the authoritative `status`
+  (`busy`/`idle`) field Claude ≥ 2.1.158 writes into
+  `~/.claude/sessions/<pid>.json`, and derives an `exited` signal when
+  a session has no live process and this Claude version manages PID
+  files (it removes the file on quit). An idle or exited session is
+  never classified as WORKING. Sessions from older Claude versions
+  (no `status` field) fall back to the existing transcript heuristic
+  unchanged. Applied consistently across the terminal dashboard,
+  floating panel, and menubar so all three views agree.
+
 ## 0.6.0 — 2026-06-05
 
 Multi-feature release on top of 0.5.0. Schema is fully backward-

@@ -42,6 +42,9 @@ from dashboard import (  # noqa: E402
     format_ago,
     resolve_title,
     live_session_ids,
+    session_runtime_status,
+    runtime_status_for,
+    pid_files_present,
     is_dormant,
     desktop_titles,
     session_gist,
@@ -99,8 +102,8 @@ DORMANT_COLOR = "#6e7681"   # dim gray, matches subtle text elsewhere
 
 
 # Delegate to dashboard.classify so menubar and floating can't drift apart.
-def classify(state: str, phase_label: str) -> str:
-    return _classify_canonical(state, phase_label)
+def classify(state: str, phase_label: str, runtime_status: str | None = None) -> str:
+    return _classify_canonical(state, phase_label, runtime_status)
 
 
 def urgency_key(row: dict) -> tuple:
@@ -263,6 +266,8 @@ def render_menubar() -> None:
     now = time.time()
 
     live_ids = live_session_ids()
+    status_map = session_runtime_status()
+    tracking = pid_files_present()
     # Authoritative titles set in the Desktop GUI live outside the JSONL.
     desktop_idx = desktop_titles()
 
@@ -276,16 +281,17 @@ def render_menubar() -> None:
         if last_epoch is None:
             last_epoch = s.get("fileMtime", 0) / 1000
         ago_s = now - last_epoch
+        sid = s.get("sessionId") or ""
+        runtime_status = runtime_status_for(sid, live_ids, status_map, tracking)
         emoji, phase_label = infer_phase(meta)
-        state, _ = state_for(meta, ago_s)
+        state, _ = state_for(meta, ago_s, runtime_status)
         hint = next_action(phase_label, meta.get("lastRole"), ago_s)
         if state == "Working…" and meta.get("lastRole") == "assistant":
             hint = "Wait — Claude is mid-tool"
-        sid = s.get("sessionId") or ""
         # Classify into an active bucket first, then check if it should
         # be demoted to DORMANT. The original bucket informs the dormant
         # check (FINISHED ages out faster than NEEDS YOU / WORKING).
-        active_bucket = classify(state, phase_label)
+        active_bucket = classify(state, phase_label, runtime_status)
         if is_dormant(sid, ago_s, live_ids, active_bucket):
             bucket = BUCKET_DORMANT
         else:

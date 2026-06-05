@@ -134,9 +134,12 @@ from dashboard import (  # noqa: E402
     is_dormant,
     live_session_ids,
     next_action,
+    pid_files_present,
     recent_sessions,
     resolve_title,
+    runtime_status_for,
     session_gist,
+    session_runtime_status,
     state_for,
     subagent_summary,
     subagents_for_session,
@@ -778,6 +781,8 @@ def _get_buckets() -> dict[str, list[dict]]:
     now = time.time()
     desktop_idx = desktop_titles()
     live_ids = live_session_ids()
+    status_map = session_runtime_status()
+    tracking = pid_files_present()
     seen = _load_seen()
 
     buckets: dict[str, list[dict]] = {b: [] for b in BUCKET_ORDER}
@@ -788,10 +793,11 @@ def _get_buckets() -> dict[str, list[dict]]:
         if last_epoch is None:
             last_epoch = s.get("fileMtime", 0) / 1000
         ago_s = now - last_epoch
-        emoji, phase_label = infer_phase(meta)
-        state, _ = state_for(meta, ago_s)
-        active_bucket = _classify(state, phase_label)
         sid = s.get("sessionId") or ""
+        runtime_status = runtime_status_for(sid, live_ids, status_map, tracking)
+        emoji, phase_label = infer_phase(meta)
+        state, _ = state_for(meta, ago_s, runtime_status)
+        active_bucket = _classify(state, phase_label, runtime_status)
         bucket = "dormant" if is_dormant(sid, ago_s, live_ids, active_bucket) else active_bucket
         subs = subagents_for_session(full_path, now)
         sub_sum = subagent_summary(subs)

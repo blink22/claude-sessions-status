@@ -863,6 +863,105 @@ def live_session_ids() -> set[str]:
     return live
 
 
+def session_runtime_status() -> dict[str, str]:
+    """Map sessionId → authoritative runtime status ("busy" | "idle")
+    reported by Claude itself in ~/.claude/sessions/<pid>.json.
+
+    Claude >= 2.1.158 writes a ``status`` field (plus ``updatedAt``)
+    into its session pid file. This is ground truth for the busy/idle
+    question and beats the transcript heuristic in ``state_for`` — the
+    last transcript entry can be a user message typed just before the
+    user exited, which the heuristic misreads as "Working…" forever
+    (the desktop helper process never dies, so liveness can't catch it
+    either). Trusting ``status`` is what un-sticks an exited session
+    from the WORKING column.
+
+    Only LIVE pids are considered: a status from a dead pid is stale
+    (the session genuinely exited) and is already handled by
+    ``live_session_ids`` + ``is_dormant``. When two pid files report
+    the same sessionId (e.g. after a ``--resume``), the most recently
+    updated one wins.
+
+    Sessions whose pid file predates the status field (older Claude)
+    are simply absent from the map — callers fall back to the
+    transcript heuristic for those."""
+    best: dict[str, tuple[float, str]] = {}
+    if not CLAUDE_SESSIONS_DIR.exists():
+        return {}
+    try:
+        files = list(CLAUDE_SESSIONS_DIR.glob("*.json"))
+    except OSError:
+        return {}
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        pid = data.get("pid")
+        sid = data.get("sessionId")
+        status = data.get("status")
+        if not isinstance(pid, int) or not isinstance(sid, str):
+            continue
+        if status not in ("busy", "idle"):
+            continue
+        try:
+            os.kill(pid, 0)   # alive-check; mirrors live_session_ids
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+        updated = data.get("updatedAt")
+        updated = float(updated) if isinstance(updated, (int, float)) else 0.0
+        prev = best.get(sid)
+        if prev is None or updated >= prev[0]:
+            best[sid] = (updated, status)
+    return {sid: st for sid, (_, st) in best.items()}
+
+
+def pid_files_present() -> bool:
+    """True if this Claude version manages session pid files at all
+    (~/.claude/sessions/<pid>.json). Claude >= 2.1.158 writes one per
+    live session and REMOVES it on quit.
+
+    Why this matters: when pid tracking is active, a session that is
+    absent from ``live_session_ids`` has genuinely exited — its file was
+    removed when the process quit — so it cannot still be "Working".
+    When tracking is inactive (older Claude that never wrote pid files),
+    "not live" is uninformative and we must fall back to the transcript
+    heuristic + the dormancy grace window."""
+    try:
+        return any(CLAUDE_SESSIONS_DIR.glob("*.json"))
+    except OSError:
+        return False
+
+
+def runtime_status_for(
+    sid: str, live: set[str], status_map: dict[str, str], tracking: bool,
+) -> str | None:
+    """Resolve one session's authoritative runtime signal:
+
+      "busy"   – a live process reports it is actively processing.
+      "idle"   – a live process reports it is waiting on the user.
+      "exited" – no live process AND this Claude tracks pid files, so the
+                 session has quit and cannot be "Working" anymore.
+      None     – unknown; callers fall back to the transcript heuristic.
+
+    This is the single place that fuses the two ground-truth signals
+    Claude exposes — the per-pid ``status`` field and process liveness —
+    so a session that the user has exited stops reading as "Working"
+    immediately rather than after the 10-minute dormancy grace window."""
+    st = status_map.get(sid)
+    if st in ("busy", "idle"):
+        return st
+    if sid in live:
+        # Alive, but a pre-status-field Claude: defer to the heuristic.
+        return None
+    if tracking:
+        # Not alive and this Claude removes pid files on quit → exited.
+        return "exited"
+    return None
+
+
 def is_dormant(
     session_id: str,
     ago_seconds: float,
@@ -927,16 +1026,24 @@ BUCKET_DISPLAY: dict[str, tuple[str, str, str]] = {
 }
 
 
-def classify(state: str, phase_label: str) -> str:
+def classify(state: str, phase_label: str, runtime_status: str | None = None) -> str:
     """Map (state, phase_label) → one of {needs, working, ready}.
     Dormant is NOT decided here — `is_dormant` overrides this once
-    activity-age + process-liveness are known."""
+    activity-age + process-liveness are known.
+
+    ``runtime_status`` is the authoritative signal from
+    ``runtime_status_for`` ("busy" | "idle" | "exited"). When Claude is
+    not processing ("idle" or "exited") we must not park the session in
+    WORKING — even the "Awaiting sub-agent" override below is
+    suppressed, because a non-processing session has no child running."""
     # "Awaiting sub-agent" wins over "Maybe stuck": the parent
     # transcript naturally goes silent for the duration of a long
     # sub-agent run, so the stuck timer would otherwise flag every
     # multi-minute delegation as NEEDS YOU. The parent isn't stuck —
-    # it's waiting on its child to return.
-    if phase_label == "Awaiting sub-agent":
+    # it's waiting on its child to return. But an authoritative
+    # idle/exited means no child is actually running, so don't force
+    # WORKING.
+    if phase_label == "Awaiting sub-agent" and runtime_status not in ("idle", "exited"):
         return BUCKET_WORKING
     if state == "Maybe stuck":
         return BUCKET_NEEDS
@@ -949,7 +1056,9 @@ def classify(state: str, phase_label: str) -> str:
     return BUCKET_READY
 
 
-def state_for(meta: dict, ago_seconds: float) -> tuple[str, str]:
+def state_for(
+    meta: dict, ago_seconds: float, runtime_status: str | None = None,
+) -> tuple[str, str]:
     """Distinguish four real states:
       - User just spoke (Working): Claude is processing.
       - Assistant called an interactive tool (Waiting): blocked on user input
@@ -958,9 +1067,34 @@ def state_for(meta: dict, ago_seconds: float) -> tuple[str, str]:
       - Assistant ended with text (Waiting): user's turn.
     The interactive-tool case has to be separated because a tool_use entry
     normally signals 'mid-flight' (Working) — but for AskUserQuestion /
-    ExitPlanMode the assistant is genuinely paused on the user."""
+    ExitPlanMode the assistant is genuinely paused on the user.
+
+    ``runtime_status`` is the authoritative busy/idle Claude writes into
+    its session pid file (Claude >= 2.1.158; see
+    ``session_runtime_status``). When present it OVERRIDES the
+    transcript heuristic for the busy/idle question, because the
+    transcript can lie: if the user typed a message and then exited
+    before Claude replied, ``lastRole == "user"`` makes the heuristic
+    report "Working…" indefinitely. Trusting ``status`` is what frees an
+    exited session from the WORKING column. The needs-vs-finished split
+    for an idle session is still left to ``classify`` via phase_label —
+    we only guarantee an idle session never reads as "Working…"."""
     role = meta.get("lastRole")
     has_text = meta.get("lastAssistantHasText")
+    # Authoritative status from Claude itself wins over the heuristic.
+    # "exited" (process gone) is treated like "idle": no process means
+    # nothing is processing, so the session cannot be "Working…".
+    if runtime_status in ("idle", "exited"):
+        # Not processing → user's turn. classify() routes this to
+        # NEEDS YOU (pending question/plan) or FINISHED via phase_label;
+        # crucially it is never "Working…".
+        return ("Waiting on you", GREEN)
+    if runtime_status == "busy":
+        # Actively processing. Preserve the stuck-escalation so a wedged
+        # turn still surfaces as NEEDS YOU rather than spinning forever.
+        if ago_seconds > STUCK_AFTER_SECS:
+            return ("Maybe stuck", RED)
+        return ("Working…", YELLOW)
     if role == "user":
         if ago_seconds > STUCK_AFTER_SECS:
             return ("Maybe stuck", RED)
@@ -1154,7 +1288,10 @@ def truncate(s: str, width: int) -> str:
     return s[: max(1, width - 1)] + "…"
 
 
-def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> dict:
+def _prepare_row(
+    s: dict, now_ts: float, desktop_idx: dict, live: set[str],
+    status_map: dict[str, str] | None = None, tracking: bool = False,
+) -> dict:
     """Resolve everything we need to render one session, in one pass.
     Both list and kanban renderers call this so the two views can never
     disagree about a session's bucket, state, or gist."""
@@ -1165,14 +1302,15 @@ def _prepare_row(s: dict, now_ts: float, desktop_idx: dict, live: set[str]) -> d
         last_epoch = s.get("fileMtime", 0) / 1000
     ago_secs = now_ts - last_epoch
 
+    sid = s.get("sessionId") or ""
+    runtime_status = runtime_status_for(sid, live, status_map or {}, tracking)
     phase_emoji, phase_label = infer_phase(meta)
-    state, color = state_for(meta, ago_secs)
+    state, color = state_for(meta, ago_secs, runtime_status)
     hint = next_action(phase_label, meta.get("lastRole"), ago_secs)
     if state == "Working…" and meta.get("lastRole") == "assistant":
         hint = "Wait — Claude is mid-tool"
 
-    bucket = classify(state, phase_label)
-    sid = s.get("sessionId") or ""
+    bucket = classify(state, phase_label, runtime_status)
     if is_dormant(sid, ago_secs, live, bucket):
         bucket = BUCKET_DORMANT
 
@@ -1502,7 +1640,9 @@ def render(
     # 23 files) so every row's title resolution sees user-set titles.
     desktop_idx = desktop_titles()
     live = live_session_ids()
-    rows = [_prepare_row(s, now_ts, desktop_idx, live) for s in sessions]
+    status_map = session_runtime_status()
+    tracking = pid_files_present()
+    rows = [_prepare_row(s, now_ts, desktop_idx, live, status_map, tracking) for s in sessions]
 
     # Resolve which view the body will actually render in (kanban may fall
     # back to list when the terminal is too narrow). The numbering must
