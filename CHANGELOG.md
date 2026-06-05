@@ -6,6 +6,28 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 
 ## 0.6.1 — 2026-06-06
 
+### Fixed — clicking a terminal session opened Claude Desktop
+
+- **Clicking a session running in a terminal now focuses that terminal
+  tab instead of bringing Claude Desktop forward.** Navigation decided
+  the host from the `entrypoint` field in
+  `~/.claude/sessions/<pid>.json`, but the `claude` CLI binary bundled
+  *inside* Claude Desktop records `entrypoint="claude-desktop"` even when
+  you launch it from a shell — so every terminal session was misrouted to
+  "activate Claude Desktop." Host detection now keys off the process's
+  real controlling TTY: a session that owns a `ttysNNN` is a terminal
+  session (focus its tab via AppleScript/TTY match), and only a session
+  with no TTY is treated as headless inside Claude Desktop. `entrypoint`
+  remains a fallback for the no-TTY case.
+- **Non-Terminal.app emulators are now detected.** `_find_terminal_ancestor`
+  walked the parent chain using `ps -o comm=`, which macOS truncates to
+  ~16 characters — so `/System/.../Terminal.app/.../Terminal` arrived as
+  `/System/Applicat` and never matched any known emulator. It now uses the
+  untruncated `ps -o command=` and matches against just the executable
+  path, so iTerm, Ghostty, Alacritty, WezTerm, kitty, Hyper, and Tabby
+  are recognized as the terminal host (Terminal.app already worked via a
+  default + TTY focus).
+
 ### Fixed — exited sessions stuck in WORKING
 
 - **Sessions you've exited no longer hang in the WORKING column.**

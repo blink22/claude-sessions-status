@@ -654,8 +654,16 @@ def _find_terminal_ancestor(pid: int) -> str | None:
     while cur > 1 and cur not in seen:
         seen.add(cur)
         try:
+            # `comm=` truncates to ~16 chars on macOS, so a path like
+            # '/System/Applications/Utilities/Terminal.app/.../Terminal'
+            # comes back as '/System/Applicat' and never matches. Use the
+            # untruncated `command=` and match against just the executable
+            # path (its first whitespace-delimited token) so process
+            # arguments can't trigger false positives. ppid goes first so
+            # we can peel it off the front before the (space-containing)
+            # command.
             r = subprocess.run(
-                ["ps", "-p", str(cur), "-o", "comm=,ppid="],
+                ["ps", "-p", str(cur), "-o", "ppid=,command="],
                 capture_output=True, text=True, timeout=2,
             )
         except (OSError, subprocess.SubprocessError):
@@ -663,12 +671,14 @@ def _find_terminal_ancestor(pid: int) -> str | None:
         line = r.stdout.strip()
         if not line:
             return None
-        parts = line.rsplit(None, 1)
-        if len(parts) != 2:
+        parts = line.split(None, 1)
+        if not parts:
             return None
-        comm, ppid_str = parts
+        ppid_str = parts[0]
+        command = parts[1] if len(parts) > 1 else ""
+        exe = command.split(None, 1)[0] if command else ""
         for needle, app in _KNOWN_TERMINAL_PROCS.items():
-            if needle in comm:
+            if needle in exe:
                 return app
         try:
             cur = int(ppid_str)
@@ -692,11 +702,15 @@ def _tty_for_pid(pid: int) -> str:
 
 def _find_live_session_host(session_id: str) -> dict | None:
     """Walk ~/.claude/sessions/*.json looking for a live process whose
-    `sessionId` matches. Returns:
+    `sessionId` matches. The host kind is decided by the process's real
+    controlling TTY, not the `entrypoint` field — the CLI bundled with
+    Claude Desktop records entrypoint="claude-desktop" even when launched
+    from a shell, so entrypoint alone misroutes terminal sessions.
+    Returns:
       {kind: "claude-desktop", pid: int}
-        — the session is running inside the Claude Desktop app
+        — headless inside the Claude Desktop app (no controlling TTY)
       {kind: "terminal", pid: int, tty: str, terminal_app: str}
-        — the session is running in a terminal emulator
+        — the session owns a TTY in a terminal emulator
       None
         — no live host for this session"""
     if not session_id or not _CLAUDE_PROCESS_SESSIONS_DIR.exists():
@@ -720,15 +734,37 @@ def _find_live_session_host(session_id: str) -> dict | None:
             os.kill(pid, 0)
         except OSError:
             continue
+        # The controlling TTY — not `entrypoint` — is the reliable host
+        # signal. The `claude` CLI binary that ships *inside* Claude
+        # Desktop writes entrypoint="claude-desktop" even when the user
+        # launched it from a terminal shell, so a terminal session would
+        # otherwise be misrouted to "activate Claude Desktop". A real
+        # TTY (e.g. 'ttys000') means a terminal emulator owns the
+        # process; '??' / empty means it's running headless inside
+        # Claude Desktop.
+        tty = _tty_for_pid(pid)
+        is_real_tty = bool(tty) and tty not in ("?", "??")
+        if is_real_tty:
+            return {
+                "kind": "terminal",
+                "pid": pid,
+                "tty": tty,
+                "terminal_app": _find_terminal_ancestor(pid),
+            }
+        # No controlling TTY — genuinely headless. Trust entrypoint, and
+        # treat a Claude Desktop ancestor (no terminal in the chain) the
+        # same way.
         entrypoint = data.get("entrypoint", "")
-        if entrypoint == "claude-desktop":
+        ancestor = _find_terminal_ancestor(pid)
+        if entrypoint == "claude-desktop" or ancestor is None:
             return {"kind": "claude-desktop", "pid": pid}
-        # Treat anything else (cli, interactive, missing) as terminal.
+        # Has a terminal ancestor but no tty yet (rare startup race) —
+        # fall back to treating it as a terminal session.
         return {
             "kind": "terminal",
             "pid": pid,
-            "tty": _tty_for_pid(pid),
-            "terminal_app": _find_terminal_ancestor(pid),
+            "tty": tty,
+            "terminal_app": ancestor,
         }
     return None
 
@@ -3421,7 +3457,7 @@ class PopoverVC(NSViewController):
         """Navigate to a session — preferring an existing host over
         spawning a new one. Three branches:
 
-        1. Session is alive in Claude.app (entrypoint=claude-desktop)
+        1. Session is alive headless in Claude.app (no controlling TTY)
            → bring Claude.app to the front so the user can select that
            session in its in-app sidebar.
 
