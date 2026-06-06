@@ -1423,6 +1423,144 @@
     letter-spacing: 0.04em;
     margin-top: -4px;
   }
+  /* Session launch config (permission mode + new/existing session)
+   * shown in the start modal as segmented pill controls. */
+  #task-start-modal .tsm-cfg {
+    border: 1px solid var(--hairline-strong);
+    border-radius: 8px;
+    padding: 12px 13px;
+    display: flex;
+    flex-direction: column;
+    gap: 11px;
+    background: rgba(0,0,0,0.18);
+  }
+  #task-start-modal .tsm-seg-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  #task-start-modal .tsm-seg-label {
+    flex: 0 0 70px;
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--text-4);
+  }
+  #task-start-modal .tsm-seg {
+    flex: 1;
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    background: rgba(0,0,0,0.32);
+    border: 1px solid var(--hairline-strong);
+    border-radius: 7px;
+  }
+  #task-start-modal .tsm-seg-btn {
+    flex: 1;
+    font-family: var(--sans);
+    font-size: 11.5px;
+    color: var(--text-2);
+    background: transparent;
+    border: 0;
+    border-radius: 5px;
+    padding: 5px 6px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 90ms ease, color 90ms ease;
+  }
+  #task-start-modal .tsm-seg-btn:hover {
+    color: var(--text-1);
+    background: rgba(255,255,255,0.05);
+  }
+  #task-start-modal .tsm-seg-btn.active {
+    background: var(--blue);
+    color: #fff;
+    font-weight: 600;
+  }
+  /* Resume picker: a trigger button + dropdown menu that reuses the
+   * .session-picker-item / .sdot styling (status dots) from the
+   * task-attach picker, so both pickers look identical. */
+  #task-start-modal .tsm-resume-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+  }
+  #task-start-modal .tsm-resume-trigger {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0,0,0,0.32);
+    border: 1px solid var(--hairline-strong);
+    border-radius: 7px;
+    color: var(--text-1);
+    font-family: var(--sans);
+    font-size: 12px;
+    padding: 6px 8px;
+    cursor: pointer;
+    outline: none;
+    box-sizing: border-box;
+  }
+  #task-start-modal .tsm-resume-trigger:hover {
+    border-color: rgba(106,166,248,0.40);
+  }
+  #task-start-modal .tsm-resume-trigger:disabled {
+    color: var(--text-4);
+    cursor: default;
+  }
+  #task-start-modal .tsm-resume-trigger .sdot {
+    font-size: 11px;
+    line-height: 1;
+    flex-shrink: 0;
+    color: var(--text-3);
+  }
+  #task-start-modal .tsm-resume-trigger.bucket-working .sdot { color: var(--amber); }
+  #task-start-modal .tsm-resume-trigger.bucket-needs   .sdot { color: var(--red); }
+  #task-start-modal .tsm-resume-trigger.bucket-ready   .sdot { color: var(--green); }
+  #task-start-modal .tsm-resume-trigger.bucket-dormant .sdot { color: var(--text-3); }
+  #task-start-modal .tsm-resume-trigger .tsm-resume-label {
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #task-start-modal .tsm-resume-trigger .tsm-resume-caret {
+    color: var(--text-4);
+    font-size: 10px;
+    flex-shrink: 0;
+  }
+  #task-start-modal .tsm-resume-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 5;
+    background: var(--bg-popover);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 7px;
+    box-shadow: 0 12px 28px rgba(0,0,0,0.45);
+    padding: 4px 0;
+    max-height: 216px;
+    overflow-y: auto;
+  }
+  #task-start-modal .tsm-resume-menu[hidden] { display: none; }
+  #task-start-modal .tsm-resume-menu .sphase { margin-left: auto; }
+  #task-start-modal .tsm-cmd {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    color: var(--text-4);
+    letter-spacing: 0.02em;
+    word-break: break-all;
+    line-height: 1.5;
+    margin-top: 1px;
+  }
+  #task-start-modal .tsm-cmd b {
+    color: var(--text-3);
+    font-weight: 600;
+  }
 </style>
 </head>
 <body>
@@ -1442,6 +1580,37 @@
     </div>
     <textarea id="tsm-prompt" placeholder="What should Claude do?"></textarea>
     <div class="hint">Edit if needed · Cmd+Enter to launch · Esc to cancel</div>
+    <div class="tsm-cfg">
+      <div class="tsm-seg-row">
+        <span class="tsm-seg-label">Session</span>
+        <div class="tsm-seg" id="tsm-session" role="group" aria-label="Session target">
+          <button type="button" class="tsm-seg-btn" data-value="new">New session</button>
+          <button type="button" class="tsm-seg-btn" data-value="existing">Existing session</button>
+        </div>
+      </div>
+      <div class="tsm-seg-row" id="tsm-resume-row" style="display:none;">
+        <span class="tsm-seg-label">Resume</span>
+        <div class="tsm-resume-wrap" id="tsm-resume-wrap">
+          <button type="button" class="tsm-resume-trigger" id="tsm-resume-trigger"
+                  aria-haspopup="listbox" aria-expanded="false">
+            <span class="sdot" id="tsm-resume-dot">○</span>
+            <span class="tsm-resume-label" id="tsm-resume-label">Most recent</span>
+            <span class="tsm-resume-caret">▾</span>
+          </button>
+          <div class="tsm-resume-menu" id="tsm-resume-menu" role="listbox" hidden></div>
+        </div>
+      </div>
+      <div class="tsm-seg-row">
+        <span class="tsm-seg-label">Permission</span>
+        <div class="tsm-seg" id="tsm-perm" role="group" aria-label="Permission mode">
+          <button type="button" class="tsm-seg-btn" data-value="default">Default</button>
+          <button type="button" class="tsm-seg-btn" data-value="acceptEdits">Auto-accept</button>
+          <button type="button" class="tsm-seg-btn" data-value="plan">Plan</button>
+          <button type="button" class="tsm-seg-btn" data-value="bypass">Auto</button>
+        </div>
+      </div>
+      <div class="tsm-cmd" id="tsm-cmd"></div>
+    </div>
     <div class="btns">
       <button class="btn" id="tsm-cancel" type="button">Cancel</button>
       <button class="btn primary" id="tsm-confirm" type="button">Start ▶</button>
@@ -2508,6 +2677,168 @@
     return '…/' + parts.slice(-2).join('/');
   }
 
+  // ---- New-session launch config controls (permission mode + new/
+  // existing session) as segmented pills. Pre-filled from
+  // window.__startConfig (pushed by Python), read back on confirm, and
+  // previewed live as a `claude …` command. ----
+  const TSM_PERM_MODES = ['default', 'acceptEdits', 'plan', 'bypass'];
+  const TSM_SESSION_TARGETS = ['new', 'existing'];
+
+  // Segmented control get/set: the active <button>'s data-value is the
+  // value; selecting one clears its siblings.
+  function segGet(groupId) {
+    const on = document.querySelector('#' + groupId + ' .tsm-seg-btn.active');
+    return on ? on.getAttribute('data-value') : null;
+  }
+  function segSet(groupId, value, fallback) {
+    const group = document.getElementById(groupId);
+    if (!group) return;
+    const btns = group.querySelectorAll('.tsm-seg-btn');
+    let matched = false;
+    btns.forEach(function(b) {
+      const on = b.getAttribute('data-value') === value;
+      b.classList.toggle('active', on);
+      if (on) matched = true;
+    });
+    if (!matched && btns.length) {
+      // Never leave a control with nothing selected — snap to fallback.
+      const want = fallback || btns[0].getAttribute('data-value');
+      btns.forEach(function(b) {
+        b.classList.toggle('active', b.getAttribute('data-value') === want);
+      });
+    }
+  }
+
+  // ---- Resume picker: a custom dropdown with status dots, matching the
+  // task-attach session picker. Sessions come straight from the last
+  // payload Python pushed (_lastData.buckets), filtered to the modal's
+  // folder — so it works even when the drawer was never opened. ----
+  let _tsmResumeSessions = [];   // sessions in the modal's folder, newest first
+  let _tsmResumeSid = '';        // chosen session id ('' = none → --continue)
+
+  function _resumeGlyph(bucket) {
+    return bucket === 'working' ? '◐' : bucket === 'ready' ? '●' : '○';
+  }
+  function _resumeLabel(s) {
+    return (s.title && s.title !== '(untitled)') ? s.title : (s.gist || 'session');
+  }
+  // Rebuild the session list for a folder; default selection is the most
+  // recent. Re-renders the menu + trigger.
+  function populateResumeOptions(cwd) {
+    const buckets = (_lastData && _lastData.buckets) || {};
+    const rows = [];
+    // Require a non-empty cwd so an unattached task (which can carry an
+    // empty cwd) doesn't lump together every cwd-less session.
+    ['needs', 'working', 'ready', 'dormant'].forEach(function(k) {
+      (buckets[k] || []).forEach(function(r) {
+        if (r && r.sessionId && cwd && r.cwd === cwd) rows.push(r);
+      });
+    });
+    rows.sort(function(a, b) { return (a.ago_s || 0) - (b.ago_s || 0); });  // newest first
+    _tsmResumeSessions = rows;
+    _tsmResumeSid = rows.length ? rows[0].sessionId : '';   // default: most recent
+    renderResumeMenu();
+    updateResumeTrigger();
+  }
+  function renderResumeMenu() {
+    const menu = document.getElementById('tsm-resume-menu');
+    if (!menu) return;
+    if (!_tsmResumeSessions.length) {
+      menu.innerHTML = '<div class="session-picker-empty">No tracked sessions in this folder.</div>';
+      return;
+    }
+    menu.innerHTML = _tsmResumeSessions.map(function(s) {
+      const cur = s.sessionId === _tsmResumeSid;
+      return '<div class="session-picker-item bucket-' + esc(s.bucket || 'dormant')
+        + (cur ? ' current' : '') + '" role="option" data-sid="' + esc(s.sessionId) + '">'
+        + '<span class="sdot">' + _resumeGlyph(s.bucket) + '</span>'
+        + '<span class="stitle">' + esc(_resumeLabel(s)) + '</span>'
+        + (s.age ? '<span class="sphase">' + esc(s.age) + '</span>' : '')
+        + '</div>';
+    }).join('');
+  }
+  function updateResumeTrigger() {
+    const trigger = document.getElementById('tsm-resume-trigger');
+    const dot = document.getElementById('tsm-resume-dot');
+    const label = document.getElementById('tsm-resume-label');
+    if (!trigger || !dot || !label) return;
+    trigger.classList.remove('bucket-working', 'bucket-needs', 'bucket-ready', 'bucket-dormant');
+    if (!_tsmResumeSessions.length) {
+      trigger.disabled = true;
+      dot.textContent = '○';
+      label.textContent = 'No tracked sessions — uses most recent';
+      return;
+    }
+    trigger.disabled = false;
+    const sel = _tsmResumeSessions.find(function(s) { return s.sessionId === _tsmResumeSid; }) || _tsmResumeSessions[0];
+    trigger.classList.add('bucket-' + (sel.bucket || 'dormant'));
+    dot.textContent = _resumeGlyph(sel.bucket);
+    label.textContent = _resumeLabel(sel) + (sel.age ? ('  ·  ' + sel.age) : '');
+  }
+  function toggleResumeMenu(show) {
+    const menu = document.getElementById('tsm-resume-menu');
+    const trigger = document.getElementById('tsm-resume-trigger');
+    if (!menu || !trigger) return;
+    const open = (show === undefined) ? menu.hasAttribute('hidden') : show;
+    if (open && !trigger.disabled) {
+      renderResumeMenu();
+      menu.removeAttribute('hidden');
+      trigger.setAttribute('aria-expanded', 'true');
+    } else {
+      menu.setAttribute('hidden', '');
+      trigger.setAttribute('aria-expanded', 'false');
+    }
+  }
+  // The resume picker only matters for an existing session — show it
+  // exactly when that target is selected, and close the menu otherwise.
+  function syncResumeVisibility() {
+    const existing = segGet('tsm-session') === 'existing';
+    const row = document.getElementById('tsm-resume-row');
+    if (row) row.style.display = existing ? 'flex' : 'none';
+    if (!existing) toggleResumeMenu(false);
+  }
+
+  function applyStartConfig(sc) {
+    sc = sc || {};
+    segSet('tsm-session', TSM_SESSION_TARGETS.indexOf(sc.sessionTarget) >= 0 ? sc.sessionTarget : 'new', 'new');
+    segSet('tsm-perm', TSM_PERM_MODES.indexOf(sc.permissionMode) >= 0 ? sc.permissionMode : 'default', 'default');
+    syncResumeVisibility();
+    updateStartCmdPreview();
+  }
+  function collectStartConfig() {
+    const target = segGet('tsm-session') || 'new';
+    // Validate the chosen id against the *current* session list before
+    // sending it: a background refresh can age the selected session out
+    // of _lastData while the modal sits open, in which case the trigger
+    // already falls back to most-recent for display — mirror that here
+    // so the sent --resume id never diverges from what's shown.
+    let rid = '';
+    if (target === 'existing' && _tsmResumeSessions.length) {
+      const valid = _tsmResumeSessions.some(function(s) { return s.sessionId === _tsmResumeSid; });
+      rid = valid ? _tsmResumeSid : _tsmResumeSessions[0].sessionId;
+    }
+    return {
+      permissionMode: segGet('tsm-perm') || 'default',
+      sessionTarget: target,
+      resumeSessionId: rid,
+    };
+  }
+  // Mirror floating.py's _start_config_flags so the preview matches the
+  // command that will actually run.
+  function updateStartCmdPreview() {
+    const el = document.getElementById('tsm-cmd');
+    if (!el) return;
+    const sc = collectStartConfig();
+    const parts = ['claude'];
+    if (sc.permissionMode === 'bypass') parts.push('--dangerously-skip-permissions');
+    else if (sc.permissionMode === 'acceptEdits' || sc.permissionMode === 'plan') parts.push('--permission-mode', sc.permissionMode);
+    if (sc.sessionTarget === 'existing') {
+      if (sc.resumeSessionId) parts.push('--resume', sc.resumeSessionId.slice(0, 8) + '…');
+      else parts.push('--continue');
+    }
+    el.innerHTML = '<b>' + esc(parts.join(' ')) + '</b> "…"';
+  }
+
   let _tsmCwd = '';            // captured at open time
   function openTaskStartModal(prompt, cwd) {
     const modal = document.getElementById('task-start-modal');
@@ -2517,6 +2848,8 @@
     _tsmCwd = cwd || '';
     folderEl.textContent = shortFolder(cwd);
     promptEl.value = prompt || '';
+    populateResumeOptions(_tsmCwd);
+    applyStartConfig(window.__startConfig || {});
     modal.classList.add('open');
     modal.setAttribute('aria-hidden', 'false');
     // Focus + select-all so the user can either keep the task
@@ -2529,6 +2862,7 @@
   function closeTaskStartModal() {
     const modal = document.getElementById('task-start-modal');
     if (!modal) return;
+    toggleResumeMenu(false);
     modal.classList.remove('open');
     modal.setAttribute('aria-hidden', 'true');
     _tsmCwd = '';
@@ -2538,8 +2872,14 @@
     if (!promptEl) return;
     const text = (promptEl.value || '').trim();
     if (!text) return;
-    // Send to Python — it spawns Terminal + closes the popover.
-    send('taskStart', { prompt: text, cwd: _tsmCwd });
+    // Send to Python — it persists this launch config as last-used,
+    // spawns Terminal with the matching `claude` flags, + closes the
+    // popover.
+    send('taskStart', {
+      prompt: text,
+      cwd: _tsmCwd,
+      startConfigJson: JSON.stringify(collectStartConfig()),
+    });
     closeTaskStartModal();
   }
   // Wire modal controls once at script load.
@@ -2550,6 +2890,48 @@
     const modal = document.getElementById('task-start-modal');
     if (cancelBtn) cancelBtn.addEventListener('click', closeTaskStartModal);
     if (confirmBtn) confirmBtn.addEventListener('click', confirmTaskStart);
+    // Segmented controls: clicking a pill selects it (clearing its
+    // siblings), reveals the resume picker when "Existing" is chosen,
+    // and updates the live `claude …` command preview.
+    ['tsm-session', 'tsm-perm'].forEach(function(groupId) {
+      const group = document.getElementById(groupId);
+      if (!group) return;
+      group.addEventListener('click', function(ev) {
+        const btn = ev.target.closest('.tsm-seg-btn');
+        if (!btn || !group.contains(btn)) return;
+        segSet(groupId, btn.getAttribute('data-value'));
+        if (groupId === 'tsm-session') syncResumeVisibility();
+        updateStartCmdPreview();
+      });
+    });
+    // Resume picker: trigger toggles the menu; clicking a row selects
+    // that session and updates the trigger + preview.
+    const resumeTrigger = document.getElementById('tsm-resume-trigger');
+    if (resumeTrigger) {
+      resumeTrigger.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        toggleResumeMenu();
+      });
+    }
+    const resumeMenu = document.getElementById('tsm-resume-menu');
+    if (resumeMenu) {
+      resumeMenu.addEventListener('click', function(ev) {
+        const item = ev.target.closest('.session-picker-item');
+        if (!item) return;
+        ev.stopPropagation();
+        _tsmResumeSid = item.getAttribute('data-sid') || '';
+        updateResumeTrigger();
+        toggleResumeMenu(false);
+        updateStartCmdPreview();
+      });
+    }
+    // Click anywhere else in the modal closes the open resume menu.
+    if (modal) {
+      modal.addEventListener('click', function(ev) {
+        const wrap = document.getElementById('tsm-resume-wrap');
+        if (wrap && !wrap.contains(ev.target)) toggleResumeMenu(false);
+      });
+    }
     if (modal) {
       // Click on the dim backdrop (but not the card) cancels.
       modal.addEventListener('click', function(ev) {
@@ -2969,6 +3351,11 @@
     // selection. Set BEFORE the dedupe check so the cache is fresh
     // even on a no-op render.
     _lastData = data;
+
+    // Stash the last-used new-session launch config so the start modal
+    // pre-fills its controls. Set before the dedupe return so it stays
+    // fresh even on a no-op render tick.
+    if (data && data.startConfig) window.__startConfig = data.startConfig;
 
     // Dedupe identical payloads — skip the whole rebuild so cards
     // don't visually jump on quiet refresh ticks. Comparison cost is

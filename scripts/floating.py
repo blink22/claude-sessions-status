@@ -276,6 +276,83 @@ def _write_density(value: str) -> None:
     _atomic_write_text(DENSITY_FILE, value)
 
 
+# ---------- New-session launch config ----------
+# Options the user picks in the "Start a new Claude session" modal before
+# launching: permission/auto mode, model, and whether to continue the
+# folder's most recent session. Persisted globally (last-used) so the
+# modal reopens pre-filled with the previous choice, and turned into
+# `claude` CLI flags at spawn time. JSON because it's a small heterogenous
+# dict (string + string + bool), unlike the plain-text single-value prefs.
+START_CONFIG_FILE = HOME / ".claude-sessions-status-start-config.json"
+START_PERM_MODES = ("default", "acceptEdits", "plan", "bypass")
+START_SESSION_TARGETS = ("new", "existing")
+START_CONFIG_DEFAULT = {
+    "permissionMode": "default",
+    "sessionTarget": "new",
+}
+
+
+def _coerce_start_config(raw: dict) -> dict:
+    """Validate an arbitrary dict into a clean start-config, dropping
+    anything unrecognized back to its default. Shared by load + save so
+    a corrupt file and a malformed JS payload both normalize the same way.
+    Also migrates the old schema's ``continueSession`` flag to the new
+    ``sessionTarget`` field."""
+    cfg = dict(START_CONFIG_DEFAULT)
+    if isinstance(raw, dict):
+        pm = str(raw.get("permissionMode") or "").strip()
+        if pm in START_PERM_MODES:
+            cfg["permissionMode"] = pm
+        st = str(raw.get("sessionTarget") or "").strip()
+        if st in START_SESSION_TARGETS:
+            cfg["sessionTarget"] = st
+        elif raw.get("continueSession"):
+            cfg["sessionTarget"] = "existing"
+    return cfg
+
+
+def _load_start_config() -> dict:
+    try:
+        raw = json.loads(START_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return dict(START_CONFIG_DEFAULT)
+    return _coerce_start_config(raw)
+
+
+def _save_start_config(cfg: dict) -> None:
+    try:
+        _atomic_write_text(
+            START_CONFIG_FILE,
+            json.dumps(_coerce_start_config(cfg), indent=2),
+        )
+    except (TypeError, ValueError) as e:  # noqa: BLE001
+        sys.stderr.write(f"[start-config save] {e!r}\n")
+
+
+def _start_config_flags(cfg: dict) -> list[str]:
+    """Turn a start-config dict into the `claude` CLI argv flags that
+    realize it. Default permission mode emits nothing (let Claude Code
+    use its own default). Bypass maps to the canonical --dangerously-
+    skip-permissions flag; acceptEdits/plan use --permission-mode. An
+    "existing" session target resumes a specific past session via
+    --resume <id> when ``resumeSessionId`` is given, else falls back to
+    the folder's most recent session via --continue; "new" (the default)
+    starts fresh."""
+    flags: list[str] = []
+    pm = cfg.get("permissionMode", "default")
+    if pm == "bypass":
+        flags.append("--dangerously-skip-permissions")
+    elif pm in ("acceptEdits", "plan"):
+        flags += ["--permission-mode", pm]
+    if cfg.get("sessionTarget") == "existing":
+        rid = str(cfg.get("resumeSessionId") or "").strip()
+        if rid:
+            flags += ["--resume", rid]
+        else:
+            flags.append("--continue")
+    return flags
+
+
 # ---------- Unread / seen state ----------
 # Per-session "last seen" timestamp lives in ~/.claude-sessions-status-seen.json.
 # A session is *unread* when its current lastTurnEpoch (real conversation
@@ -3086,6 +3163,9 @@ class PopoverVC(NSViewController):
                 self._build_sidebar_data(buckets)
                 if self.mode != "list" else None
             ),
+            # Last-used new-session launch config, so the start modal can
+            # pre-fill its permission-mode / model / continue controls.
+            "startConfig": _load_start_config(),
         }
 
         # If the JS isn't ready yet (initial loadHTMLString hasn't
@@ -3358,7 +3438,29 @@ class PopoverVC(NSViewController):
             target_cwd = pstr("cwd")
             if not prompt:
                 return
-            self._spawn_new_terminal_with_prompt(target_cwd, prompt)
+            # Launch config chosen in the modal (permission mode, model,
+            # continue). Persist it as the new last-used so the modal
+            # reopens pre-filled, then translate to `claude` CLI flags.
+            sc_raw = pstr("startConfigJson")
+            raw_cfg = None
+            if sc_raw:
+                try:
+                    raw_cfg = json.loads(sc_raw)
+                except (ValueError, TypeError):
+                    raw_cfg = None
+            if isinstance(raw_cfg, dict):
+                start_cfg = _coerce_start_config(raw_cfg)
+                _save_start_config(start_cfg)   # persist only the sticky part
+                # The chosen resume target is a specific session id — per
+                # launch, not persisted. Carry it through for flag-building.
+                if start_cfg.get("sessionTarget") == "existing":
+                    rid = str(raw_cfg.get("resumeSessionId") or "").strip()
+                    if rid:
+                        start_cfg["resumeSessionId"] = rid
+            else:
+                start_cfg = _load_start_config()
+            flags = _start_config_flags(start_cfg)
+            self._spawn_new_terminal_with_prompt(target_cwd, prompt, flags)
             # Defer the popover close to the next runloop tick. Closing
             # synchronously from inside this script-message handler
             # has caused intermittent stalls (visible as a hover
@@ -3641,28 +3743,33 @@ class PopoverVC(NSViewController):
             sys.stderr.write(f"[_spawn_new_terminal_session] {e!r}\n")
 
     @objc.python_method
-    def _spawn_new_terminal_with_prompt(self, cwd: str, prompt: str) -> None:
+    def _spawn_new_terminal_with_prompt(
+        self, cwd: str, prompt: str, flags: "list[str] | None" = None
+    ) -> None:
         """Open a fresh Terminal window at ``cwd`` and launch
-        ``claude <prompt>`` so the new Claude Code session starts with
-        the user's edited task text as its first message. Used by the
-        "▶ start" affordance on task rows.
+        ``claude [flags] <prompt>`` so the new Claude Code session starts
+        with the user's edited task text as its first message and the
+        launch options chosen in the modal (permission mode, model,
+        continue). Used by the "▶ start" affordance on task rows.
 
         We pass the prompt as a single positional argument; Claude
         Code's CLI treats argv[1:] as the initial user prompt and
-        opens the interactive REPL with that already submitted. Both
-        cwd and prompt are shlex-quoted, then the whole shell command
-        is JSON-encoded so AppleScript's `do script` sees a single,
-        properly-escaped string — without that the quoted shell
-        snippet's embedded quotes break the AppleScript parser."""
+        opens the interactive REPL with that already submitted. cwd,
+        every flag, and the prompt are shlex-quoted, then the whole
+        shell command is JSON-encoded so AppleScript's `do script` sees
+        a single, properly-escaped string — without that the quoted
+        shell snippet's embedded quotes break the AppleScript parser."""
         import shlex
         if not cwd:
             cwd = os.path.expanduser("~")
         prompt = (prompt or "").strip()
         if not prompt:
             return
-        shell_cmd = (
-            f"cd {shlex.quote(cwd)} && claude {shlex.quote(prompt)}"
-        )
+        claude_parts = ["claude"]
+        for f in (flags or []):
+            claude_parts.append(shlex.quote(str(f)))
+        claude_parts.append(shlex.quote(prompt))
+        shell_cmd = f"cd {shlex.quote(cwd)} && {' '.join(claude_parts)}"
         # Build the AppleScript program with JSON-quoted shell string
         # so quotes/backslashes inside the prompt don't escape. We
         # pass ensure_ascii=False so non-ASCII (emoji, accented
