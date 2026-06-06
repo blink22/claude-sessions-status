@@ -2775,6 +2775,30 @@
     dot.textContent = _resumeGlyph(sel.bucket);
     label.textContent = _resumeLabel(sel) + (sel.age ? ('  ·  ' + sel.age) : '');
   }
+  // Place the menu so it stays inside the ~480px-tall popover window:
+  // open downward by default, but flip upward when there isn't room
+  // below, and cap the height to the available space so rows are never
+  // clipped by the WKWebView edge.
+  function placeResumeMenu() {
+    const menu = document.getElementById('tsm-resume-menu');
+    const trigger = document.getElementById('tsm-resume-trigger');
+    if (!menu || !trigger) return;
+    const r = trigger.getBoundingClientRect();
+    const margin = 8;
+    const spaceBelow = window.innerHeight - r.bottom - margin;
+    const spaceAbove = r.top - margin;
+    const DESIRED = 216;
+    const down = spaceBelow >= Math.min(DESIRED, 140) || spaceBelow >= spaceAbove;
+    if (down) {
+      menu.style.top = 'calc(100% + 4px)';
+      menu.style.bottom = 'auto';
+      menu.style.maxHeight = Math.max(96, Math.min(DESIRED, spaceBelow)) + 'px';
+    } else {
+      menu.style.top = 'auto';
+      menu.style.bottom = 'calc(100% + 4px)';
+      menu.style.maxHeight = Math.max(96, Math.min(DESIRED, spaceAbove)) + 'px';
+    }
+  }
   function toggleResumeMenu(show) {
     const menu = document.getElementById('tsm-resume-menu');
     const trigger = document.getElementById('tsm-resume-trigger');
@@ -2783,6 +2807,7 @@
     if (open && !trigger.disabled) {
       renderResumeMenu();
       menu.removeAttribute('hidden');
+      placeResumeMenu();   // flip up / clamp height so nothing is clipped
       trigger.setAttribute('aria-expanded', 'true');
     } else {
       menu.setAttribute('hidden', '');
