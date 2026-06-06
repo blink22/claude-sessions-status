@@ -286,9 +286,11 @@ def _write_density(value: str) -> None:
 START_CONFIG_FILE = HOME / ".claude-sessions-status-start-config.json"
 START_PERM_MODES = ("default", "acceptEdits", "plan", "bypass")
 START_SESSION_TARGETS = ("new", "existing")
+START_LOCATIONS = ("same", "worktree")
 START_CONFIG_DEFAULT = {
     "permissionMode": "default",
     "sessionTarget": "new",
+    "location": "same",
 }
 
 
@@ -308,6 +310,9 @@ def _coerce_start_config(raw: dict) -> dict:
             cfg["sessionTarget"] = st
         elif raw.get("continueSession"):
             cfg["sessionTarget"] = "existing"
+        loc = str(raw.get("location") or "").strip()
+        if loc in START_LOCATIONS:
+            cfg["location"] = loc
     return cfg
 
 
@@ -3459,8 +3464,15 @@ class PopoverVC(NSViewController):
                         start_cfg["resumeSessionId"] = rid
             else:
                 start_cfg = _load_start_config()
-            flags = _start_config_flags(start_cfg)
-            self._spawn_new_terminal_with_prompt(target_cwd, prompt, flags)
+            if start_cfg.get("location") == "worktree":
+                # A fresh git worktree is always a new session — resume/
+                # continue don't apply there, so force the new-session flags.
+                wt_cfg = dict(start_cfg, sessionTarget="new")
+                self._spawn_worktree_terminal(
+                    target_cwd, prompt, _start_config_flags(wt_cfg))
+            else:
+                self._spawn_new_terminal_with_prompt(
+                    target_cwd, prompt, _start_config_flags(start_cfg))
             # Defer the popover close to the next runloop tick. Closing
             # synchronously from inside this script-message handler
             # has caused intermittent stalls (visible as a hover
@@ -3765,21 +3777,31 @@ class PopoverVC(NSViewController):
         prompt = (prompt or "").strip()
         if not prompt:
             return
-        claude_parts = ["claude"]
+        shell_cmd = (
+            f"cd {shlex.quote(cwd)} && {self._claude_invocation(flags, prompt)}"
+        )
+        self._run_terminal_do_script(shell_cmd)
+
+    @objc.python_method
+    def _claude_invocation(self, flags: "list[str] | None", prompt: str) -> str:
+        """Return the shlex-quoted ``claude [flags] <prompt>`` command."""
+        import shlex
+        parts = ["claude"]
         for f in (flags or []):
-            claude_parts.append(shlex.quote(str(f)))
-        claude_parts.append(shlex.quote(prompt))
-        shell_cmd = f"cd {shlex.quote(cwd)} && {' '.join(claude_parts)}"
-        # Build the AppleScript program with JSON-quoted shell string
-        # so quotes/backslashes inside the prompt don't escape. We
-        # pass ensure_ascii=False so non-ASCII (emoji, accented
-        # characters, RTL text) survives intact — AppleScript does
-        # NOT decode JSON's \uXXXX escapes inside string literals,
-        # so a prompt like "review the café UX 🚀" would otherwise
-        # arrive in Terminal as literal "é ... 🚀"
-        # text. JSON's other escapes (\", \\, \n, \r, \t) coincide
-        # with AppleScript's string-literal escapes, so the rest
-        # stays safe.
+            parts.append(shlex.quote(str(f)))
+        parts.append(shlex.quote(prompt))
+        return " ".join(parts)
+
+    @objc.python_method
+    def _run_terminal_do_script(self, shell_cmd: str) -> None:
+        """Open/activate Terminal and run ``shell_cmd`` in a fresh window.
+        The command is JSON-encoded so quotes/backslashes inside the prompt
+        don't escape. ensure_ascii=False keeps non-ASCII (emoji, accents,
+        RTL) intact — AppleScript does NOT decode JSON's \\uXXXX escapes
+        inside string literals, so "review the café UX 🚀" would otherwise
+        arrive mangled. JSON's other escapes (\\", \\\\, \\n, \\r, \\t)
+        coincide with AppleScript's string-literal escapes, so the rest
+        stays safe."""
         applescript_str = json.dumps(shell_cmd, ensure_ascii=False)
         try:
             subprocess.Popen(
@@ -3791,7 +3813,53 @@ class PopoverVC(NSViewController):
                 **self._detached_popen_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as e:
-            sys.stderr.write(f"[_spawn_new_terminal_with_prompt] {e!r}\n")
+            sys.stderr.write(f"[_run_terminal_do_script] {e!r}\n")
+
+    @objc.python_method
+    def _spawn_worktree_terminal(
+        self, cwd: str, prompt: str, flags: "list[str] | None" = None
+    ) -> None:
+        """Create a fresh git worktree off the repo containing ``cwd`` (on a
+        new ``claude/<timestamp>`` branch) and launch ``claude [flags]
+        <prompt>`` inside it, so the session works on an isolated checkout
+        without disturbing the user's current tree. The whole thing runs as
+        one shell command in Terminal so the user sees the `git worktree
+        add` output (and any error). If ``cwd`` isn't inside a git work
+        tree, falls back to a normal same-directory launch."""
+        import shlex
+        import datetime
+        if not cwd:
+            cwd = os.path.expanduser("~")
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return
+        root = ""
+        try:
+            r = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                root = r.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            root = ""
+        if not root:
+            sys.stderr.write(
+                "[worktree] cwd is not a git repo; starting in-place instead\n")
+            self._spawn_new_terminal_with_prompt(cwd, prompt, flags)
+            return
+        root = root.rstrip("/")
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        branch = "claude/" + stamp
+        base = os.path.basename(root) or "repo"
+        wt_path = os.path.join(os.path.dirname(root), f"{base}-{stamp}")
+        shell_cmd = (
+            "git -C " + shlex.quote(root)
+            + " worktree add -b " + shlex.quote(branch) + " " + shlex.quote(wt_path)
+            + " && cd " + shlex.quote(wt_path)
+            + " && " + self._claude_invocation(flags, prompt)
+        )
+        self._run_terminal_do_script(shell_cmd)
 
     @objc.python_method
     def _copy_to_clipboard(self, text: str) -> bool:

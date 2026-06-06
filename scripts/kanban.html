@@ -1582,6 +1582,13 @@
     <div class="hint">Edit if needed · Cmd+Enter to launch · Esc to cancel</div>
     <div class="tsm-cfg">
       <div class="tsm-seg-row">
+        <span class="tsm-seg-label">Run in</span>
+        <div class="tsm-seg" id="tsm-location" role="group" aria-label="Where to run">
+          <button type="button" class="tsm-seg-btn" data-value="same">Same code</button>
+          <button type="button" class="tsm-seg-btn" data-value="worktree">New worktree</button>
+        </div>
+      </div>
+      <div class="tsm-seg-row" id="tsm-session-row">
         <span class="tsm-seg-label">Session</span>
         <div class="tsm-seg" id="tsm-session" role="group" aria-label="Session target">
           <button type="button" class="tsm-seg-btn" data-value="new">New session</button>
@@ -2683,6 +2690,7 @@
   // previewed live as a `claude …` command. ----
   const TSM_PERM_MODES = ['default', 'acceptEdits', 'plan', 'bypass'];
   const TSM_SESSION_TARGETS = ['new', 'existing'];
+  const TSM_LOCATIONS = ['same', 'worktree'];
 
   // Segmented control get/set: the active <button>'s data-value is the
   // value; selecting one clears its siblings.
@@ -2814,23 +2822,34 @@
       trigger.setAttribute('aria-expanded', 'false');
     }
   }
-  // The resume picker only matters for an existing session — show it
-  // exactly when that target is selected, and close the menu otherwise.
+  // The resume picker only matters for an existing session in the *same*
+  // code — a new worktree is always a fresh session. Show it exactly when
+  // that combination holds, and close the menu otherwise.
   function syncResumeVisibility() {
-    const existing = segGet('tsm-session') === 'existing';
+    const show = segGet('tsm-session') === 'existing' && segGet('tsm-location') !== 'worktree';
     const row = document.getElementById('tsm-resume-row');
-    if (row) row.style.display = existing ? 'flex' : 'none';
-    if (!existing) toggleResumeMenu(false);
+    if (row) row.style.display = show ? 'flex' : 'none';
+    if (!show) toggleResumeMenu(false);
+  }
+  // A new worktree is inherently a new session, so hide the Session +
+  // Resume controls when "New worktree" is selected.
+  function syncLocationVisibility() {
+    const worktree = segGet('tsm-location') === 'worktree';
+    const srow = document.getElementById('tsm-session-row');
+    if (srow) srow.style.display = worktree ? 'none' : 'flex';
+    syncResumeVisibility();
   }
 
   function applyStartConfig(sc) {
     sc = sc || {};
+    segSet('tsm-location', TSM_LOCATIONS.indexOf(sc.location) >= 0 ? sc.location : 'same', 'same');
     segSet('tsm-session', TSM_SESSION_TARGETS.indexOf(sc.sessionTarget) >= 0 ? sc.sessionTarget : 'new', 'new');
     segSet('tsm-perm', TSM_PERM_MODES.indexOf(sc.permissionMode) >= 0 ? sc.permissionMode : 'default', 'default');
-    syncResumeVisibility();
+    syncLocationVisibility();
     updateStartCmdPreview();
   }
   function collectStartConfig() {
+    const location = segGet('tsm-location') || 'same';
     const target = segGet('tsm-session') || 'new';
     // Validate the chosen id against the *current* session list before
     // sending it: a background refresh can age the selected session out
@@ -2838,28 +2857,35 @@
     // already falls back to most-recent for display — mirror that here
     // so the sent --resume id never diverges from what's shown.
     let rid = '';
-    if (target === 'existing' && _tsmResumeSessions.length) {
+    if (location !== 'worktree' && target === 'existing' && _tsmResumeSessions.length) {
       const valid = _tsmResumeSessions.some(function(s) { return s.sessionId === _tsmResumeSid; });
       rid = valid ? _tsmResumeSid : _tsmResumeSessions[0].sessionId;
     }
     return {
       permissionMode: segGet('tsm-perm') || 'default',
       sessionTarget: target,
+      location: location,
       resumeSessionId: rid,
     };
   }
-  // Mirror floating.py's _start_config_flags so the preview matches the
-  // command that will actually run.
+  // Mirror floating.py so the preview matches the command that will run.
   function updateStartCmdPreview() {
     const el = document.getElementById('tsm-cmd');
     if (!el) return;
     const sc = collectStartConfig();
-    const parts = ['claude'];
-    if (sc.permissionMode === 'bypass') parts.push('--dangerously-skip-permissions');
-    else if (sc.permissionMode === 'acceptEdits' || sc.permissionMode === 'plan') parts.push('--permission-mode', sc.permissionMode);
-    if (sc.sessionTarget === 'existing') {
-      if (sc.resumeSessionId) parts.push('--resume', sc.resumeSessionId.slice(0, 8) + '…');
-      else parts.push('--continue');
+    const perm = [];
+    if (sc.permissionMode === 'bypass') perm.push('--dangerously-skip-permissions');
+    else if (sc.permissionMode === 'acceptEdits' || sc.permissionMode === 'plan') perm.push('--permission-mode', sc.permissionMode);
+    let parts;
+    if (sc.location === 'worktree') {
+      // Fresh worktree → new branch + session; resume/continue don't apply.
+      parts = ['git worktree add …  &&  claude'].concat(perm);
+    } else {
+      parts = ['claude'].concat(perm);
+      if (sc.sessionTarget === 'existing') {
+        if (sc.resumeSessionId) parts.push('--resume', sc.resumeSessionId.slice(0, 8) + '…');
+        else parts.push('--continue');
+      }
     }
     el.innerHTML = '<b>' + esc(parts.join(' ')) + '</b> "…"';
   }
@@ -2918,14 +2944,15 @@
     // Segmented controls: clicking a pill selects it (clearing its
     // siblings), reveals the resume picker when "Existing" is chosen,
     // and updates the live `claude …` command preview.
-    ['tsm-session', 'tsm-perm'].forEach(function(groupId) {
+    ['tsm-location', 'tsm-session', 'tsm-perm'].forEach(function(groupId) {
       const group = document.getElementById(groupId);
       if (!group) return;
       group.addEventListener('click', function(ev) {
         const btn = ev.target.closest('.tsm-seg-btn');
         if (!btn || !group.contains(btn)) return;
         segSet(groupId, btn.getAttribute('data-value'));
-        if (groupId === 'tsm-session') syncResumeVisibility();
+        if (groupId === 'tsm-location') syncLocationVisibility();
+        else if (groupId === 'tsm-session') syncResumeVisibility();
         updateStartCmdPreview();
       });
     });
