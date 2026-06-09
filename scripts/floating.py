@@ -3510,7 +3510,10 @@ class PopoverVC(NSViewController):
                 flags = _start_config_flags(wt_cfg)
                 new_sid = str(_uuid.uuid4())
                 flags += ["--session-id", new_sid]
-                if tid:
+                # In review/dry-run the launch is provisional (the user may
+                # discard the pasted command), so don't move the task into a
+                # session that might never exist.
+                if tid and not review:
                     tasks_module.attach_task_to_new_session(tid, new_sid)
                 self._spawn_worktree_terminal(target_cwd, prompt, flags, review=review)
             elif start_cfg.get("sessionTarget") == "existing":
@@ -3519,14 +3522,17 @@ class PopoverVC(NSViewController):
                 # Only a specific --resume <id> has a known session id to
                 # attach to; a bare --continue resumes "most recent" and
                 # we can't name it here, so skip the attach in that case.
-                if tid and resume_sid:
+                if tid and resume_sid and not review:
                     tasks_module.attach_task_to_new_session(tid, resume_sid)
                 self._spawn_new_terminal_with_prompt(target_cwd, prompt, flags, review=review)
             else:
                 flags = _start_config_flags(start_cfg)
                 new_sid = str(_uuid.uuid4())
                 flags += ["--session-id", new_sid]
-                if tid:
+                # In review/dry-run the launch is provisional (the user may
+                # discard the pasted command), so don't move the task into a
+                # session that might never exist.
+                if tid and not review:
                     tasks_module.attach_task_to_new_session(tid, new_sid)
                 self._spawn_new_terminal_with_prompt(target_cwd, prompt, flags, review=review)
             # Defer the popover close to the next runloop tick. Closing
