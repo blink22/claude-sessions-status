@@ -284,11 +284,13 @@ def _write_density(value: str) -> None:
 # `claude` CLI flags at spawn time. JSON because it's a small heterogenous
 # dict (string + string + bool), unlike the plain-text single-value prefs.
 START_CONFIG_FILE = HOME / ".claude-sessions-status-start-config.json"
-START_PERM_MODES = ("default", "acceptEdits", "plan", "bypass")
+START_PERM_MODES = ("acceptEdits", "plan", "auto")
 START_SESSION_TARGETS = ("new", "existing")
 START_LOCATIONS = ("same", "worktree")
 START_CONFIG_DEFAULT = {
-    "permissionMode": "default",
+    # First-run seed only — the modal pre-selects the user's last choice.
+    # An older saved "default" (no-flag) value migrates here via _coerce.
+    "permissionMode": "acceptEdits",
     "sessionTarget": "new",
     "location": "same",
 }
@@ -303,6 +305,8 @@ def _coerce_start_config(raw: dict) -> dict:
     cfg = dict(START_CONFIG_DEFAULT)
     if isinstance(raw, dict):
         pm = str(raw.get("permissionMode") or "").strip()
+        if pm == "bypass":   # old value for the Auto pill
+            pm = "auto"
         if pm in START_PERM_MODES:
             cfg["permissionMode"] = pm
         st = str(raw.get("sessionTarget") or "").strip()
@@ -336,18 +340,14 @@ def _save_start_config(cfg: dict) -> None:
 
 def _start_config_flags(cfg: dict) -> list[str]:
     """Turn a start-config dict into the `claude` CLI argv flags that
-    realize it. Default permission mode emits nothing (let Claude Code
-    use its own default). Bypass maps to the canonical --dangerously-
-    skip-permissions flag; acceptEdits/plan use --permission-mode. An
-    "existing" session target resumes a specific past session via
-    --resume <id> when ``resumeSessionId`` is given, else falls back to
-    the folder's most recent session via --continue; "new" (the default)
-    starts fresh."""
+    realize it. Each permission mode (acceptEdits / plan / auto) maps to
+    ``--permission-mode <mode>``. An "existing" session target resumes a
+    specific past session via --resume <id> when ``resumeSessionId`` is
+    given, else falls back to the folder's most recent session via
+    --continue; "new" (the default) starts fresh."""
     flags: list[str] = []
-    pm = cfg.get("permissionMode", "default")
-    if pm == "bypass":
-        flags.append("--dangerously-skip-permissions")
-    elif pm in ("acceptEdits", "plan"):
+    pm = cfg.get("permissionMode", "acceptEdits")
+    if pm in ("acceptEdits", "plan", "auto"):
         flags += ["--permission-mode", pm]
     if cfg.get("sessionTarget") == "existing":
         rid = str(cfg.get("resumeSessionId") or "").strip()
@@ -408,6 +408,29 @@ def _atomic_write_text(path: Path, content: str) -> None:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _install_edit_menu(main) -> None:
+    """Append a standard Edit menu (Cut/Copy/Paste/Select All) to `main`.
+
+    An accessory/LSUIElement app has no system-provided menu bar, so the
+    ⌘X/⌘C/⌘V/⌘A key equivalents that AppKit relies on to turn keystrokes
+    into cut:/copy:/paste:/selectAll: actions don't exist unless we add
+    them. Without this menu, text fields and WKWebView inputs accept typing
+    but silently ignore paste. The items carry no target (nil) on purpose,
+    so each action travels the responder chain to whatever is focused."""
+    edit_item = NSMenuItem.alloc().init()
+    main.addItem_(edit_item)
+    edit_menu = NSMenu.alloc().initWithTitle_("Edit")
+    for title, action, key in (
+        ("Cut", "cut:", "x"),
+        ("Copy", "copy:", "c"),
+        ("Paste", "paste:", "v"),
+        ("Select All", "selectAll:", "a"),
+    ):
+        it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
+        edit_menu.addItem_(it)  # no setTarget_ -> nil -> responder chain
+    edit_item.setSubmenu_(edit_menu)
 
 
 _SEEN_GC_TTL_S = 30 * 86400.0  # 30 days
@@ -1354,6 +1377,7 @@ class PanelController(NSObject):
         )
         app_menu.addItem_(quit_item)
         app_item.setSubmenu_(app_menu)
+        _install_edit_menu(main)
         NSApp.setMainMenu_(main)
 
     @objc.python_method
@@ -3441,6 +3465,7 @@ class PopoverVC(NSViewController):
             # responding to hover normally after Terminal activates.
             prompt = pstr("prompt")
             target_cwd = pstr("cwd")
+            tid = pstr("taskId")
             if not prompt:
                 return
             # Launch config chosen in the modal (permission mode, model,
@@ -3464,15 +3489,46 @@ class PopoverVC(NSViewController):
                         start_cfg["resumeSessionId"] = rid
             else:
                 start_cfg = _load_start_config()
+            # Decide the session id the launched session will own, and
+            # link the task to it now. For a brand-new session (the
+            # default, and always for worktrees) we MINT the UUID
+            # ourselves and pass it via `claude --session-id`, so the
+            # task attaches to that exact id the instant we spawn — no
+            # transcript polling, no guessing which freshly-appeared
+            # session belongs to this click. For an "existing" resume
+            # target the id already exists, so we attach straight to it;
+            # for a bare --continue we don't know the id up front, so we
+            # leave the task where it is.
+            # "Review" (dry-run): paste the command into Terminal without
+            # running it. Per-launch only, not persisted.
+            review = bool(raw_cfg.get("dryRun")) if isinstance(raw_cfg, dict) else False
+            import uuid as _uuid
             if start_cfg.get("location") == "worktree":
                 # A fresh git worktree is always a new session — resume/
                 # continue don't apply there, so force the new-session flags.
                 wt_cfg = dict(start_cfg, sessionTarget="new")
-                self._spawn_worktree_terminal(
-                    target_cwd, prompt, _start_config_flags(wt_cfg))
+                flags = _start_config_flags(wt_cfg)
+                new_sid = str(_uuid.uuid4())
+                flags += ["--session-id", new_sid]
+                if tid:
+                    tasks_module.attach_task_to_new_session(tid, new_sid)
+                self._spawn_worktree_terminal(target_cwd, prompt, flags, review=review)
+            elif start_cfg.get("sessionTarget") == "existing":
+                flags = _start_config_flags(start_cfg)
+                resume_sid = str(start_cfg.get("resumeSessionId") or "").strip()
+                # Only a specific --resume <id> has a known session id to
+                # attach to; a bare --continue resumes "most recent" and
+                # we can't name it here, so skip the attach in that case.
+                if tid and resume_sid:
+                    tasks_module.attach_task_to_new_session(tid, resume_sid)
+                self._spawn_new_terminal_with_prompt(target_cwd, prompt, flags, review=review)
             else:
-                self._spawn_new_terminal_with_prompt(
-                    target_cwd, prompt, _start_config_flags(start_cfg))
+                flags = _start_config_flags(start_cfg)
+                new_sid = str(_uuid.uuid4())
+                flags += ["--session-id", new_sid]
+                if tid:
+                    tasks_module.attach_task_to_new_session(tid, new_sid)
+                self._spawn_new_terminal_with_prompt(target_cwd, prompt, flags, review=review)
             # Defer the popover close to the next runloop tick. Closing
             # synchronously from inside this script-message handler
             # has caused intermittent stalls (visible as a hover
@@ -3756,7 +3812,8 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _spawn_new_terminal_with_prompt(
-        self, cwd: str, prompt: str, flags: "list[str] | None" = None
+        self, cwd: str, prompt: str, flags: "list[str] | None" = None,
+        review: bool = False,
     ) -> None:
         """Open a fresh Terminal window at ``cwd`` and launch
         ``claude [flags] <prompt>`` so the new Claude Code session starts
@@ -3780,7 +3837,7 @@ class PopoverVC(NSViewController):
         shell_cmd = (
             f"cd {shlex.quote(cwd)} && {self._claude_invocation(flags, prompt)}"
         )
-        self._run_terminal_do_script(shell_cmd)
+        self._run_terminal_do_script(shell_cmd, review=review)
 
     @objc.python_method
     def _claude_invocation(self, flags: "list[str] | None", prompt: str) -> str:
@@ -3793,7 +3850,7 @@ class PopoverVC(NSViewController):
         return " ".join(parts)
 
     @objc.python_method
-    def _run_terminal_do_script(self, shell_cmd: str) -> None:
+    def _run_terminal_do_script(self, shell_cmd: str, review: bool = False) -> None:
         """Open/activate Terminal and run ``shell_cmd`` in a fresh window.
         The command is JSON-encoded so quotes/backslashes inside the prompt
         don't escape. ensure_ascii=False keeps non-ASCII (emoji, accents,
@@ -3801,7 +3858,17 @@ class PopoverVC(NSViewController):
         inside string literals, so "review the café UX 🚀" would otherwise
         arrive mangled. JSON's other escapes (\\", \\\\, \\n, \\r, \\t)
         coincide with AppleScript's string-literal escapes, so the rest
-        stays safe."""
+        stays safe.
+
+        When ``review`` is True the command is NOT executed: it's pushed
+        into zsh's line-edit buffer via ``print -z`` so it appears typed at
+        the prompt for the user to inspect and press Enter (or edit /
+        discard). The full command is wrapped in one zsh-quoted string (each
+        ' re-escaped as '\\'') so the embedded shlex quoting survives.
+        Requires the Terminal shell to be zsh (the macOS default)."""
+        if review:
+            esc = "'" + shell_cmd.replace("'", "'\\''") + "'"
+            shell_cmd = "print -z -- " + esc
         applescript_str = json.dumps(shell_cmd, ensure_ascii=False)
         try:
             subprocess.Popen(
@@ -3817,7 +3884,8 @@ class PopoverVC(NSViewController):
 
     @objc.python_method
     def _spawn_worktree_terminal(
-        self, cwd: str, prompt: str, flags: "list[str] | None" = None
+        self, cwd: str, prompt: str, flags: "list[str] | None" = None,
+        review: bool = False,
     ) -> None:
         """Create a fresh git worktree off the repo containing ``cwd`` (on a
         new ``claude/<timestamp>`` branch) and launch ``claude [flags]
@@ -3846,7 +3914,7 @@ class PopoverVC(NSViewController):
         if not root:
             sys.stderr.write(
                 "[worktree] cwd is not a git repo; starting in-place instead\n")
-            self._spawn_new_terminal_with_prompt(cwd, prompt, flags)
+            self._spawn_new_terminal_with_prompt(cwd, prompt, flags, review=review)
             return
         root = root.rstrip("/")
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -3859,7 +3927,7 @@ class PopoverVC(NSViewController):
             + " && cd " + shlex.quote(wt_path)
             + " && " + self._claude_invocation(flags, prompt)
         )
-        self._run_terminal_do_script(shell_cmd)
+        self._run_terminal_do_script(shell_cmd, review=review)
 
     @objc.python_method
     def _copy_to_clipboard(self, text: str) -> bool:
@@ -4515,6 +4583,7 @@ class BadgeController(NSObject):
         )
         app_menu.addItem_(quit_item)
         app_item.setSubmenu_(app_menu)
+        _install_edit_menu(main)
         NSApp.setMainMenu_(main)
 
     @objc.python_method

@@ -235,6 +235,34 @@ def main() -> int:
             f"approved suggestion didn't move to front: {[t['id'] for t in ordered]}"
     t("reorder_tasks — update positions + idempotent + stale + approved sug", _reorder)
 
+    # Launch-from-task attach: session_of_task + attach_task_to_new_session
+    def _attach():
+        # A task created unattached lives under its cwd's pseudo-session.
+        cwd = "/tmp/proj-attach"
+        pseudo = tasks.unattached_sid_for_cwd(cwd)
+        created = tasks.create_unattached_task(cwd, "ship the thing")
+        assert created is not None
+        tid = created["id"]
+        # session_of_task finds the pseudo bucket.
+        assert tasks.session_of_task(tid) == pseudo
+        # Attaching to a freshly-minted session UUID migrates it there.
+        new_sid = "11111111-2222-3333-4444-555555555555"
+        assert tasks.attach_task_to_new_session(tid, new_sid) is True
+        assert tasks.session_of_task(tid) == new_sid
+        # It no longer lives in the unattached bucket.
+        assert all(t["id"] != tid for t in tasks.tasks_for_session(pseudo))
+        # Now under the new session, render-visible.
+        assert any(t["id"] == tid for t in tasks.tasks_for_session(new_sid))
+        # Re-attaching to the same session is a no-op success.
+        assert tasks.attach_task_to_new_session(tid, new_sid) is True
+        # Unknown task id → False (nothing to move).
+        assert tasks.attach_task_to_new_session("t_does_not_exist", new_sid) is False
+        # Empty args → False, never raises.
+        assert tasks.attach_task_to_new_session("", new_sid) is False
+        assert tasks.attach_task_to_new_session(tid, "") is False
+        assert tasks.session_of_task("t_does_not_exist") is None
+    t("attach_task_to_new_session — unattached → new session UUID", _attach)
+
     # Corrupt file recovery
     def _corrupt():
         TEST_FILE.write_text("not json {{", encoding="utf-8")

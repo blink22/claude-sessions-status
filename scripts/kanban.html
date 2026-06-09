@@ -1561,6 +1561,24 @@
     color: var(--text-3);
     font-weight: 600;
   }
+  #task-start-modal .tsm-review {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--sans);
+    font-size: 11px;
+    color: var(--text-3);
+    cursor: pointer;
+    user-select: none;
+    margin-top: 1px;
+  }
+  #task-start-modal .tsm-review input {
+    accent-color: var(--blue);
+    width: 13px;
+    height: 13px;
+    margin: 0;
+    cursor: pointer;
+  }
 </style>
 </head>
 <body>
@@ -1610,13 +1628,16 @@
       <div class="tsm-seg-row">
         <span class="tsm-seg-label">Permission</span>
         <div class="tsm-seg" id="tsm-perm" role="group" aria-label="Permission mode">
-          <button type="button" class="tsm-seg-btn" data-value="default">Default</button>
-          <button type="button" class="tsm-seg-btn" data-value="acceptEdits">Auto-accept</button>
           <button type="button" class="tsm-seg-btn" data-value="plan">Plan</button>
-          <button type="button" class="tsm-seg-btn" data-value="bypass">Auto</button>
+          <button type="button" class="tsm-seg-btn" data-value="acceptEdits">Accept Edits</button>
+          <button type="button" class="tsm-seg-btn" data-value="auto">Auto</button>
         </div>
       </div>
       <div class="tsm-cmd" id="tsm-cmd"></div>
+      <label class="tsm-review">
+        <input type="checkbox" id="tsm-dryrun">
+        <span>Paste into Terminal without running it (review first)</span>
+      </label>
     </div>
     <div class="btns">
       <button class="btn" id="tsm-cancel" type="button">Cancel</button>
@@ -2405,7 +2426,7 @@
             return false;
           });
         });
-        if (found) openTaskStartModal(found.content || '', cwd);
+        if (found) openTaskStartModal(found.content || '', cwd, tid);
       });
     });
 
@@ -2688,7 +2709,7 @@
   // existing session) as segmented pills. Pre-filled from
   // window.__startConfig (pushed by Python), read back on confirm, and
   // previewed live as a `claude …` command. ----
-  const TSM_PERM_MODES = ['default', 'acceptEdits', 'plan', 'bypass'];
+  const TSM_PERM_MODES = ['plan', 'acceptEdits', 'auto'];
   const TSM_SESSION_TARGETS = ['new', 'existing'];
   const TSM_LOCATIONS = ['same', 'worktree'];
 
@@ -2844,7 +2865,10 @@
     sc = sc || {};
     segSet('tsm-location', TSM_LOCATIONS.indexOf(sc.location) >= 0 ? sc.location : 'same', 'same');
     segSet('tsm-session', TSM_SESSION_TARGETS.indexOf(sc.sessionTarget) >= 0 ? sc.sessionTarget : 'new', 'new');
-    segSet('tsm-perm', TSM_PERM_MODES.indexOf(sc.permissionMode) >= 0 ? sc.permissionMode : 'default', 'default');
+    segSet('tsm-perm', TSM_PERM_MODES.indexOf(sc.permissionMode) >= 0 ? sc.permissionMode : 'acceptEdits', 'acceptEdits');
+    // Review/dry-run is a per-launch safety toggle — always start unchecked.
+    const dr = document.getElementById('tsm-dryrun');
+    if (dr) dr.checked = false;
     syncLocationVisibility();
     updateStartCmdPreview();
   }
@@ -2861,11 +2885,13 @@
       const valid = _tsmResumeSessions.some(function(s) { return s.sessionId === _tsmResumeSid; });
       rid = valid ? _tsmResumeSid : _tsmResumeSessions[0].sessionId;
     }
+    const dr = document.getElementById('tsm-dryrun');
     return {
       permissionMode: segGet('tsm-perm') || 'default',
       sessionTarget: target,
       location: location,
       resumeSessionId: rid,
+      dryRun: dr ? !!dr.checked : false,
     };
   }
   // Mirror floating.py so the preview matches the command that will run.
@@ -2874,8 +2900,7 @@
     if (!el) return;
     const sc = collectStartConfig();
     const perm = [];
-    if (sc.permissionMode === 'bypass') perm.push('--dangerously-skip-permissions');
-    else if (sc.permissionMode === 'acceptEdits' || sc.permissionMode === 'plan') perm.push('--permission-mode', sc.permissionMode);
+    if (sc.permissionMode === 'acceptEdits' || sc.permissionMode === 'plan' || sc.permissionMode === 'auto') perm.push('--permission-mode', sc.permissionMode);
     let parts;
     if (sc.location === 'worktree') {
       // Fresh worktree → new branch + session; resume/continue don't apply.
@@ -2891,12 +2916,14 @@
   }
 
   let _tsmCwd = '';            // captured at open time
-  function openTaskStartModal(prompt, cwd) {
+  let _tsmTaskId = '';         // task this launch came from (for attach)
+  function openTaskStartModal(prompt, cwd, taskId) {
     const modal = document.getElementById('task-start-modal');
     const folderEl = document.getElementById('tsm-folder');
     const promptEl = document.getElementById('tsm-prompt');
     if (!modal || !folderEl || !promptEl) return;
     _tsmCwd = cwd || '';
+    _tsmTaskId = taskId || '';
     folderEl.textContent = shortFolder(cwd);
     promptEl.value = prompt || '';
     populateResumeOptions(_tsmCwd);
@@ -2917,6 +2944,7 @@
     modal.classList.remove('open');
     modal.setAttribute('aria-hidden', 'true');
     _tsmCwd = '';
+    _tsmTaskId = '';
   }
   function confirmTaskStart() {
     const promptEl = document.getElementById('tsm-prompt');
@@ -2929,6 +2957,7 @@
     send('taskStart', {
       prompt: text,
       cwd: _tsmCwd,
+      taskId: _tsmTaskId,
       startConfigJson: JSON.stringify(collectStartConfig()),
     });
     closeTaskStartModal();
@@ -4063,7 +4092,7 @@
         const row = lastRows.get(cardEl.dataset.session || '');
         const t = row && (row.tasks || []).find(function(x) { return x.id === tid; });
         if (!t) return;
-        openTaskStartModal(t.content || '', cardEl.dataset.cwd || '');
+        openTaskStartModal(t.content || '', cardEl.dataset.cwd || '', tid);
       });
     });
 

@@ -631,6 +631,50 @@ def move_task_to_session(current_session_id: str, task_id: str,
         return True
 
 
+def session_of_task(task_id: str) -> Optional[str]:
+    """Return the sessionId of whichever bucket currently holds
+    ``task_id``, or None if no session owns it. Used by the launch-from-
+    task flow, where the caller knows the task id but not which bucket
+    (real session vs. ``__unattached__:<cwd>`` pseudo-session) it lives
+    in. O(total tasks) — acceptable since it runs once per launch click,
+    not on the render hot path."""
+    if not task_id:
+        return None
+    state = load_state()
+    for sid, entry in (state.get("sessions") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        for t in entry.get("tasks") or []:
+            if t.get("id") == task_id:
+                return sid
+    return None
+
+
+def attach_task_to_new_session(task_id: str, new_session_id: str) -> bool:
+    """Link ``task_id`` to ``new_session_id`` by moving it out of whatever
+    bucket currently owns it (a real session, or its project's
+    ``__unattached__`` pseudo-session) and into ``new_session_id``.
+
+    This is the persistence half of "start a new Claude session from a
+    task": the launcher mints the session's UUID itself (passed to
+    ``claude --session-id``), then calls this so the task and the
+    not-yet-started session are linked the instant the launch fires —
+    no transcript polling, no guessing which freshly-appeared session
+    belongs to this click.
+
+    Returns True if the task now lives under ``new_session_id`` (including
+    the no-op case where it already did), False if the task id matches no
+    known task or the move failed to persist."""
+    if not task_id or not new_session_id:
+        return False
+    cur = session_of_task(task_id)
+    if cur is None:
+        return False
+    if cur == new_session_id:
+        return True
+    return move_task_to_session(cur, task_id, new_session_id)
+
+
 def reorder_tasks(session_id: str, ordered_ids: list[str]) -> bool:
     """Apply a new ordering to a session's tasks. ``ordered_ids`` is the
     list of task IDs in their new desired display order — only the
